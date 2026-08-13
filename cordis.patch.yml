@@ -7,11 +7,15 @@
 # credentials, persistence (the shared $DSH_HOME/sessions store), sandbox,
 # tools, skills, subagents — and exposes it to ACP clients such as Zed:
 #
-#     dsh plugin --profile acp add @deepseek-ai-harness/dsh-acp
+#     dsh plugin --profile acp add -w @deepseek-ai-harness/dsh-acp
 #     dsh --profile acp
 #
-# Override provider/model here or from the profile's cordis.patch.yml
-# (id-targeted config, last write wins).
+# No provider/model is pinned here: sessions inherit the composition default
+# (the model saved on the dsh Web UI Models page via agent-default-model,
+# including its reasoning effort), and the model picker lists the live
+# adapter directory. DSH_MODEL / DSH_PERMISSION_MODE override per launch;
+# permanent overrides belong in the profile's cordis.patch.yml (id-targeted,
+# last write wins).
 
 - id: hmr
   disabled: true
@@ -20,9 +24,5 @@
     - id: acp-bridge
       name: '@deepseek-ai-harness/dsh-acp/bridge'
       config:
-        provider: deepseek-official
-        model: !!js process.env.DSH_MODEL ?? 'deepseek-v4-flash'
-        models:
-          - deepseek-v4-flash
-          - deepseek-v4-pro
+        model: !!js process.env.DSH_MODEL
         permissionMode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'

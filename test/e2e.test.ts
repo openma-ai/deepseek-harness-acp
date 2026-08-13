@@ -8,7 +8,7 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -28,16 +28,24 @@ class AcpTestClient {
     private buffer = "";
     private stderr = "";
 
-    constructor(sessionRoot: string, workspace: string, dshPath?: string) {
+    constructor(
+        sessionRoot: string,
+        workspace: string,
+        dshPath?: string,
+        envPatch?: Record<string, string | undefined>,
+    ) {
+        const env: Record<string, string | undefined> = {
+            ...process.env,
+            DEEPSEEK_BASE_URL: "http://127.0.0.1:1", // credential gate only; never dialed
+            DSH_SESSION_ROOT: sessionRoot,
+            DSH_ACP_WORKSPACE: workspace,
+            ...(dshPath !== undefined ? { DSH_PATH: dshPath } : {}),
+            ...(envPatch ?? {}),
+        };
+        for (const [key, value] of Object.entries(env)) if (value === undefined) delete env[key];
         this.child = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
             cwd: ROOT,
-            env: {
-                ...process.env,
-                DEEPSEEK_BASE_URL: "http://127.0.0.1:1", // credential gate only; never dialed
-                DSH_SESSION_ROOT: sessionRoot,
-                DSH_ACP_WORKSPACE: workspace,
-                ...(dshPath !== undefined ? { DSH_PATH: dshPath } : {}),
-            },
+            env: env as Record<string, string>,
             stdio: ["pipe", "pipe", "pipe"],
         });
         this.child.stdout.setEncoding("utf8");
@@ -217,9 +225,8 @@ describe("dsh-acp server (e2e smoke)", () => {
     it("publishes available commands for new sessions", () => {
         const updates = client.updatesFor(sessionId);
         const commands = updates.find((update) => update["sessionUpdate"] === "available_commands_update");
-        expect(commands).toMatchObject({
-            availableCommands: [{ name: "status", description: expect.stringContaining("status") }],
-        });
+        const names = (commands?.["availableCommands"] as Array<{ name: string }>).map((c) => c.name);
+        expect(names).toEqual(["status", "login", "logout"]);
     });
 
     it("switches session modes", async () => {
@@ -315,5 +322,76 @@ describe.skipIf(HOST_TREE === undefined)("dsh-acp against a standalone host inst
             prompt: [{ type: "text", text: "/status" }],
         })) as Record<string, unknown>;
         expect(status["stopReason"]).toBe("end_turn");
+    }, 120_000);
+});
+
+describe("credential self-service (/login flow)", () => {
+    let client: AcpTestClient;
+    let sessionRoot: string;
+    let workspace: string;
+    let home: string;
+    let sessionId: string;
+
+    beforeAll(async () => {
+        sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-login-sessions-"));
+        workspace = mkdtempSync(join(tmpdir(), "dsh-acp-login-workspace-"));
+        home = mkdtempSync(join(tmpdir(), "dsh-acp-login-home-"));
+        // No ambient credential at all; the harness credential store lives in
+        // an isolated DSH_HOME.
+        client = new AcpTestClient(sessionRoot, workspace, undefined, {
+            DEEPSEEK_BASE_URL: undefined,
+            DEEPSEEK_API_KEY: undefined,
+            DSH_HOME: home,
+        });
+        await client.request("initialize", { protocolVersion: 1 });
+        const created = (await client.request("session/new", { cwd: workspace, mcpServers: [] })) as Record<
+            string,
+            unknown
+        >;
+        sessionId = created["sessionId"] as string;
+    }, 120_000);
+
+    afterAll(async () => {
+        await client.close();
+        for (const dir of [sessionRoot, workspace, home]) rmSync(dir, { recursive: true, force: true });
+    });
+
+    const promptText = async (text: string): Promise<string> => {
+        const before = client.updatesFor(sessionId).length;
+        const result = (await client.request("session/prompt", {
+            sessionId,
+            prompt: [{ type: "text", text }],
+        })) as Record<string, unknown>;
+        expect(result["stopReason"]).toBe("end_turn");
+        return client
+            .updatesFor(sessionId)
+            .slice(before)
+            .filter((update) => update["sessionUpdate"] === "agent_message_chunk")
+            .map((update) => (update["content"] as { text: string }).text)
+            .join("");
+    };
+
+    it("creates a session without any credential and guides instead of erroring", async () => {
+        expect(sessionId).toBeTruthy();
+        const guidance = await promptText("hello there");
+        expect(guidance).toContain("/login");
+        expect(guidance).toContain("not sent to the model");
+    }, 120_000);
+
+    it("stores a key via /login, reports it in /status, removes it via /logout", async () => {
+        const saved = await promptText("/login sk-test-abcdef1234567890");
+        expect(saved).toContain("Saved DEEPSEEK_API_KEY");
+        expect(saved).toContain("sk-t…7890");
+        expect(existsSync(join(home, ".credentials.yaml"))).toBe(true);
+
+        const status = await promptText("/status");
+        expect(status).toContain("| Credential |");
+        expect(status).not.toContain("not configured");
+
+        const removed = await promptText("/logout");
+        expect(removed).toContain("Removed the stored DEEPSEEK_API_KEY");
+
+        const guidance = await promptText("are you there?");
+        expect(guidance).toContain("/login");
     }, 120_000);
 });

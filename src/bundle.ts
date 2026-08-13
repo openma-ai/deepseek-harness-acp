@@ -27,9 +27,11 @@ export const inject = bridge.inject;
 export type Config = Omit<AcpBridgeConfig, "harness" | "stream">;
 
 export function apply(ctx: Context, config: Config): void {
+    // No pinned defaults: absent provider/model means the composition's own
+    // default route (agent-default-model reading the user's settings.yaml).
     bridge.apply(ctx, {
-        provider: config.provider ?? "deepseek-official",
-        model: config.model ?? "deepseek-v4-flash",
+        ...(config.provider !== undefined ? { provider: config.provider } : {}),
+        ...(config.model !== undefined ? { model: config.model } : {}),
         ...(config.models !== undefined ? { models: config.models } : {}),
         ...(config.maxTokens !== undefined ? { maxTokens: config.maxTokens } : {}),
         ...(config.permissionMode !== undefined ? { permissionMode: config.permissionMode } : {}),
