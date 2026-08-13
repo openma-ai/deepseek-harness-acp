@@ -28,7 +28,7 @@ class AcpTestClient {
     private buffer = "";
     private stderr = "";
 
-    constructor(sessionRoot: string, workspace: string) {
+    constructor(sessionRoot: string, workspace: string, dshPath?: string) {
         this.child = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
             cwd: ROOT,
             env: {
@@ -36,6 +36,7 @@ class AcpTestClient {
                 DEEPSEEK_BASE_URL: "http://127.0.0.1:1", // credential gate only; never dialed
                 DSH_SESSION_ROOT: sessionRoot,
                 DSH_ACP_WORKSPACE: workspace,
+                ...(dshPath !== undefined ? { DSH_PATH: dshPath } : {}),
             },
             stdio: ["pipe", "pipe", "pipe"],
         });
@@ -263,4 +264,42 @@ describe("dsh-acp server (e2e smoke)", () => {
             client.request("session/load", { sessionId: "missing", cwd: workspace, mcpServers: [] }),
         ).rejects.toThrow(/session not found/);
     }, 60_000);
+});
+
+// Optional: run the same handshake against a real standalone host install
+// (`npm install @deepseek-ai/dsh`) when one is available. Set
+// DSH_ACP_TEST_HOST to its directory; CI without one skips this block.
+const HOST_TREE = process.env["DSH_ACP_TEST_HOST"];
+
+describe.skipIf(HOST_TREE === undefined)("dsh-acp against a standalone host install", () => {
+    let client: AcpTestClient;
+    let sessionRoot: string;
+    let workspace: string;
+
+    beforeAll(() => {
+        sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-host-sessions-"));
+        workspace = mkdtempSync(join(tmpdir(), "dsh-acp-host-workspace-"));
+        client = new AcpTestClient(sessionRoot, workspace, HOST_TREE);
+    });
+
+    afterAll(async () => {
+        await client.close();
+        rmSync(sessionRoot, { recursive: true, force: true });
+        rmSync(workspace, { recursive: true, force: true });
+    });
+
+    it("boots from the host tree and serves a session", async () => {
+        const init = (await client.request("initialize", { protocolVersion: 1 })) as Record<string, unknown>;
+        expect(init["agentInfo"]).toMatchObject({ name: "dsh-acp" });
+        const created = (await client.request("session/new", { cwd: workspace, mcpServers: [] })) as Record<
+            string,
+            unknown
+        >;
+        expect(created["sessionId"]).toBeTruthy();
+        const status = (await client.request("session/prompt", {
+            sessionId: created["sessionId"],
+            prompt: [{ type: "text", text: "/status" }],
+        })) as Record<string, unknown>;
+        expect(status["stopReason"]).toBe("end_turn");
+    }, 120_000);
 });

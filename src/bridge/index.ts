@@ -52,10 +52,10 @@ import {
 } from "@agentclientprotocol/sdk";
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent } from "@deepseek-ai/dsh-agent";
-import { createUserMessage, errorChain } from "@deepseek-ai/dsh-llm";
-import { SessionId, type SessionEvent } from "@deepseek-ai/dsh-session";
-import { foldSessionTitle } from "@deepseek-ai/dsh-session-title";
-import { SANDBOX_MODES, setSandboxMode } from "@deepseek-ai/dsh-sandbox-policy";
+import type { createUserMessage, errorChain } from "@deepseek-ai/dsh-llm";
+import type { SessionId, SessionEvent } from "@deepseek-ai/dsh-session";
+import type { foldSessionTitle } from "@deepseek-ai/dsh-session-title";
+import type { setSandboxMode } from "@deepseek-ai/dsh-sandbox-policy";
 import type { SandboxMode } from "@deepseek-ai/dsh-sandbox";
 // Side-effect type imports: declaration-merge the approval waterfall and agent events.
 import type {} from "@deepseek-ai/dsh-user-approval";
@@ -71,6 +71,16 @@ export const name = "acp-bridge";
 /** The bridge creates and owns agents; every other capability is optional. */
 export const inject = ["agents"];
 
+/** Host functions the bridge needs beyond the plugin tree (see loadKit). */
+export interface BridgeHarness {
+    createUserMessage: typeof createUserMessage;
+    errorChain: typeof errorChain;
+    sessionId: typeof SessionId;
+    foldSessionTitle: typeof foldSessionTitle;
+    setSandboxMode: typeof setSandboxMode;
+    sandboxModes: readonly SandboxMode[];
+}
+
 export interface AcpBridgeConfig {
     /** Provider route for ACP-created agents. */
     provider: string;
@@ -84,6 +94,8 @@ export interface AcpBridgeConfig {
     permissionMode?: SandboxMode;
     /** Runtime-only transport override; production uses stdio. */
     stream?: Stream;
+    /** Host functions resolved from the DeepSeek Harness installation. */
+    harness: BridgeHarness;
 }
 
 interface Inflight {
@@ -145,6 +157,8 @@ const MODE_LABELS: Record<SandboxMode, { name: string; description: string }> = 
 export function apply(ctx: Context, config: AcpBridgeConfig): void {
     // Capture injected services during apply; handlers run outside the scope.
     const agents = ctx.agents;
+    const { createUserMessage, errorChain, sessionId: SessionId, foldSessionTitle, setSandboxMode } = config.harness;
+    const SANDBOX_MODES = config.harness.sandboxModes;
     const sessions = new Map<string, SessionRecord>();
     let closed = false;
     let conn: AgentSideConnection;

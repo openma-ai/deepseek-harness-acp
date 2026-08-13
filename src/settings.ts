@@ -11,6 +11,8 @@ import { join } from "node:path";
 import type { SandboxMode } from "@deepseek-ai/dsh-sandbox";
 
 export interface Settings {
+    /** Explicit DeepSeek Harness installation (DSH_PATH); auto-detected when unset. */
+    dshPath: string | undefined;
     provider: string;
     model: string;
     /** Selectable model candidates (session config option). */
@@ -67,6 +69,7 @@ function parseFlags(argv: string[]): ParsedArgs {
 }
 
 const FLAGS_WITH_VALUES = new Set([
+    "dsh-path",
     "provider",
     "model",
     "models",
@@ -132,6 +135,7 @@ export function resolveSettings(argv: string[]): Settings {
     }
 
     return {
+        dshPath: stringFlag(parsed, "dsh-path") ?? envString("DSH_PATH"),
         provider: stringFlag(parsed, "provider") ?? envString("DSH_PROVIDER") ?? "deepseek-official",
         model,
         models,
@@ -154,6 +158,10 @@ Agent Client Protocol (ACP) stdio server for DeepSeek Harness. Speak ACP on
 stdin/stdout from an ACP client such as Zed; diagnostics go to stderr.
 
 Options:
+  --dsh-path <path>           DeepSeek Harness installation: the dsh binary, its
+                              package dir, or any dir carrying node_modules/@deepseek-ai
+                              (DSH_PATH; auto-detected when unset — own tree, ./node_modules,
+                              dsh on PATH, npm root -g)
   --provider <route>          Provider route (DSH_PROVIDER, default deepseek-official)
   --model <id>                Default model (DSH_MODEL, default deepseek-v4-flash)
   --models <a,b,...>          Selectable models for the session "Model" option
@@ -170,6 +178,7 @@ Options:
   --help                      Show this help
 
 Environment:
+  DSH_PATH                    DeepSeek Harness installation (see --dsh-path)
   DEEPSEEK_API_KEY            DeepSeek (or compatible) API credential
   DEEPSEEK_BASE_URL           OpenAI-compatible endpoint override
   DSH_ACP_DEBUG               Verbose stderr diagnostics

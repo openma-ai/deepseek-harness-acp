@@ -2,15 +2,15 @@
 /**
  * dsh-acp — Agent Client Protocol stdio server for DeepSeek Harness.
  *
- * Boots the harness composition (`src/app.ts`) on a fresh cordis Context and
+ * Finds the user's DeepSeek Harness installation (DSH_PATH or auto-detected;
+ * see src/harness.ts), composes the agent runtime from it in-process, and
  * serves ACP JSON-RPC on stdin/stdout. Stdout is reserved for the protocol;
  * every diagnostic goes to stderr.
  */
 
-import { Context } from "@deepseek-ai/cordis";
-
 import * as app from "./app.ts";
-import { logError } from "./log.ts";
+import { HarnessNotFoundError, loadKit, resolveHost } from "./harness.ts";
+import { logDebug, logError } from "./log.ts";
 import { HELP_TEXT, resolveSettings, SettingsError } from "./settings.ts";
 import { VERSION } from "./version.ts";
 
@@ -40,8 +40,22 @@ async function main(): Promise<void> {
         throw error;
     }
 
-    const ctx = new Context();
-    await ctx.plugin(app, settings);
+    let kit;
+    try {
+        const host = resolveHost(settings.dshPath);
+        logDebug(`harness host: ${host.base} via ${host.source} (${host.version ?? "unknown version"})`);
+        kit = await loadKit(host);
+    } catch (error: unknown) {
+        if (error instanceof HarnessNotFoundError) {
+            logError(error.message);
+            process.exitCode = 1;
+            return;
+        }
+        throw error;
+    }
+
+    const ctx = new kit.cordis.Context();
+    await ctx.plugin(app, { settings, kit });
 
     let disposing = false;
     const shutdown = (code: number): void => {
