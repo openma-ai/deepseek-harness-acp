@@ -81,6 +81,13 @@ export interface BridgeHarness {
     sandboxModes: readonly SandboxMode[];
     /** Brands a credential reference for `ctx.credentials` lookups (optional seam). */
     credentialRef?: (value: string) => unknown;
+    /**
+     * The `@deepseek-ai/dsh-mcp-client` plugin module (optional seam). One
+     * mounted instance connects to one MCP server and registers its tools on
+     * `ctx.tools` as `mcp__<serverName>__<rawName>`; disposal disconnects and
+     * unregisters. Absent on installations that predate the plugin.
+     */
+    mcpClient?: { apply: (ctx: never, config: never) => void };
 }
 
 export interface AcpBridgeConfig {
@@ -409,6 +416,9 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     agentCapabilities: {
                         loadSession: hasPersistence,
                         promptCapabilities: { image: false, audio: false, embeddedContext: true },
+                        // Stdio servers always work; streamable HTTP maps onto
+                        // mcp-client's second transport. Legacy SSE does not.
+                        mcpCapabilities: { http: true, sse: false },
                         ...(hasPersistence ? { sessionCapabilities: { list: {} } } : {}),
                     },
                     authMethods: [],
@@ -428,7 +438,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
 
             async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
                 assertOpen();
-                validateSessionParams(params.cwd, params.mcpServers);
+                validateCwd(params.cwd);
+                syncMcpServers(params.mcpServers, params.cwd);
                 if (!(await credentialPresent())) {
                     throw authRequired(
                         "no DeepSeek credential found: save one in the dsh Web UI (Settings → Models) or set DEEPSEEK_API_KEY",
@@ -461,7 +472,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
 
             async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
                 assertOpen();
-                validateSessionParams(params.cwd, params.mcpServers);
+                validateCwd(params.cwd);
+                syncMcpServers(params.mcpServers, params.cwd);
                 const persistence = requirePersistence();
                 const sessionId = params.sessionId;
                 const existing = sessions.get(sessionId);
@@ -697,12 +709,120 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         return ctx.get("sessionPersistence") as Context["sessionPersistence"] | undefined;
     }
 
-    function validateSessionParams(cwd: string, mcpServers: NewSessionRequest["mcpServers"] | undefined): void {
+    function validateCwd(cwd: string): void {
         if (!isAbsolute(cwd)) throw invalidParams(`cwd must be an absolute path: ${cwd}`);
-        if (mcpServers !== undefined && mcpServers.length > 0) {
-            throw invalidParams("mcpServers is not supported by this agent");
-        }
     }
+
+    // ------------------------------------------------------------------ //
+    // MCP servers (session mcpServers → dsh-mcp-client instances)         //
+    // ------------------------------------------------------------------ //
+
+    /**
+     * Live mcp-client mounts by server name. ACP has no session/close, so a
+     * mount lives until the process exits or a later session re-declares the
+     * same name with a different config (the client edited its settings —
+     * replace, so new sessions and the next turns of old ones see the new
+     * server). Same name + same config is reused across sessions: clients
+     * send one configured list to every session, and tool names
+     * (`mcp__<name>__…`) stay stable for prompt caching.
+     */
+    const mcpMounts = new Map<string, { configJson: string; fiber: { dispose(): unknown } }>();
+    let warnedNoMcpClient = false;
+
+    /** mcp-client requires `[A-Za-z0-9_-]{1,32}`; ACP names are free-form. */
+    const sanitizeServerName = (raw: string): string => {
+        const cleaned = raw.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 32);
+        return cleaned.length > 0 ? cleaned : "server";
+    };
+
+    /** Projects one ACP McpServer onto an mcp-client config, if supported. */
+    const mcpConfigFor = (
+        server: Record<string, unknown>,
+        cwd: string,
+        serverName: string,
+    ): Record<string, unknown> | undefined => {
+        const envList = (list: unknown): Record<string, string> =>
+            Object.fromEntries(
+                (Array.isArray(list) ? (list as { name: string; value: string }[]) : []).map((e) => [
+                    e.name,
+                    e.value,
+                ]),
+            );
+        if (typeof server["command"] === "string") {
+            return {
+                transport: "stdio",
+                serverName,
+                command: server["command"],
+                args: Array.isArray(server["args"]) ? server["args"] : [],
+                env: envList(server["env"]),
+                cwd: typeof server["cwd"] === "string" ? server["cwd"] : cwd,
+                // A dead or misconfigured server must not take the session
+                // down; the client surfaces missing tools on its own.
+                failOnStartupError: false,
+            };
+        }
+        if (server["type"] === "http" && typeof server["url"] === "string") {
+            return {
+                transport: "streamable-http",
+                serverName,
+                url: server["url"],
+                headers: envList(server["headers"]),
+                failOnStartupError: false,
+            };
+        }
+        return undefined;
+    };
+
+    /** Mounts/reuses/replaces mcp-client instances for a session's server list. */
+    const syncMcpServers = (servers: NewSessionRequest["mcpServers"] | undefined, cwd: string): void => {
+        if (servers === undefined || servers.length === 0) return;
+        const mcpClient = harness.mcpClient;
+        if (mcpClient === undefined) {
+            if (!warnedNoMcpClient) {
+                warnedNoMcpClient = true;
+                logWarn(
+                    `ignoring ${servers.length} MCP server(s): this DeepSeek Harness installation lacks @deepseek-ai/dsh-mcp-client`,
+                );
+            }
+            return;
+        }
+        const taken = new Set<string>();
+        for (const entry of servers) {
+            const server = entry as unknown as Record<string, unknown>;
+            const base = sanitizeServerName(typeof server["name"] === "string" ? server["name"] : "server");
+            let serverName = base;
+            for (let n = 2; taken.has(serverName); n += 1) serverName = `${base.slice(0, 28)}_${n}`;
+            const cfg = mcpConfigFor(server, cwd, serverName);
+            if (cfg === undefined) {
+                logWarn(`skipping MCP server "${serverName}": unsupported transport`);
+                continue;
+            }
+            const configJson = JSON.stringify(cfg);
+            const existing = mcpMounts.get(serverName);
+            if (existing !== undefined) {
+                if (existing.configJson === configJson) {
+                    taken.add(serverName);
+                    continue;
+                }
+                try {
+                    void existing.fiber.dispose();
+                } catch (error: unknown) {
+                    logWarn(`disposing MCP server "${serverName}": ${String(error)}`);
+                }
+                mcpMounts.delete(serverName);
+            }
+            try {
+                const fiber = (
+                    ctx as unknown as { plugin(module: unknown, config: unknown): { dispose(): unknown } }
+                ).plugin(mcpClient, cfg);
+                mcpMounts.set(serverName, { configJson, fiber });
+                taken.add(serverName);
+                logDebug(`mounted MCP server "${serverName}" (${String(cfg["transport"])})`);
+            } catch (error: unknown) {
+                logWarn(`failed to mount MCP server "${serverName}": ${String(error)}`);
+            }
+        }
+    };
 
     // ------------------------------------------------------------------ //
     // Transport wiring and teardown                                       //

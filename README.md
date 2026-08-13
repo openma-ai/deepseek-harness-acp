@@ -47,6 +47,12 @@ workflows, web search, plan mode, LLM session titles, compaction — and it
 shares `$DSH_HOME/sessions`, so conversations started in the dsh Web UI can
 be listed and loaded from the editor.
 
+**MCP servers** configured in your client (Zed context servers, for example)
+are attached per session: each `session/new` server entry mounts a
+`@deepseek-ai/dsh-mcp-client` instance (stdio and streamable HTTP
+transports), whose tools join the agent as `mcp__<server>__<tool>`. A server
+that fails to start never takes the session down.
+
 Override provider/model per profile in `$DSH_HOME/profiles/acp/cordis.patch.yml`
 (id-targeted patch on the `acp-bridge` row), or via `DSH_MODEL` /
 `DSH_PERMISSION_MODE` in the launch environment.

@@ -15,30 +15,16 @@
  */
 
 import type { Context } from "@deepseek-ai/cordis";
-import { createUserMessage, errorChain } from "@deepseek-ai/dsh-llm";
-import { SessionId } from "@deepseek-ai/dsh-session";
-import { foldSessionTitle } from "@deepseek-ai/dsh-session-title";
-import { SANDBOX_MODES, setSandboxMode } from "@deepseek-ai/dsh-sandbox-policy";
-import { credentialRef } from "@deepseek-ai/dsh-credentials";
 
 import * as bridge from "./bridge/index.ts";
-import type { AcpBridgeConfig, BridgeHarness } from "./bridge/index.ts";
+import { selfHarness } from "./bridge/self-harness.ts";
+import type { AcpBridgeConfig } from "./bridge/index.ts";
 
 export const name = bridge.name;
 export const inject = bridge.inject;
 
 /** Bundle-facing config: everything except the injected harness kit. */
 export type Config = Omit<AcpBridgeConfig, "harness" | "stream">;
-
-const HARNESS: BridgeHarness = {
-    createUserMessage,
-    errorChain,
-    sessionId: SessionId,
-    foldSessionTitle,
-    setSandboxMode,
-    sandboxModes: SANDBOX_MODES,
-    credentialRef,
-};
 
 export function apply(ctx: Context, config: Config): void {
     bridge.apply(ctx, {
@@ -47,6 +33,6 @@ export function apply(ctx: Context, config: Config): void {
         ...(config.models !== undefined ? { models: config.models } : {}),
         ...(config.maxTokens !== undefined ? { maxTokens: config.maxTokens } : {}),
         ...(config.permissionMode !== undefined ? { permissionMode: config.permissionMode } : {}),
-        harness: HARNESS,
+        harness: selfHarness(),
     });
 }

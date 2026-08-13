@@ -18,6 +18,7 @@ import { SessionId } from "@deepseek-ai/dsh-session";
 import { foldSessionTitle } from "@deepseek-ai/dsh-session-title";
 import { SANDBOX_MODES, setSandboxMode } from "@deepseek-ai/dsh-sandbox-policy";
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
+import * as mcpClient from "@deepseek-ai/dsh-mcp-client";
 
 import type { BridgeHarness } from "./index.ts";
 
@@ -30,5 +31,6 @@ export function selfHarness(): BridgeHarness {
         setSandboxMode,
         sandboxModes: SANDBOX_MODES,
         credentialRef,
+        mcpClient: mcpClient as unknown as NonNullable<BridgeHarness["mcpClient"]>,
     };
 }

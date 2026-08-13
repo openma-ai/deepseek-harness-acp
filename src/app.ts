@@ -94,6 +94,9 @@ export async function apply(ctx: Context, config: AppConfig): Promise<void> {
         ...(credentialsSeam?.credentialRef !== undefined
             ? { credentialRef: credentialsSeam.credentialRef }
             : {}),
+        ...(p["mcpClient"] !== undefined
+            ? { mcpClient: p["mcpClient"] as unknown as NonNullable<BridgeHarness["mcpClient"]> }
+            : {}),
     };
 
     await (ctx as unknown as typeof anyCtx).effect(async function* (this: unknown) {

@@ -174,16 +174,29 @@ describe("dsh-acp server (e2e smoke)", () => {
         expect(configOptions[0]).toMatchObject({ id: "model", type: "select", currentValue: "deepseek-v4-flash" });
     }, 60_000);
 
-    it("rejects relative cwds and mcp servers", async () => {
+    it("rejects relative cwds", async () => {
         await expect(client.request("session/new", { cwd: "relative/path", mcpServers: [] })).rejects.toThrow(
             /absolute/,
         );
-        await expect(
-            client.request("session/new", {
-                cwd: workspace,
-                mcpServers: [{ name: "x", command: "y", args: [], env: [] }],
-            }),
-        ).rejects.toThrow(/mcpServers/);
+    }, 60_000);
+
+    it("accepts mcpServers, tolerating dead servers and unknown transports", async () => {
+        // failOnStartupError is off: a server that cannot start must not take
+        // the session down, and an unsupported transport is skipped. The name
+        // is sanitized onto mcp-client's [A-Za-z0-9_-]{1,32} charset.
+        const result = (await client.request("session/new", {
+            cwd: workspace,
+            mcpServers: [
+                {
+                    name: "dead server! (test)",
+                    command: "/nonexistent/dsh-acp-mcp-e2e",
+                    args: [],
+                    env: [{ name: "X", value: "1" }],
+                },
+                { type: "sse", name: "legacy", url: "http://127.0.0.1:1/sse" },
+            ],
+        })) as Record<string, unknown>;
+        expect(result["sessionId"]).toBeTruthy();
     }, 60_000);
 
     it("serves the /status command without touching the model", async () => {
