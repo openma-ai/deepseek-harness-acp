@@ -62,7 +62,7 @@ import type {} from "@deepseek-ai/dsh-user-approval";
 import type {} from "@deepseek-ai/dsh-session-persistence";
 
 import { VERSION } from "../version.ts";
-import { logWarn } from "../log.ts";
+import { logDebug, logWarn } from "../log.ts";
 import { buildReplay } from "./history.ts";
 import { convertPrompt, UnsupportedPromptContentError } from "./prompt.ts";
 import { SessionProjection, turnEndToStopReason, type HarnessEvent, type SessionUpdate } from "./translate.ts";
@@ -79,13 +79,15 @@ export interface BridgeHarness {
     foldSessionTitle: typeof foldSessionTitle;
     setSandboxMode: typeof setSandboxMode;
     sandboxModes: readonly SandboxMode[];
+    /** Brands a credential reference for `ctx.credentials` lookups (optional seam). */
+    credentialRef?: (value: string) => unknown;
 }
 
 export interface AcpBridgeConfig {
-    /** Provider route for ACP-created agents. */
-    provider: string;
-    /** Default model for ACP-created agents. */
-    model: string;
+    /** Provider route for ACP-created agents; omitted = the composition's default. */
+    provider?: string;
+    /** Default model for ACP-created agents; omitted = the composition's default. */
+    model?: string;
     /** Selectable model candidates surfaced as a session config option. */
     models?: string[];
     /** Optional per-request output-token cap. */
@@ -94,8 +96,12 @@ export interface AcpBridgeConfig {
     permissionMode?: SandboxMode;
     /** Runtime-only transport override; production uses stdio. */
     stream?: Stream;
-    /** Host functions resolved from the DeepSeek Harness installation. */
-    harness: BridgeHarness;
+    /**
+     * Host functions resolved from the DeepSeek Harness installation. The
+     * standalone CLI injects these; bundle/profile mounts omit them and the
+     * bridge imports its own copies (src/bridge/self-harness.ts).
+     */
+    harness?: BridgeHarness;
 }
 
 interface Inflight {
@@ -110,7 +116,8 @@ interface SessionRecord {
     dispose: () => Promise<void>;
     projection: SessionProjection;
     modeId: SandboxMode;
-    model: string;
+    /** Selected model; undefined = the composition's default route. */
+    model: string | undefined;
     cancelled: boolean;
     inflight: Inflight | undefined;
 }
@@ -128,12 +135,10 @@ function authRequired(detail: string): RequestError {
     return RequestError.authRequired(undefined, detail);
 }
 
-function credentialPresent(): boolean {
+function envCredentialPresent(): boolean {
     // A custom base URL counts: OpenAI-compatible proxies may not need a key.
     return Boolean(process.env["DEEPSEEK_API_KEY"] || process.env["DEEPSEEK_BASE_URL"]);
 }
-
-const AUTH_METHOD_ID = "deepseek-api-key";
 
 const MODE_LABELS: Record<SandboxMode, { name: string; description: string }> = {
     "read-only": { name: "Read-only", description: "Bash and file mutations are denied by the sandbox" },
@@ -154,24 +159,58 @@ const MODE_LABELS: Record<SandboxMode, { name: string; description: string }> = 
  *   `sessionPersistence`, `approval`, and `subagents` services.
  * @param config - provider/model selection and optional test transport.
  */
-export function apply(ctx: Context, config: AcpBridgeConfig): void {
+export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise<void> {
     // Capture injected services during apply; handlers run outside the scope.
     const agents = ctx.agents;
-    const { createUserMessage, errorChain, sessionId: SessionId, foldSessionTitle, setSandboxMode } = config.harness;
-    const SANDBOX_MODES = config.harness.sandboxModes;
+    const harness = config.harness ?? (await import("./self-harness.ts")).selfHarness();
+    const { createUserMessage, errorChain, sessionId: SessionId, foldSessionTitle, setSandboxMode } = harness;
+    const SANDBOX_MODES = harness.sandboxModes;
     const sessions = new Map<string, SessionRecord>();
     let closed = false;
     let conn: AgentSideConnection;
 
     const modelCandidates = (): string[] => {
-        const seen = new Set<string>([config.model]);
+        const seen = new Set<string>();
+        if (config.model !== undefined) seen.add(config.model);
         for (const model of config.models ?? []) if (model.trim().length > 0) seen.add(model.trim());
         return [...seen];
     };
 
-    const agentOptionsFor = (model: string): { provider: string; model: string; maxTokens?: number } => ({
-        provider: config.provider,
-        model,
+    /**
+     * Whether a model call has any chance of authenticating: the credential
+     * seam first (the key saved through the dsh Web UI, hot-reloaded from
+     * ~/.dsh/.credentials.yaml), then the process environment. Composition
+     * boots activate plugins concurrently, so wait briefly for the seam to
+     * register instead of failing a session that raced the loader.
+     */
+    const credentialPresent = async (): Promise<boolean> => {
+        if (envCredentialPresent()) return true;
+        const brand = harness.credentialRef;
+        if (brand === undefined) return false;
+        const deadline = Date.now() + 5000;
+        for (;;) {
+            const seam = ctx.get("credentials") as
+                | { resolve(ref: unknown): Promise<{ value: string } | undefined> }
+                | undefined;
+            if (seam !== undefined) {
+                try {
+                    return (await seam.resolve(brand("DEEPSEEK_API_KEY"))) !== undefined;
+                } catch (error: unknown) {
+                    logWarn(`credential lookup failed: ${String(error)}`);
+                    return false;
+                }
+            }
+            if (Date.now() >= deadline) {
+                logDebug("credential gate: no credentials service registered within 5s");
+                return false;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+    };
+
+    const agentOptionsFor = (model: string | undefined): { provider?: string; model?: string; maxTokens?: number } => ({
+        ...(config.provider !== undefined ? { provider: config.provider } : {}),
+        ...(model !== undefined ? { model } : {}),
         ...(config.maxTokens !== undefined ? { maxTokens: config.maxTokens } : {}),
     });
 
@@ -215,7 +254,9 @@ export function apply(ctx: Context, config: AcpBridgeConfig): void {
 
     const configOptions = (record: SessionRecord): SessionConfigOption[] => {
         const candidates = modelCandidates();
-        if (!candidates.includes(record.model)) candidates.unshift(record.model);
+        const current = record.model ?? candidates[0];
+        if (current === undefined) return [];
+        if (!candidates.includes(current)) candidates.unshift(current);
         if (candidates.length < 2) return [];
         return [
             {
@@ -223,7 +264,7 @@ export function apply(ctx: Context, config: AcpBridgeConfig): void {
                 id: "model",
                 name: "Model",
                 category: "model",
-                currentValue: record.model,
+                currentValue: current,
                 options: candidates.map((model) => ({ value: model, name: model })),
             },
         ];
@@ -245,8 +286,8 @@ export function apply(ctx: Context, config: AcpBridgeConfig): void {
             "",
             `| | |`,
             `|---|---|`,
-            `| Provider | ${config.provider} |`,
-            `| Model | ${record.model} |`,
+            `| Provider | ${config.provider ?? "(composition default)"} |`,
+            `| Model | ${record.model ?? record.agent.options.model ?? "(composition default)"} |`,
             `| Permission mode | ${record.modeId} |`,
             `| Workspace | ${record.agent.session.header.cwd ?? process.cwd()} |`,
             `| Session | ${String(record.agent.session.id)} |`,
@@ -259,7 +300,7 @@ export function apply(ctx: Context, config: AcpBridgeConfig): void {
         sessionId: string,
         agent: Agent,
         dispose: () => Promise<void>,
-        model: string,
+        model: string | undefined,
         modeId: SandboxMode,
         projection?: SessionProjection,
     ): SessionRecord => {
@@ -355,19 +396,10 @@ export function apply(ctx: Context, config: AcpBridgeConfig): void {
             initialize(params: InitializeRequest): Promise<InitializeResponse> {
                 const hasPersistence = ctx.get("sessionPersistence") !== undefined;
                 const requested = params.protocolVersion;
-                const authMethods: AuthMethod[] = [
-                    {
-                        type: "env_var",
-                        id: AUTH_METHOD_ID,
-                        name: "DeepSeek API key",
-                        description:
-                            "Provide DEEPSEEK_API_KEY (and optionally DEEPSEEK_BASE_URL) in the environment that launches dsh-acp.",
-                        vars: [
-                            { name: "DEEPSEEK_API_KEY", label: "DeepSeek API key", secret: true },
-                            { name: "DEEPSEEK_BASE_URL", label: "OpenAI-compatible base URL", optional: true },
-                        ],
-                    },
-                ];
+                // No ACP auth methods: credential management belongs to the
+                // harness (dsh Web UI → ~/.dsh/.credentials.yaml, hot-reloaded)
+                // or the launching environment. The adapter reuses whatever
+                // the user already configured; clients never mediate auth.
                 return Promise.resolve({
                     protocolVersion:
                         typeof requested === "number" && requested >= 1 && requested < PROTOCOL_VERSION
@@ -379,27 +411,28 @@ export function apply(ctx: Context, config: AcpBridgeConfig): void {
                         promptCapabilities: { image: false, audio: false, embeddedContext: true },
                         ...(hasPersistence ? { sessionCapabilities: { list: {} } } : {}),
                     },
-                    authMethods,
+                    authMethods: [],
                 });
             },
 
-            authenticate(params: AuthenticateRequest): Promise<void> {
-                if (params.methodId !== AUTH_METHOD_ID) {
-                    throw invalidParams(`unknown auth method: ${params.methodId}`);
-                }
-                if (!credentialPresent()) {
+            async authenticate(_params: AuthenticateRequest): Promise<void> {
+                // No advertised methods; accept the call defensively and
+                // re-check the ambient credential so a client retry after the
+                // user configures dsh succeeds.
+                if (!(await credentialPresent())) {
                     throw authRequired(
-                        "DEEPSEEK_API_KEY (or DEEPSEEK_BASE_URL) is not set in the dsh-acp environment",
+                        "no DeepSeek credential found: save one in the dsh Web UI (Settings → Models) or set DEEPSEEK_API_KEY",
                     );
                 }
-                return Promise.resolve();
             },
 
             async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
                 assertOpen();
                 validateSessionParams(params.cwd, params.mcpServers);
-                if (!credentialPresent()) {
-                    throw authRequired("set DEEPSEEK_API_KEY before creating a session");
+                if (!(await credentialPresent())) {
+                    throw authRequired(
+                        "no DeepSeek credential found: save one in the dsh Web UI (Settings → Models) or set DEEPSEEK_API_KEY",
+                    );
                 }
                 const sessionId = SessionId(randomUUID());
                 const handle = await agents.create({

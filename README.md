@@ -2,84 +2,81 @@
 
 Use [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) from [Agent Client Protocol](https://agentclientprotocol.com/) clients such as [Zed](https://zed.dev).
 
-`dsh-acp` is a stdio ACP agent server. It attaches to **your** DeepSeek Harness installation — the way [codex-acp](https://github.com/agentclientprotocol/codex-acp) runs the Codex you point it at — composes the harness agent runtime in-process (model adapter, sandboxed bash/filesystem tools, todo planning, JSONL session persistence, context compaction), and maps the harness session-event log onto the full ACP update vocabulary.
+`@deepseek-ai-harness/dsh-acp` is a **dsh profile plugin** (a harness bundle) and a standalone stdio ACP server. In both shapes it maps the harness session-event log onto the full ACP update vocabulary and reuses your existing dsh setup — including the API key you saved in the dsh Web UI. No credentials in your editor config.
 
-## Install
+## Install (recommended: as a dsh plugin)
 
-**1. Install DeepSeek Harness first** (the host this adapter attaches to):
+**1. Have DeepSeek Harness** (you probably already do):
 
 ```bash
 npm install -g @deepseek-ai/dsh
-dsh --version
+dsh web        # first run: save your DeepSeek API key in Settings → Models
 ```
 
-**2. Install dsh-acp** (from a checkout, until it is published):
+**2. Add the ACP bundle to a profile:**
 
 ```bash
-npm install
-npm run pack:local
-npm install -g ./deepseek-ai-harness-dsh-acp-0.1.0.tgz
-dsh-acp --version
+dsh plugin --profile acp add -w @deepseek-ai-harness/dsh-acp
 ```
 
-The adapter's only runtime dependency is the ACP SDK (22 kB tarball); every harness module loads from your `@deepseek-ai/dsh` installation.
+This creates `$DSH_HOME/profiles/acp`, installs the package, and registers the
+bundle (its `dsh.bundle` patch mounts the bridge over `@deepseek-ai/dsh-base`
+— the same product baseline as `dsh web`, with the module-reload watcher off).
 
-**3. Get a credential**: a DeepSeek API key in `DEEPSEEK_API_KEY`, or an OpenAI-compatible proxy in `DEEPSEEK_BASE_URL`.
-
-Requires Node.js ≥ 20 (the harness targets `^22.19 || >=24`; use 22+ for best results) on macOS or Linux.
-
-## Finding the harness
-
-`dsh-acp` looks for a DeepSeek Harness installation in this order:
-
-1. `--dsh-path` / `DSH_PATH` — the `dsh` binary path, the `@deepseek-ai/dsh` package directory, an npm prefix, or any directory whose `node_modules` carries the `@deepseek-ai` scope:
-
-   ```bash
-   DSH_PATH="$(which dsh)" dsh-acp
-   ```
-
-2. dsh-acp's own package tree (development checkouts).
-3. `./node_modules` of the invoking directory (project-local installs).
-4. **`dsh` on `PATH`** — the normal case after `npm install -g @deepseek-ai/dsh`.
-5. The global npm root (`npm root -g`).
-
-If nothing matches, it exits with the probed locations and the install command above. An explicit `DSH_PATH` that does not contain a harness is an error, never a silent fallback.
-
-## Use with Zed
-
-Configure `dsh-acp` as an agent server. The only optional argument is the path
-to your `dsh` installation — leave it out and dsh-acp finds `dsh` on PATH:
+**3. Point Zed at it** (`settings.json`):
 
 ```jsonc
-// settings.json
 {
   "agent_servers": {
     "DeepSeek Harness": {
-      "command": "dsh-acp",
-      "args": [],
-      "env": {
-        "DEEPSEEK_API_KEY": "sk-your-key-here"
-      }
+      "command": "dsh",
+      "args": ["--profile", "acp"]
     }
   }
 }
 ```
 
-With an explicit harness location (e.g. a non-global or versioned install):
+That's it — no `env`, no keys in the editor. Credentials come from the
+harness's own credential store (`$DSH_HOME/.credentials.yaml`, the file the
+Web UI writes, hot-reloaded), with the process environment
+(`DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL`) as a fallback layer.
+
+Because the profile rides `dsh-base`, the agent in your editor is the full
+product: sandboxed bash and filesystem tools, todo plans, skills, subagents,
+workflows, web search, plan mode, LLM session titles, compaction — and it
+shares `$DSH_HOME/sessions`, so conversations started in the dsh Web UI can
+be listed and loaded from the editor.
+
+Override provider/model per profile in `$DSH_HOME/profiles/acp/cordis.patch.yml`
+(id-targeted patch on the `acp-bridge` row), or via `DSH_MODEL` /
+`DSH_PERMISSION_MODE` in the launch environment.
+
+## Install (alternative: standalone server)
+
+The package is also a self-contained ACP server that attaches to a DeepSeek
+Harness installation — the way codex-acp runs the Codex you point it at:
+
+```bash
+npm install -g @deepseek-ai-harness/dsh-acp
+dsh-acp --help
+```
 
 ```jsonc
 {
   "agent_servers": {
     "DeepSeek Harness": {
       "command": "dsh-acp",
-      "args": ["--dsh-path", "/opt/deepseek/lib/node_modules/@deepseek-ai/dsh"],
-      "env": { "DEEPSEEK_API_KEY": "sk-your-key-here" }
+      "args": []               // optional: ["--dsh-path", "/path/to/dsh"]
     }
   }
 }
 ```
 
-Any ACP client works the same way: spawn `dsh-acp` and speak newline-delimited JSON-RPC on its stdio. Stdout is protocol-pure; diagnostics go to stderr.
+It finds the harness via `--dsh-path`/`DSH_PATH`, its own tree,
+`./node_modules`, `dsh` on PATH, or `npm root -g` — and composes a fixed
+coding-agent tree from it (spine, sandboxed bash/fs, todo, compaction). Use
+this mode when you want an ACP server without creating a profile; use the
+profile mode when you want your full dsh composition in the editor.
 
 ## Features
 

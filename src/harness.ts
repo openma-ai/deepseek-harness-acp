@@ -294,6 +294,12 @@ export const PLUGIN_SPECIFIERS = {
     compaction: "@deepseek-ai/dsh-compaction-basic",
 } as const;
 
+/** Optional host modules: mounted when the installation provides them. */
+export const OPTIONAL_PLUGIN_SPECIFIERS = {
+    credentials: "@deepseek-ai/dsh-credentials-local",
+    credentialsSeam: "@deepseek-ai/dsh-credentials",
+} as const;
+
 export type PluginKey = keyof typeof PLUGIN_SPECIFIERS;
 
 /**
@@ -301,12 +307,19 @@ export type PluginKey = keyof typeof PLUGIN_SPECIFIERS;
  */
 export async function loadKit(host: HarnessHost): Promise<HarnessKit> {
     const keys = Object.keys(PLUGIN_SPECIFIERS) as PluginKey[];
+    const optionalKeys = Object.keys(OPTIONAL_PLUGIN_SPECIFIERS) as (keyof typeof OPTIONAL_PLUGIN_SPECIFIERS)[];
     const [cordis, ...pluginModules] = await Promise.all([
         loadHostModule(host, "@deepseek-ai/cordis"),
         ...keys.map((key) => loadHostModule(host, PLUGIN_SPECIFIERS[key])),
+        ...optionalKeys.map((key) =>
+            loadHostModule(host, OPTIONAL_PLUGIN_SPECIFIERS[key]).catch((error: unknown) => {
+                logDebug(`optional module ${OPTIONAL_PLUGIN_SPECIFIERS[key]} unavailable: ${String(error)}`);
+                return undefined;
+            }),
+        ),
     ]);
     const plugins: Record<string, ModuleNamespace> = {};
-    keys.forEach((key, index) => {
+    [...keys, ...optionalKeys].forEach((key, index) => {
         const module = pluginModules[index];
         if (module !== undefined) plugins[key] = module;
     });

@@ -143,7 +143,7 @@ describe("dsh-acp server (e2e smoke)", () => {
 
     let sessionId: string;
 
-    it("initializes with capabilities and an env-var auth method", async () => {
+    it("initializes with capabilities and no ACP-mediated auth", async () => {
         const result = (await client.request("initialize", {
             protocolVersion: 1,
             clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
@@ -153,8 +153,9 @@ describe("dsh-acp server (e2e smoke)", () => {
         const capabilities = result["agentCapabilities"] as Record<string, unknown>;
         expect(capabilities["loadSession"]).toBe(true);
         expect(capabilities["promptCapabilities"]).toMatchObject({ embeddedContext: true, image: false });
-        const authMethods = result["authMethods"] as Array<Record<string, unknown>>;
-        expect(authMethods[0]).toMatchObject({ type: "env_var", id: "deepseek-api-key" });
+        // Credential management is the harness's own concern (dsh Web UI /
+        // environment); the adapter advertises no ACP auth methods.
+        expect(result["authMethods"]).toEqual([]);
     }, 60_000);
 
     it("creates a session with modes and model config options", async () => {

@@ -81,6 +81,9 @@ export async function apply(ctx: Context, config: AppConfig): Promise<void> {
     };
 
     // The bridge needs a handful of host functions beyond the plugin tree.
+    const credentialsSeam = p["credentialsSeam"] as
+        | { credentialRef?: (value: string) => unknown }
+        | undefined;
     const harness: BridgeHarness = {
         createUserMessage: kit.llm.createUserMessage,
         errorChain: kit.llm.errorChain,
@@ -88,6 +91,9 @@ export async function apply(ctx: Context, config: AppConfig): Promise<void> {
         foldSessionTitle: kit.sessionTitle.foldSessionTitle,
         setSandboxMode: kit.sandboxPolicy.setSandboxMode,
         sandboxModes: kit.sandboxPolicy.SANDBOX_MODES,
+        ...(credentialsSeam?.credentialRef !== undefined
+            ? { credentialRef: credentialsSeam.credentialRef }
+            : {}),
     };
 
     await (ctx as unknown as typeof anyCtx).effect(async function* (this: unknown) {
@@ -99,8 +105,20 @@ export async function apply(ctx: Context, config: AppConfig): Promise<void> {
         await spine;
         yield spine.dispose;
 
-        // Model adapter: resolves DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL from
-        // the launching environment; nothing secret is inlined here.
+        // User credentials: reuse the key the user saved through the dsh
+        // Web UI (~/.dsh/.credentials.yaml, hot-reloaded), with the process
+        // environment as a fallback layer. Optional: older hosts without the
+        // local provider still work via DEEPSEEK_API_KEY.
+        const credentialsModule = p["credentials"];
+        if (credentialsModule !== undefined) {
+            const credentials = anyCtx.plugin(pluginOf(credentialsModule), {});
+            await credentials;
+            yield credentials.dispose;
+        }
+
+        // Model adapter: resolves DEEPSEEK_API_KEY through the credential
+        // seam mounted above, falling back to the launching environment;
+        // nothing secret is inlined here.
         const llm = anyCtx.plugin(p["llmDeepseek"]!, {
             thinking: settings.thinking ? "enabled" : "disabled",
             reasoningEffort: settings.reasoningEffort,
