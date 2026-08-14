@@ -17,10 +17,11 @@ jobs:
       matrix:
         # windows is exercised in ci.yml but does not gate releases yet.
         os: [ubuntu-latest, macos-latest]
-        node: [20, 24]
+        # node:zlib zstd APIs (used by the harness session store) need >= 22.15
+        node: [22, 24]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -35,8 +36,8 @@ jobs:
       id-token: write # npm OIDC trusted publishing
       contents: write # create the GitHub Release
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 24 # bundles npm >= 11.5.1 (OIDC-capable)
           registry-url: "https://registry.npmjs.org"

@@ -37,7 +37,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.15"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
