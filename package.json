@@ -3,7 +3,15 @@
   "publishConfig": {
     "access": "public"
   },
-  "version": "0.1.0",
+  "version": "0.1.0-beta.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/openma-ai/deepseek-harness-acp.git"
+  },
+  "homepage": "https://github.com/openma-ai/deepseek-harness-acp#readme",
+  "bugs": {
+    "url": "https://github.com/openma-ai/deepseek-harness-acp/issues"
+  },
   "description": "Agent Client Protocol (ACP) adapter for DeepSeek Harness \u2014 use DeepSeek Harness from ACP clients such as Zed.",
   "main": "dist/index.js",
   "bin": {
