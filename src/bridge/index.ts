@@ -637,13 +637,25 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     const presetLabel = (id: string): string => id.charAt(0).toUpperCase() + id.slice(1);
 
     /** Sandbox confinement levels: the session-mode selector, always. */
-    const modeState = (record: SessionRecord): SessionModeState => ({
-        currentModeId: record.modeId,
-        availableModes: SANDBOX_MODES.map((mode) => {
-            const label = MODE_LABELS[mode] ?? { name: mode, description: "" };
-            return { id: mode, name: label.name, description: label.description };
-        }),
-    });
+    const modeState = (record: SessionRecord): SessionModeState => {
+        const permission = permissionService();
+        if (permission !== undefined && permission.names.length > 0) {
+            return {
+                currentModeId: record.modeId,
+                availableModes: permission.names.map((name) => {
+                    const spec = permission.resolve(name);
+                    return { id: name, name: spec.name, description: spec.description };
+                }),
+            };
+        }
+        return {
+            currentModeId: record.modeId,
+            availableModes: SANDBOX_MODES.map((mode) => {
+                const label = MODE_LABELS[mode] ?? { name: mode, description: "" };
+                return { id: mode, name: label.name, description: label.description };
+            }),
+        };
+    };
 
     /**
      * Switch the agent preset: record the durable fact, then rebuild the
@@ -710,7 +722,39 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     };
 
     /** Apply one sandbox mode: confinement, coupled approval default, mode update. */
+    /**
+     * The permission-presets service: the product's ONE user-facing
+     * permission concept. Each named preset bundles a sandbox confinement
+     * with its approval policy (read-only/ask, workspace-write/ask,
+     * danger-full-access/never by default — deployments can reconfigure the
+     * table). The Web UI and TUI surface exactly these presets and never a
+     * standalone approval toggle; the session-mode selector mirrors that.
+     */
+    interface PermissionPresetsService {
+        names: string[];
+        resolve(name: string): { sandbox: SandboxMode; approval: ApprovalPolicy; name: string; description: string };
+        current(events: readonly unknown[]): string | undefined;
+        apply(session: unknown, name: string, setApproval: (policy: ApprovalPolicy) => void): void;
+    }
+
+    const permissionService = (): PermissionPresetsService | undefined =>
+        ctx.get("permission") as PermissionPresetsService | undefined;
+
     const applyMode = (record: SessionRecord, sessionId: string, modeId: string): void => {
+        const permission = permissionService();
+        if (permission !== undefined && permission.names.includes(modeId)) {
+            // The authoritative path: records the durable permission/preset
+            // fact, applies the sandbox, and writes the bundled approval
+            // policy through the live agent.
+            let bundledApproval: ApprovalPolicy = record.approvals;
+            permission.apply(record.agent.session, modeId, (policy) => {
+                bundledApproval = policy;
+            });
+            setApprovalPolicy(record, bundledApproval);
+            record.modeId = permission.resolve(modeId).sandbox;
+            notify(sessionId, { sessionUpdate: "current_mode_update", currentModeId: modeId });
+            return;
+        }
         const mode = SANDBOX_MODES.find((candidate) => candidate === modeId);
         if (mode === undefined) throw invalidParams(`unknown mode: ${modeId}`);
         setSandboxMode(record.agent.session, mode);
@@ -753,22 +797,6 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     const configOptions = async (record: SessionRecord): Promise<SessionConfigOption[]> => {
         const result: SessionConfigOption[] = [];
 
-        result.push({
-            type: "select",
-            id: "mode",
-            name: "Mode",
-            category: "mode",
-            currentValue: record.modeId,
-            options: SANDBOX_MODES.map((mode) => {
-                const label = MODE_LABELS[mode] ?? { name: mode, description: "" };
-                return {
-                    value: mode,
-                    name: label.name,
-                    ...(label.description.length > 0 ? { description: label.description } : {}),
-                };
-            }),
-        });
-
         const models = await modelChoices(record);
         if (models.length >= 2) {
             result.push({
@@ -808,17 +836,6 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 })),
             });
         }
-
-        result.push({
-            type: "select",
-            id: "approvals",
-            name: "Approvals",
-            currentValue: record.approvals,
-            options: [
-                { value: "ask", name: "Ask", description: "Ask before actions beyond the sandbox mode" },
-                { value: "never", name: "Never ask", description: "Auto-approve every permission request" },
-            ],
-        });
 
         // Agent presets: one model-facing composition (persona, tool surface,
         // compaction) per entry, switchable per session alongside the sandbox
@@ -1201,15 +1218,20 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     projection,
                 );
                 if (presetId !== undefined) record.preset = presetId;
-                // The approval policy is a logged, replayed fact (the service
-                // folds approval/policy events); mirror the same fold so the
-                // advertised option matches what the service will enforce.
-                for (let index = events.length - 1; index >= 0; index -= 1) {
-                    const event = events[index] as unknown as { type?: string; data?: { policy?: string } };
-                    if (event?.type === "approval/policy") {
-                        const policy = event.data?.policy;
-                        if (policy === "ask" || policy === "never") record.approvals = policy;
-                        break;
+                // Permission facts are logged and replayed (permission/preset,
+                // sandbox/mode, approval/policy events); mirror the service
+                // folds so the advertised state matches what is enforced.
+                {
+                    const permission = permissionService();
+                    const storedMode = permission?.current(events as unknown as unknown[]);
+                    if (storedMode !== undefined) record.modeId = storedMode as SandboxMode;
+                    for (let index = events.length - 1; index >= 0; index -= 1) {
+                        const event = events[index] as unknown as { type?: string; data?: { policy?: string } };
+                        if (event?.type === "approval/policy") {
+                            const policy = event.data?.policy;
+                            if (policy === "ask" || policy === "never") record.approvals = policy;
+                            break;
+                        }
                     }
                 }
                 ensureSelection(record);
@@ -1360,15 +1382,6 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 if (value === undefined) throw invalidParams(`invalid value: ${String(params.value)}`);
 
                 switch (params.configId) {
-                    case "mode": {
-                        applyMode(record, params.sessionId, value);
-                        break;
-                    }
-                    case "approvals": {
-                        if (value !== "ask" && value !== "never") throw invalidParams(`unknown approvals: ${value}`);
-                        setApprovalPolicy(record, value);
-                        break;
-                    }
                     case "preset": {
                         await switchPreset(record, params.sessionId, value);
                         break;
