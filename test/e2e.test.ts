@@ -181,9 +181,10 @@ describe("dsh-acp server (e2e smoke)", () => {
         expect(modes).toEqual(["read-only", "workspace-write", "danger-full-access"]);
         const configOptions = result["configOptions"] as Array<Record<string, unknown>>;
         const byId = new Map(configOptions.map((option) => [option["id"], option]));
-        // Permission is the session-mode selector only — approval policy is a
-        // preset-bundled fact, never a standalone option (matching the Web UI).
-        expect(byId.has("mode")).toBe(false);
+        // The permission level is both the session-mode state and a config
+        // option (some clients only render the latter); approval policy stays
+        // bundled inside it, never a standalone option (matching the Web UI).
+        expect(byId.get("mode")).toMatchObject({ type: "select", category: "mode", currentValue: "workspace-write" });
         expect(byId.has("approvals")).toBe(false);
         expect(byId.get("model")).toMatchObject({ type: "select", category: "model", currentValue: "deepseek-v4-flash" });
         expect(byId.get("effort")).toMatchObject({ type: "select", category: "thought_level" });
@@ -266,14 +267,17 @@ describe("dsh-acp server (e2e smoke)", () => {
         );
         expect(byId.get("effort")).toMatchObject({ currentValue: "high" });
 
-        // Permission facts travel only through the session-mode selector.
-        const modeError = await client
-            .request("session/set_config_option", { sessionId, configId: "mode", value: "read-only" })
-            .then(
-                () => undefined,
-                (error: unknown) => error,
-            );
-        expect(String(modeError)).toMatch(/unknown config option/);
+        // Permission facts travel through the mode option or session modes;
+        // a standalone approvals knob stays rejected.
+        const modeSet = (await client.request("session/set_config_option", {
+            sessionId,
+            configId: "mode",
+            value: "read-only",
+        })) as Record<string, unknown>;
+        const modeById = new Map(
+            (modeSet["configOptions"] as Array<Record<string, unknown>>).map((option) => [option["id"], option]),
+        );
+        expect(modeById.get("mode")).toMatchObject({ currentValue: "read-only" });
         const approvalsError = await client
             .request("session/set_config_option", { sessionId, configId: "approvals", value: "never" })
             .then(

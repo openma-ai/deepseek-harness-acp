@@ -124,8 +124,13 @@ export async function bootAcpProfile(
     // The bridge ships with THIS binary: whatever composition source names
     // it (the virtual bundle list or a real profile's), the row must load
     // the running package's entry, never an older copy installed elsewhere.
+    // In a source run (tsx — this module's URL ends in .ts) prefer the live
+    // sources over a possibly stale dist/ build.
     const distBridge = join(ownRoot(), "dist", "bridge.js");
-    const bridgeEntry = existsSync(distBridge) ? distBridge : join(ownRoot(), "src", "bundle.ts");
+    const bridgeEntry =
+        import.meta.url.endsWith(".ts") || !existsSync(distBridge)
+            ? join(ownRoot(), "src", "bundle.ts")
+            : distBridge;
     const realProfileDir = join(home, "profiles", "acp");
     if (existsSync(join(realProfileDir, "package.json"))) {
         // Exactly the dsh CLI's path: the profile directory is the module

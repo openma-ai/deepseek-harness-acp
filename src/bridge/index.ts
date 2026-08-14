@@ -797,6 +797,32 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     const configOptions = async (record: SessionRecord): Promise<SessionConfigOption[]> => {
         const result: SessionConfigOption[] = [];
 
+        // The permission level (the product's one user-facing {sandbox,
+        // approval} dimension) ALSO travels as a config option: session modes
+        // carry the same state for clients that render them, but some (Zed
+        // among them) only surface config options.
+        {
+            const permission = permissionService();
+            const levels =
+                permission !== undefined && permission.names.length > 0
+                    ? permission.names.map((name) => {
+                          const spec = permission.resolve(name);
+                          return { value: name, name: spec.name, description: spec.description };
+                      })
+                    : SANDBOX_MODES.map((mode) => {
+                          const label = MODE_LABELS[mode] ?? { name: mode, description: "" };
+                          return { value: mode, name: label.name, description: label.description };
+                      });
+            result.push({
+                type: "select",
+                id: "mode",
+                name: "Permissions",
+                category: "mode",
+                currentValue: record.modeId,
+                options: levels,
+            });
+        }
+
         const models = await modelChoices(record);
         if (models.length >= 2) {
             result.push({
@@ -1382,6 +1408,10 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 if (value === undefined) throw invalidParams(`invalid value: ${String(params.value)}`);
 
                 switch (params.configId) {
+                    case "mode": {
+                        applyMode(record, params.sessionId, value);
+                        break;
+                    }
                     case "preset": {
                         await switchPreset(record, params.sessionId, value);
                         break;
