@@ -161,6 +161,33 @@ npm install --prefix /tmp/dsh-host @deepseek-ai/dsh
 DSH_ACP_TEST_HOST=/tmp/dsh-host npm test
 ```
 
+### Live iteration: paired profiles
+
+Keep the profile you use in your editor on the published package, and point a
+second profile at this worktree via a pnpm symlink:
+
+```bash
+# stable — what Zed uses day to day
+dsh plugin --profile acp add -w @openma/deepseek-harness-acp
+
+# dev — a symlink to this checkout; no packing, no version bumps
+dsh plugin --profile acp-test add -w "link:$PWD"
+```
+
+The dev loop is then just `npm run build` and a process restart (`dist/` and
+`cordis.patch.yml` are read through the link). Note pnpm treats `file:` as a
+copy install and caches same-version tarballs — `link:` avoids both. In Zed,
+register both entries:
+
+```jsonc
+{
+  "agent_servers": {
+    "DeepSeek Harness": { "command": "dsh", "args": ["--profile", "acp"] },
+    "DeepSeek Harness (dev)": { "command": "dsh", "args": ["--profile", "acp-test"] }
+  }
+}
+```
+
 ## License
 
 Apache-2.0.
