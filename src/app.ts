@@ -84,6 +84,13 @@ export async function apply(ctx: Context, config: AppConfig): Promise<void> {
     const credentialsSeam = p["credentialsSeam"] as
         | { credentialRef?: (value: string) => unknown }
         | undefined;
+    // rc builds shipped `installModelSelection` under a mangled name for a
+    // while; accept either so attach mode works across host versions.
+    const agentsModule = p["agents"] as unknown as {
+        installModelSelection?: BridgeHarness["installModelSelection"];
+        ln?: BridgeHarness["installModelSelection"];
+    };
+    const installModelSelection = agentsModule.installModelSelection ?? agentsModule.ln;
     const harness: BridgeHarness = {
         createUserMessage: kit.llm.createUserMessage,
         errorChain: kit.llm.errorChain,
@@ -91,6 +98,7 @@ export async function apply(ctx: Context, config: AppConfig): Promise<void> {
         foldSessionTitle: kit.sessionTitle.foldSessionTitle,
         setSandboxMode: kit.sandboxPolicy.setSandboxMode,
         sandboxModes: kit.sandboxPolicy.SANDBOX_MODES,
+        ...(installModelSelection !== undefined ? { installModelSelection } : {}),
         ...(credentialsSeam?.credentialRef !== undefined
             ? { credentialRef: credentialsSeam.credentialRef }
             : {}),

@@ -18,11 +18,19 @@ import { SessionId } from "@deepseek-ai/dsh-session";
 import { foldSessionTitle } from "@deepseek-ai/dsh-session-title";
 import { SANDBOX_MODES, setSandboxMode } from "@deepseek-ai/dsh-sandbox-policy";
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
+import * as agentModule from "@deepseek-ai/dsh-agent";
 import * as mcpClient from "@deepseek-ai/dsh-mcp-client";
 
 import type { BridgeHarness } from "./index.ts";
 
 export function selfHarness(): BridgeHarness {
+    // rc builds shipped `installModelSelection` under a mangled name for a
+    // while; accept either so bundle mounts work across host versions.
+    const agents = agentModule as unknown as {
+        installModelSelection?: BridgeHarness["installModelSelection"];
+        ln?: BridgeHarness["installModelSelection"];
+    };
+    const installModelSelection = agents.installModelSelection ?? agents.ln;
     return {
         createUserMessage,
         errorChain,
@@ -31,6 +39,7 @@ export function selfHarness(): BridgeHarness {
         setSandboxMode,
         sandboxModes: SANDBOX_MODES,
         credentialRef,
+        ...(installModelSelection !== undefined ? { installModelSelection } : {}),
         mcpClient: mcpClient as unknown as NonNullable<BridgeHarness["mcpClient"]>,
     };
 }

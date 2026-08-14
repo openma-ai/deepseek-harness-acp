@@ -82,6 +82,14 @@ export interface BridgeHarness {
     /** Brands a credential reference for `ctx.credentials` lookups (optional seam). */
     credentialRef?: (value: string) => unknown;
     /**
+     * `installModelSelection` from `@deepseek-ai/dsh-agent` (optional seam):
+     * couples one mutable selection to the agent's prompt assembly so
+     * provider/model/reasoning-effort switches apply on the next step without
+     * recreating the agent. Older hosts may not export it; the bridge then
+     * hides the effort option and keeps resume-based model switching only.
+     */
+    installModelSelection?: (agentCtx: unknown, selection: ModelSelectionRef) => () => void;
+    /**
      * The `@deepseek-ai/dsh-mcp-client` plugin module (optional seam). One
      * mounted instance connects to one MCP server and registers its tools on
      * `ctx.tools` as `mcp__<serverName>__<rawName>`; disposal disconnects and
@@ -118,6 +126,21 @@ interface Inflight {
     turn: number | undefined;
 }
 
+/** One live model selection: provider route, model id, optional adapter-owned effort. */
+export interface ModelSelectionValue {
+    provider: string;
+    model: string;
+    reasoningEffort?: string;
+}
+
+/** Mutable selection snapshotted by prompt assembly (dsh-agent model-selection seam). */
+export interface ModelSelectionRef {
+    current: ModelSelectionValue | undefined;
+    assembled: ModelSelectionValue | undefined;
+}
+
+type ApprovalPolicy = "ask" | "never";
+
 interface SessionRecord {
     agent: Agent;
     dispose: () => Promise<void>;
@@ -127,6 +150,12 @@ interface SessionRecord {
     model: string | undefined;
     /** Selected provider route; undefined = the configured default. */
     provider?: string;
+    /** User-picked reasoning effort for this session; undefined = adapter/default behavior. */
+    effort?: string;
+    /** Current permission policy: "ask" prompts, "never" auto-approves. */
+    approvals: ApprovalPolicy;
+    /** Installed model-selection ref (lazy; created on the first effort/model pick). */
+    selection?: ModelSelectionRef;
     cancelled: boolean;
     inflight: Inflight | undefined;
 }
@@ -230,6 +259,13 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     /** Cached adapter directory; invalidated by `llm/adapters-updated`. */
     let liveCatalog: ModelChoice[] | undefined;
 
+    /** Per-route reasoning-effort metadata; invalidated with the catalog. */
+    interface EffortCatalog {
+        efforts: { id: string; name: string; description?: string }[];
+        defaultEffort?: string;
+    }
+    const effortCache = new Map<string, EffortCatalog | undefined>();
+
     const discoverModels = async (): Promise<ModelChoice[]> => {
         if (liveCatalog !== undefined) return liveCatalog;
         const llm = ctx.get("llm") as
@@ -268,7 +304,194 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         // A settings edit (Web UI Models page) registered or withdrew routes;
         // rebuild on next use so new third-party models appear immediately.
         liveCatalog = undefined;
+        effortCache.clear();
     });
+
+    /**
+     * The session's effective provider/model route: explicit session picks
+     * first, then bridge config, then the composition default, then the last
+     * logged request header (accurate once a request ran).
+     */
+    const routeOf = (record: SessionRecord): { provider?: string; model?: string } => {
+        const logged = loggedConfig(record);
+        const provider = record.provider ?? defaultProvider() ?? logged?.provider;
+        const model =
+            record.model ??
+            config.model ??
+            defaultSelection().model ??
+            logged?.model ??
+            record.agent.options.model;
+        return {
+            ...(provider !== undefined ? { provider } : {}),
+            ...(model !== undefined ? { model } : {}),
+        };
+    };
+
+    /** The conversation's last logged call config (provider/model/effort), when any request ran. */
+    const loggedConfig = (
+        record: SessionRecord,
+    ): { provider: string; model: string; reasoningEffort?: string } | undefined => {
+        try {
+            const header = (
+                record.agent.session as unknown as {
+                    requestHeader?: () => { config?: { provider: string; model: string; reasoningEffort?: unknown } } | undefined;
+                }
+            ).requestHeader?.();
+            const cfg = header?.config;
+            if (cfg === undefined) return undefined;
+            return {
+                provider: cfg.provider,
+                model: cfg.model,
+                ...(cfg.reasoningEffort !== undefined ? { reasoningEffort: String(cfg.reasoningEffort) } : {}),
+            };
+        } catch {
+            return undefined;
+        }
+    };
+
+    /** Selectable reasoning efforts for one exact route, from the owning adapter. */
+    const effortCatalog = async (
+        provider: string | undefined,
+        model: string | undefined,
+    ): Promise<EffortCatalog | undefined> => {
+        if (provider === undefined || model === undefined) return undefined;
+        const key = `${provider}::${model}`;
+        if (effortCache.has(key)) return effortCache.get(key);
+        const llm = ctx.get("llm") as
+            | {
+                  resolveModelInfo?(
+                      provider: string,
+                      model: string,
+                  ): Promise<{
+                      reasoning?: {
+                          efforts: readonly { id: unknown; name: string; description?: string }[];
+                          defaultEffort?: unknown;
+                      };
+                  }>;
+              }
+            | undefined;
+        let catalog: EffortCatalog | undefined;
+        try {
+            const reasoning = (await llm?.resolveModelInfo?.(provider, model))?.reasoning;
+            if (reasoning !== undefined && reasoning.efforts.length > 0) {
+                catalog = {
+                    efforts: reasoning.efforts.map((effort) => ({
+                        id: String(effort.id),
+                        name: effort.name,
+                        ...(effort.description !== undefined ? { description: effort.description } : {}),
+                    })),
+                    ...(reasoning.defaultEffort !== undefined
+                        ? { defaultEffort: String(reasoning.defaultEffort) }
+                        : {}),
+                };
+            }
+        } catch (error: unknown) {
+            logDebug(`resolveModelInfo(${key}) failed: ${String(error)}`);
+        }
+        effortCache.set(key, catalog);
+        return catalog;
+    };
+
+    /**
+     * Install (once per live agent) the mutable selection prompt assembly
+     * snapshots. Reads fall back to the logged header, then the session's
+     * route, so installation alone never changes behavior.
+     */
+    const ensureSelection = (record: SessionRecord): ModelSelectionRef | undefined => {
+        const install = harness.installModelSelection;
+        if (install === undefined) return undefined;
+        if (record.selection !== undefined) return record.selection;
+        let picked: ModelSelectionValue | undefined;
+        const selection: ModelSelectionRef = {
+            get current(): ModelSelectionValue | undefined {
+                if (picked !== undefined) return picked;
+                const logged = loggedConfig(record);
+                if (logged !== undefined) return logged;
+                const { provider, model } = routeOf(record);
+                if (provider === undefined || model === undefined) return undefined;
+                return { provider, model };
+            },
+            set current(next: ModelSelectionValue | undefined) {
+                picked = next;
+            },
+            assembled: undefined,
+        };
+        try {
+            install((record.agent as unknown as { ctx: unknown }).ctx, selection);
+        } catch (error: unknown) {
+            logWarn(`installModelSelection failed: ${String(error)}`);
+            return undefined;
+        }
+        record.selection = selection;
+        return selection;
+    };
+
+    /**
+     * Resume-based model switching: model options are fixed at agent
+     * construction, so swap by resuming the same durable session under new
+     * options. A picked reasoning effort survives when the new route offers it.
+     */
+    const switchModel = async (record: SessionRecord, acpSessionId: string, value: string): Promise<void> => {
+        if (record.inflight !== undefined) {
+            throw invalidParams("cannot switch models while a prompt is running");
+        }
+        const choice = decodeChoice(value);
+        const known = new Set<string>([
+            ...modelCandidates().map((model) => encodeChoice(undefined, model)),
+            ...(await discoverModels()).map((entry) => encodeChoice(entry.provider, entry.model)),
+            encodeChoice(record.provider, record.model ?? ""),
+        ]);
+        if (!known.has(value)) throw invalidParams(`unknown model: ${value}`);
+        if (choice.model === record.model && choice.provider === (record.provider ?? defaultProvider())) return;
+        const sessionId = record.agent.session.id;
+        await record.dispose().catch((error: unknown) => {
+            logWarn(`dispose during model switch failed: ${String(error)}`);
+        });
+        let handle;
+        try {
+            handle = await agents.resume({
+                resumeSessionId: sessionId,
+                agentOptions: agentOptionsFor(choice.model, choice.provider),
+            });
+        } catch (error: unknown) {
+            sessions.delete(acpSessionId);
+            throw internalError(`model switch failed: ${errorChain(error)}`);
+        }
+        record.agent = handle.agent;
+        record.dispose = () => handle.dispose();
+        record.model = choice.model;
+        if (choice.provider !== undefined && choice.provider !== defaultProvider()) {
+            record.provider = choice.provider;
+        } else {
+            delete record.provider;
+        }
+        // The old selection ref died with the disposed agent's scope.
+        delete record.selection;
+        if (record.effort !== undefined) {
+            const route = routeOf(record);
+            const catalog = await effortCatalog(route.provider, route.model);
+            if (
+                catalog?.efforts.some((effort) => effort.id === record.effort) === true &&
+                route.provider !== undefined &&
+                route.model !== undefined
+            ) {
+                const selection = ensureSelection(record);
+                if (selection !== undefined) {
+                    selection.current = {
+                        provider: route.provider,
+                        model: route.model,
+                        reasoningEffort: record.effort,
+                    };
+                }
+            } else {
+                // The new route does not offer the picked effort; fall back to
+                // its default instead of failing every request.
+                delete record.effort;
+            }
+        }
+        // Approval policy is agent-scoped state; re-apply it to the new agent.
+        setApprovalPolicy(record, record.approvals);
+    };
 
     /**
      * Whether a model call has any chance of authenticating: the credential
@@ -353,7 +576,29 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         }),
     });
 
-    const configOptions = async (record: SessionRecord): Promise<SessionConfigOption[]> => {
+    /** Flip the per-agent approval policy, mirroring the result on the record. */
+    const setApprovalPolicy = (record: SessionRecord, policy: ApprovalPolicy): void => {
+        try {
+            (ctx.get("approval") as { setPolicy?: (agent: Agent, policy: ApprovalPolicy) => void } | undefined)
+                ?.setPolicy?.(record.agent, policy);
+        } catch (error: unknown) {
+            logWarn(`approval policy switch failed: ${String(error)}`);
+        }
+        record.approvals = policy;
+    };
+
+    /** Apply one sandbox mode: confinement, coupled approval default, mode update. */
+    const applyMode = (record: SessionRecord, sessionId: string, modeId: string): void => {
+        const mode = SANDBOX_MODES.find((candidate) => candidate === modeId);
+        if (mode === undefined) throw invalidParams(`unknown mode: ${modeId}`);
+        setSandboxMode(record.agent.session, mode);
+        setApprovalPolicy(record, mode === "danger-full-access" ? "never" : "ask");
+        record.modeId = mode;
+        notify(sessionId, { sessionUpdate: "current_mode_update", currentModeId: mode });
+    };
+
+    /** The model-select entries: adapter directory first, then static config. */
+    const modelChoices = async (record: SessionRecord): Promise<{ value: string; name: string }[]> => {
         const seen = new Set<string>();
         const options: { value: string; name: string }[] = [];
         const push = (value: string, name: string): void => {
@@ -374,17 +619,79 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             push(encodeChoice(choice.provider, choice.model), choice.label);
         }
         for (const model of modelCandidates()) push(encodeChoice(undefined, model), model);
-        if (options.length < 2) return [];
-        return [
-            {
+        return options;
+    };
+
+    /**
+     * Session config options: sandbox mode, model, reasoning effort, and
+     * approvals. Everything lives here (not only in `modes`) because clients
+     * that support config options — Zed — drop the `modes` state entirely
+     * when any config option is present.
+     */
+    const configOptions = async (record: SessionRecord): Promise<SessionConfigOption[]> => {
+        const result: SessionConfigOption[] = [];
+
+        result.push({
+            type: "select",
+            id: "mode",
+            name: "Mode",
+            category: "mode",
+            currentValue: record.modeId,
+            options: SANDBOX_MODES.map((mode) => {
+                const label = MODE_LABELS[mode] ?? { name: mode, description: "" };
+                return {
+                    value: mode,
+                    name: label.name,
+                    ...(label.description.length > 0 ? { description: label.description } : {}),
+                };
+            }),
+        });
+
+        const models = await modelChoices(record);
+        if (models.length >= 2) {
+            result.push({
                 type: "select",
                 id: "model",
                 name: "Model",
                 category: "model",
-                currentValue: current,
-                options,
-            },
-        ];
+                currentValue: models[0]!.value,
+                options: models,
+            });
+        }
+
+        const route = routeOf(record);
+        const efforts = await effortCatalog(route.provider, route.model);
+        if (efforts !== undefined && efforts.efforts.length >= 2) {
+            const known = new Set(efforts.efforts.map((effort) => effort.id));
+            const preferred = [record.effort, loggedConfig(record)?.reasoningEffort, efforts.defaultEffort].find(
+                (candidate): candidate is string => candidate !== undefined && known.has(candidate),
+            );
+            result.push({
+                type: "select",
+                id: "effort",
+                name: "Reasoning",
+                category: "thought_level",
+                currentValue: preferred ?? efforts.efforts[0]!.id,
+                options: efforts.efforts.map((effort) => ({
+                    value: effort.id,
+                    name: effort.name,
+                    ...(effort.description !== undefined ? { description: effort.description } : {}),
+                })),
+            });
+        }
+
+        result.push({
+            type: "select",
+            id: "approvals",
+            name: "Approvals",
+            currentValue: record.approvals,
+            options: [
+                { value: "ask", name: "Ask", description: "Ask before actions beyond the sandbox mode" },
+                { value: "never", name: "Never ask", description: "Auto-approve every permission request" },
+            ],
+        });
+
+        return result;
     };
 
     const publishCommands = (sessionId: string): void => {
@@ -489,15 +796,19 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
 
     const statusText = async (record: SessionRecord): Promise<string> => {
         const used = record.projection.contextWindow;
+        const route = routeOf(record);
+        const effort = record.effort ?? loggedConfig(record)?.reasoningEffort;
         const lines = [
             `**dsh-acp** ${VERSION} — DeepSeek Harness ACP bridge`,
             "",
             `| | |`,
             `|---|---|`,
-            `| Provider | ${record.provider ?? defaultProvider() ?? "(composition default)"} |`,
-            `| Model | ${record.model ?? config.model ?? defaultSelection().model ?? record.agent.options.model ?? "(composition default)"} |`,
+            `| Provider | ${route.provider ?? "(composition default)"} |`,
+            `| Model | ${route.model ?? "(composition default)"} |`,
+            `| Reasoning | ${effort ?? "(adapter default)"} |`,
             `| Credential | ${await describeCredential()} |`,
             `| Permission mode | ${record.modeId} |`,
+            `| Approvals | ${record.approvals} |`,
             `| Workspace | ${record.agent.session.header.cwd ?? process.cwd()} |`,
             `| Session | ${String(record.agent.session.id)} |`,
             ...(used !== undefined ? [`| Context window | ${used.toLocaleString()} tokens |`] : []),
@@ -519,6 +830,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             projection: projection ?? new SessionProjection(),
             modeId,
             model,
+            approvals: modeId === "danger-full-access" ? "never" : "ask",
             cancelled: false,
             inflight: undefined,
         };
@@ -845,64 +1157,59 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 return { stopReason, ...(usage !== undefined ? { usage } : {}) };
             },
 
-            setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
+            async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
                 const record = requireSession(params.sessionId);
-                const mode = SANDBOX_MODES.find((candidate) => candidate === params.modeId);
-                if (mode === undefined) throw invalidParams(`unknown mode: ${params.modeId}`);
-                setSandboxMode(record.agent.session, mode);
-                try {
-                    (ctx.get("approval") as { setPolicy?: (agent: Agent, policy: "ask" | "never") => void } | undefined)
-                        ?.setPolicy?.(record.agent, mode === "danger-full-access" ? "never" : "ask");
-                } catch (error: unknown) {
-                    logWarn(`approval policy switch failed: ${String(error)}`);
-                }
-                record.modeId = mode;
-                notify(params.sessionId, { sessionUpdate: "current_mode_update", currentModeId: mode });
-                return Promise.resolve({});
+                applyMode(record, params.sessionId, params.modeId);
+                notify(params.sessionId, {
+                    sessionUpdate: "config_option_update",
+                    configOptions: await configOptions(record),
+                });
+                return {};
             },
 
             async setSessionConfigOption(
                 params: SetSessionConfigOptionRequest,
             ): Promise<SetSessionConfigOptionResponse> {
                 const record = requireSession(params.sessionId);
-                if (params.configId !== "model") throw invalidParams(`unknown config option: ${params.configId}`);
-                if (record.inflight !== undefined) {
-                    throw invalidParams("cannot switch models while a prompt is running");
-                }
                 const value = typeof params.value === "string" ? params.value : undefined;
-                if (value === undefined) throw invalidParams(`unknown model: ${String(params.value)}`);
-                const choice = decodeChoice(value);
-                const known = new Set<string>([
-                    ...modelCandidates().map((model) => encodeChoice(undefined, model)),
-                    ...(await discoverModels()).map((entry) => encodeChoice(entry.provider, entry.model)),
-                    encodeChoice(record.provider, record.model ?? ""),
-                ]);
-                if (!known.has(value)) throw invalidParams(`unknown model: ${value}`);
-                if (choice.model !== record.model || choice.provider !== (record.provider ?? defaultProvider())) {
-                    // Model options are fixed at agent construction; swap by
-                    // resuming the same durable session under new options.
-                    const sessionId = record.agent.session.id;
-                    await record.dispose().catch((error: unknown) => {
-                        logWarn(`dispose during model switch failed: ${String(error)}`);
-                    });
-                    let handle;
-                    try {
-                        handle = await agents.resume({
-                            resumeSessionId: sessionId,
-                            agentOptions: agentOptionsFor(choice.model, choice.provider),
-                        });
-                    } catch (error: unknown) {
-                        sessions.delete(params.sessionId);
-                        throw internalError(`model switch failed: ${errorChain(error)}`);
+                if (value === undefined) throw invalidParams(`invalid value: ${String(params.value)}`);
+
+                switch (params.configId) {
+                    case "mode": {
+                        applyMode(record, params.sessionId, value);
+                        break;
                     }
-                    record.agent = handle.agent;
-                    record.dispose = () => handle.dispose();
-                    record.model = choice.model;
-                    if (choice.provider !== undefined && choice.provider !== defaultProvider()) {
-                        record.provider = choice.provider;
-                    } else {
-                        delete record.provider;
+                    case "approvals": {
+                        if (value !== "ask" && value !== "never") throw invalidParams(`unknown approvals: ${value}`);
+                        setApprovalPolicy(record, value);
+                        break;
                     }
+                    case "effort": {
+                        const route = routeOf(record);
+                        const catalog = await effortCatalog(route.provider, route.model);
+                        if (catalog === undefined || !catalog.efforts.some((effort) => effort.id === value)) {
+                            throw invalidParams(`unknown effort: ${value}`);
+                        }
+                        const selection = ensureSelection(record);
+                        if (selection === undefined || route.provider === undefined || route.model === undefined) {
+                            throw invalidParams("reasoning effort switching is unavailable on this host");
+                        }
+                        // Snapshotted at the next step's prompt assembly; a
+                        // running turn keeps its captured selection.
+                        selection.current = {
+                            provider: route.provider,
+                            model: route.model,
+                            reasoningEffort: value,
+                        };
+                        record.effort = value;
+                        break;
+                    }
+                    case "model": {
+                        await switchModel(record, params.sessionId, value);
+                        break;
+                    }
+                    default:
+                        throw invalidParams(`unknown config option: ${params.configId}`);
                 }
                 return { configOptions: await configOptions(record) };
             },

@@ -166,7 +166,7 @@ describe("dsh-acp server (e2e smoke)", () => {
         expect(result["authMethods"]).toEqual([]);
     }, 60_000);
 
-    it("creates a session with modes and model config options", async () => {
+    it("creates a session with modes and config options (mode, model, effort, approvals)", async () => {
         const result = (await client.request("session/new", {
             cwd: workspace,
             mcpServers: [],
@@ -179,7 +179,17 @@ describe("dsh-acp server (e2e smoke)", () => {
         );
         expect(modes).toEqual(["read-only", "workspace-write", "danger-full-access"]);
         const configOptions = result["configOptions"] as Array<Record<string, unknown>>;
-        expect(configOptions[0]).toMatchObject({ id: "model", type: "select", currentValue: "deepseek-v4-flash" });
+        const byId = new Map(configOptions.map((option) => [option["id"], option]));
+        expect(byId.get("mode")).toMatchObject({
+            type: "select",
+            category: "mode",
+            currentValue: "workspace-write",
+        });
+        expect(byId.get("model")).toMatchObject({ type: "select", category: "model", currentValue: "deepseek-v4-flash" });
+        expect(byId.get("effort")).toMatchObject({ type: "select", category: "thought_level" });
+        const efforts = (byId.get("effort") as { options: Array<{ value: string }> }).options.map((o) => o.value);
+        expect(efforts).toContain("high");
+        expect(byId.get("approvals")).toMatchObject({ type: "select", currentValue: "ask" });
     }, 60_000);
 
     it("rejects relative cwds", async () => {
@@ -239,9 +249,61 @@ describe("dsh-acp server (e2e smoke)", () => {
                     update["sessionUpdate"] === "current_mode_update" && update["currentModeId"] === "read-only",
             ),
         ).toBe(true);
+        // Mode changes also republish config options so config-option clients stay in sync.
+        expect(
+            updates.some((update) => {
+                if (update["sessionUpdate"] !== "config_option_update") return false;
+                const options = update["configOptions"] as Array<Record<string, unknown>>;
+                return options.some((o) => o["id"] === "mode" && o["currentValue"] === "read-only");
+            }),
+        ).toBe(true);
         await expect(client.request("session/set_mode", { sessionId, modeId: "bogus" })).rejects.toThrow(
             /unknown mode/,
         );
+    }, 60_000);
+
+    it("switches mode, effort, and approvals through config options", async () => {
+        const mode = (await client.request("session/set_config_option", {
+            sessionId,
+            configId: "mode",
+            value: "danger-full-access",
+        })) as Record<string, unknown>;
+        let byId = new Map(
+            (mode["configOptions"] as Array<Record<string, unknown>>).map((option) => [option["id"], option]),
+        );
+        expect(byId.get("mode")).toMatchObject({ currentValue: "danger-full-access" });
+        // Full access couples the approval default to "never".
+        expect(byId.get("approvals")).toMatchObject({ currentValue: "never" });
+
+        const approvals = (await client.request("session/set_config_option", {
+            sessionId,
+            configId: "approvals",
+            value: "ask",
+        })) as Record<string, unknown>;
+        byId = new Map(
+            (approvals["configOptions"] as Array<Record<string, unknown>>).map((option) => [option["id"], option]),
+        );
+        expect(byId.get("approvals")).toMatchObject({ currentValue: "ask" });
+
+        const effort = (await client.request("session/set_config_option", {
+            sessionId,
+            configId: "effort",
+            value: "high",
+        })) as Record<string, unknown>;
+        byId = new Map(
+            (effort["configOptions"] as Array<Record<string, unknown>>).map((option) => [option["id"], option]),
+        );
+        expect(byId.get("effort")).toMatchObject({ currentValue: "high" });
+
+        await expect(
+            client.request("session/set_config_option", { sessionId, configId: "effort", value: "bogus" }),
+        ).rejects.toThrow(/unknown effort/);
+        await expect(
+            client.request("session/set_config_option", { sessionId, configId: "bogus", value: "x" }),
+        ).rejects.toThrow(/unknown config option/);
+
+        // Restore for the later status/mode assertions.
+        await client.request("session/set_config_option", { sessionId, configId: "mode", value: "read-only" });
     }, 60_000);
 
     it("switches models through the config option and lists sessions", async () => {
@@ -251,7 +313,11 @@ describe("dsh-acp server (e2e smoke)", () => {
             value: "deepseek-v4-pro",
         })) as Record<string, unknown>;
         const configOptions = result["configOptions"] as Array<Record<string, unknown>>;
-        expect(configOptions[0]).toMatchObject({ id: "model", currentValue: "deepseek-v4-pro" });
+        const model = configOptions.find((option) => option["id"] === "model");
+        expect(model).toMatchObject({ id: "model", currentValue: "deepseek-v4-pro" });
+        // The picked effort survives the resume-based model switch.
+        const effort = configOptions.find((option) => option["id"] === "effort");
+        expect(effort).toMatchObject({ currentValue: "high" });
 
         const list = (await client.request("session/list", {})) as Record<string, unknown>;
         const sessions = list["sessions"] as Array<Record<string, unknown>>;
