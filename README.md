@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/icon.svg" width="72" alt="DeepSeek Harness" />
+  <img src="assets/acp-x-deepseek.svg" width="520" alt="Agent Client Protocol × DeepSeek Harness" />
 </p>
 
 <h1 align="center">deepseek-harness-acp</h1>
