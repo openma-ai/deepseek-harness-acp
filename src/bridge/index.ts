@@ -1201,6 +1201,17 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     projection,
                 );
                 if (presetId !== undefined) record.preset = presetId;
+                // The approval policy is a logged, replayed fact (the service
+                // folds approval/policy events); mirror the same fold so the
+                // advertised option matches what the service will enforce.
+                for (let index = events.length - 1; index >= 0; index -= 1) {
+                    const event = events[index] as unknown as { type?: string; data?: { policy?: string } };
+                    if (event?.type === "approval/policy") {
+                        const policy = event.data?.policy;
+                        if (policy === "ask" || policy === "never") record.approvals = policy;
+                        break;
+                    }
+                }
                 ensureSelection(record);
                 queueMicrotask(() => publishCommands(sessionId));
                 const options = await configOptions(record);
