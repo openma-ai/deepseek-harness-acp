@@ -208,6 +208,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     const sessions = new Map<string, SessionRecord>();
     let closed = false;
     let conn: AgentSideConnection;
+    /** Whether the client renders `_meta.terminal_output` display terminals. */
+    let clientTerminalOutput = false;
 
     const modelCandidates = (): string[] => {
         const seen = new Set<string>();
@@ -1025,7 +1027,12 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         const record: SessionRecord = {
             agent,
             dispose,
-            projection: projection ?? new SessionProjection(),
+            projection:
+                projection ??
+                new SessionProjection(undefined, {
+                    terminalOutput: clientTerminalOutput,
+                    ...(agent.session.header.cwd !== undefined ? { cwd: agent.session.header.cwd } : {}),
+                }),
             modeId,
             model,
             approvals: modeId === "danger-full-access" ? "never" : "ask",
@@ -1115,6 +1122,16 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             initialize(params: InitializeRequest): Promise<InitializeResponse> {
                 const hasPersistence = ctx.get("sessionPersistence") !== undefined;
                 const requested = params.protocolVersion;
+                // Zed's display-terminal extension: command tool calls embed a
+                // presentation terminal when the client advertises it in the
+                // capability _meta (the codex-acp contract).
+                const capsMeta = (params.clientCapabilities as { _meta?: Record<string, unknown> } | undefined)?.[
+                    "_meta"
+                ];
+                clientTerminalOutput =
+                    capsMeta !== null && typeof capsMeta === "object"
+                        ? capsMeta["terminal_output"] === true
+                        : false;
                 // No ACP auth methods: credential management belongs to the
                 // harness (dsh Web UI → ~/.dsh/.credentials.yaml, hot-reloaded)
                 // or the launching environment. The adapter reuses whatever

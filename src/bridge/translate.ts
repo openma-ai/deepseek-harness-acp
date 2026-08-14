@@ -345,9 +345,15 @@ export class SessionProjection {
     private toolCalls = new Map<string, ToolCallFacts>();
     private window: PromptWindow = emptyWindow();
     private lastContextUse: number | undefined;
+    /** Client renders `_meta.terminal_output` display terminals (Zed extension). */
+    private readonly terminalOutput: boolean;
+    /** Session working directory, advertised on display terminals. */
+    private readonly cwd: string | undefined;
 
-    constructor(contextWindow?: number) {
+    constructor(contextWindow?: number, options?: { terminalOutput?: boolean; cwd?: string }) {
         this.contextWindow = contextWindow;
+        this.terminalOutput = options?.terminalOutput ?? false;
+        this.cwd = options?.cwd;
     }
 
     /** Reset per-prompt accumulators; call when a new `session/prompt` starts. */
@@ -491,6 +497,10 @@ export class SessionProjection {
         const rawArguments = typeof data["arguments"] === "string" ? (data["arguments"] as string) : "{}";
         const facts = classifyToolCall(name, rawArguments);
         this.toolCalls.set(callId, facts);
+        // Command tools embed a display-only terminal when the client supports
+        // one (the codex-acp `_meta` contract Zed renders): content carries the
+        // terminal reference, `terminal_info` announces it.
+        const displayTerminal = this.terminalOutput && facts.kind === "execute";
         return [
             {
                 sessionUpdate: "tool_call",
@@ -501,7 +511,18 @@ export class SessionProjection {
                 status: "in_progress",
                 rawInput: facts.rawInput,
                 ...(facts.locations.length > 0 ? { locations: facts.locations } : {}),
-            },
+                ...(displayTerminal
+                    ? {
+                          content: [{ type: "terminal", terminalId: callId }],
+                          _meta: {
+                              terminal_info: {
+                                  terminal_id: callId,
+                                  ...(this.cwd !== undefined ? { cwd: this.cwd } : {}),
+                              },
+                          },
+                      }
+                    : {}),
+            } as unknown as SessionUpdate,
         ];
     }
 
@@ -522,6 +543,7 @@ export class SessionProjection {
                     : undefined,
             ) ?? asString(data["callId"]);
         if (callId === undefined) return [];
+        const facts = this.toolCalls.get(callId);
         const { failed, text, diffs } = extractToolResult(data);
         const content: ToolCallContent[] = diffs.map((diff) => ({
             type: "diff",
@@ -529,8 +551,40 @@ export class SessionProjection {
             ...(diff.oldText !== null ? { oldText: diff.oldText } : {}),
             newText: diff.newText,
         }));
+        const isCommand = facts?.kind === "execute";
+        if (this.terminalOutput && isCommand) {
+            // Display-terminal path: stream the whole captured output onto the
+            // embedded terminal, then close it with the exit status. Content
+            // stays empty — the terminal is the presentation.
+            this.toolCalls.delete(callId);
+            return [
+                ...(text.length > 0
+                    ? [
+                          {
+                              sessionUpdate: "tool_call_update",
+                              toolCallId: callId,
+                              _meta: { terminal_output: { terminal_id: callId, data: text } },
+                          } as unknown as SessionUpdate,
+                      ]
+                    : []),
+                {
+                    sessionUpdate: "tool_call_update",
+                    toolCallId: callId,
+                    status: failed ? "failed" : "completed",
+                    ...(text.length > 0 ? { rawOutput: { output: text, isError: failed } } : {}),
+                    _meta: {
+                        terminal_exit: { terminal_id: callId, exit_code: failed ? 1 : 0, signal: null },
+                    },
+                } as unknown as SessionUpdate,
+            ];
+        }
         if (text.length > 0 && diffs.length === 0) {
-            const block: AcpContentBlock = { type: "text", text };
+            // Fenced output renders in tool-call cards (raw text does not in
+            // every client); markdown-ish tool output passes through as is.
+            const block: AcpContentBlock = {
+                type: "text",
+                text: isCommand ? `\`\`\`sh\n${text.replace(/\n+$/, "")}\n\`\`\`\n` : text,
+            };
             content.push({ type: "content", content: block });
         }
         this.toolCalls.delete(callId);

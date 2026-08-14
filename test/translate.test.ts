@@ -123,8 +123,44 @@ describe("SessionProjection tool calls", () => {
             sessionUpdate: "tool_call_update",
             toolCallId: "c1",
             status: "completed",
-            content: [{ type: "content", content: { type: "text", text: "a.ts\n" } }],
+            // Command output renders as a fenced block (raw text does not
+            // render in every client's tool-call card).
+            content: [{ type: "content", content: { type: "text", text: "```sh\na.ts\n```\n" } }],
+            rawOutput: { output: "a.ts\n", isError: false },
         });
+    });
+
+    it("streams command output onto a display terminal when the client supports one", () => {
+        const p = new SessionProjection(undefined, { terminalOutput: true, cwd: "/ws" });
+        const start = p.onEvent(
+            event("tool/call", { turn: 1, step: 0, callId: "t1", name: "bash", arguments: '{"command":"pwd"}' }),
+        );
+        expect(start[0]).toMatchObject({
+            sessionUpdate: "tool_call",
+            content: [{ type: "terminal", terminalId: "t1" }],
+            _meta: { terminal_info: { terminal_id: "t1", cwd: "/ws" } },
+        });
+        const done = p.onEvent(
+            event("tool/result", {
+                turn: 1,
+                step: 0,
+                message: {
+                    content: [
+                        { type: "tool-result", toolCallId: "t1", content: [{ type: "text", text: "/ws\n" }] },
+                    ],
+                },
+            }),
+        );
+        expect(done[0]).toMatchObject({
+            sessionUpdate: "tool_call_update",
+            _meta: { terminal_output: { terminal_id: "t1", data: "/ws\n" } },
+        });
+        expect(done[1]).toMatchObject({
+            sessionUpdate: "tool_call_update",
+            status: "completed",
+            _meta: { terminal_exit: { terminal_id: "t1", exit_code: 0, signal: null } },
+        });
+        expect((done[1] as Record<string, unknown>)["content"]).toBeUndefined();
     });
 
     it("marks failed results and carries fs diffs as diff content", () => {
