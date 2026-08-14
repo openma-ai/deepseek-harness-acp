@@ -636,33 +636,14 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
 
     const presetLabel = (id: string): string => id.charAt(0).toUpperCase() + id.slice(1);
 
-    const modeState = async (record: SessionRecord): Promise<SessionModeState> => {
-        const presets = presetsService();
-        if (presets !== undefined && record.preset !== undefined) {
-            try {
-                const roster = await presets.list();
-                if (roster.length > 0) {
-                    return {
-                        currentModeId: record.preset,
-                        availableModes: roster.map((preset) => ({
-                            id: preset.id,
-                            name: presetLabel(preset.id),
-                            description: `Agent preset “${preset.id}”`,
-                        })),
-                    };
-                }
-            } catch (error: unknown) {
-                logWarn(`preset roster unavailable: ${String(error)}`);
-            }
-        }
-        return {
-            currentModeId: record.modeId,
-            availableModes: SANDBOX_MODES.map((mode) => {
-                const label = MODE_LABELS[mode] ?? { name: mode, description: "" };
-                return { id: mode, name: label.name, description: label.description };
-            }),
-        };
-    };
+    /** Sandbox confinement levels: the session-mode selector, always. */
+    const modeState = (record: SessionRecord): SessionModeState => ({
+        currentModeId: record.modeId,
+        availableModes: SANDBOX_MODES.map((mode) => {
+            const label = MODE_LABELS[mode] ?? { name: mode, description: "" };
+            return { id: mode, name: label.name, description: label.description };
+        }),
+    });
 
     /**
      * Switch the agent preset: record the durable fact, then rebuild the
@@ -715,7 +696,6 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         ensureSelection(record);
         // Approval policy is agent-scoped state; re-apply it to the new agent.
         setApprovalPolicy(record, record.approvals);
-        notify(acpSessionId, { sessionUpdate: "current_mode_update", currentModeId: resolved });
     };
 
     /** Flip the per-agent approval policy, mirroring the result on the record. */
@@ -839,6 +819,31 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 { value: "never", name: "Never ask", description: "Auto-approve every permission request" },
             ],
         });
+
+        // Agent presets: one model-facing composition (persona, tool surface,
+        // compaction) per entry, switchable per session alongside the sandbox
+        // mode rather than instead of it.
+        const presets = presetsService();
+        if (presets !== undefined && record.preset !== undefined) {
+            try {
+                const roster = await presets.list();
+                if (roster.length >= 2) {
+                    result.push({
+                        type: "select",
+                        id: "preset",
+                        name: "Preset",
+                        currentValue: record.preset,
+                        options: roster.map((preset) => ({
+                            value: preset.id,
+                            name: presetLabel(preset.id),
+                            description: `Agent preset “${preset.id}”`,
+                        })),
+                    });
+                }
+            } catch (error: unknown) {
+                logWarn(`preset roster unavailable: ${String(error)}`);
+            }
+        }
 
         return result;
     };
@@ -1135,7 +1140,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 const options = await configOptions(record);
                 return {
                     sessionId: String(sessionId),
-                    modes: await modeState(record),
+                    modes: modeState(record),
                     ...(options.length > 0 ? { configOptions: options } : {}),
                 };
             },
@@ -1200,7 +1205,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 queueMicrotask(() => publishCommands(sessionId));
                 const options = await configOptions(record);
                 return {
-                    modes: await modeState(record),
+                    modes: modeState(record),
                     ...(options.length > 0 ? { configOptions: options } : {}),
                 };
             },
@@ -1328,14 +1333,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
 
             async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
                 const record = requireSession(params.sessionId);
-                // With a preset roster, session modes are agent presets; the
-                // sandbox lives in the "mode" config option. Without one, modes
-                // keep their original sandbox meaning.
-                if (presetsService() !== undefined && record.preset !== undefined) {
-                    await switchPreset(record, params.sessionId, params.modeId);
-                } else {
-                    applyMode(record, params.sessionId, params.modeId);
-                }
+                applyMode(record, params.sessionId, params.modeId);
                 notify(params.sessionId, {
                     sessionUpdate: "config_option_update",
                     configOptions: await configOptions(record),
@@ -1358,6 +1356,10 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     case "approvals": {
                         if (value !== "ask" && value !== "never") throw invalidParams(`unknown approvals: ${value}`);
                         setApprovalPolicy(record, value);
+                        break;
+                    }
+                    case "preset": {
+                        await switchPreset(record, params.sessionId, value);
                         break;
                     }
                     case "effort": {
