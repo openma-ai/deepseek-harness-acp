@@ -64,9 +64,11 @@ describe("resolveHost", () => {
         expect(() => resolveHost(root)).toThrow(/npm install -g @deepseek-ai\/dsh/);
     });
 
-    it("auto-detects this checkout's own tree when no path is given", () => {
-        // The dev checkout carries the harness as devDependencies.
+    it("auto-detects a harness from the checkout when no path is given", () => {
+        // The dev checkout carries the harness (dependencies + devDependencies);
+        // user-installation probes (cwd, PATH, npm -g) rank before the
+        // vendored fallback, and in this checkout the cwd probe hits first.
         const host = resolveHost();
-        expect(host.source).toContain("dsh-acp package tree");
+        expect(host.source).toMatch(/invoking directory|dsh-acp package tree/);
     });
 });

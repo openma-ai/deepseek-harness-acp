@@ -13,8 +13,8 @@ import type { SandboxMode } from "@deepseek-ai/dsh-sandbox";
 export interface Settings {
     /** Explicit DeepSeek Harness installation (DSH_PATH); auto-detected when unset. */
     dshPath: string | undefined;
-    provider: string;
-    model: string;
+    provider: string | undefined;
+    model: string | undefined;
     /** Selectable model candidates (session config option). */
     models: string[];
     maxTokens: number | undefined;
@@ -99,7 +99,7 @@ export function resolveSettings(argv: string[]): Settings {
         }
     }
 
-    const model = stringFlag(parsed, "model") ?? envString("DSH_MODEL") ?? "deepseek-v4-flash";
+    const model = stringFlag(parsed, "model") ?? envString("DSH_MODEL");
     const modelsRaw = stringFlag(parsed, "models") ?? envString("DSH_ACP_MODELS");
     const models = (modelsRaw !== undefined ? modelsRaw.split(",") : ["deepseek-v4-flash", "deepseek-v4-pro"])
         .map((entry) => entry.trim())
@@ -136,7 +136,7 @@ export function resolveSettings(argv: string[]): Settings {
 
     return {
         dshPath: stringFlag(parsed, "dsh-path") ?? envString("DSH_PATH"),
-        provider: stringFlag(parsed, "provider") ?? envString("DSH_PROVIDER") ?? "deepseek-official",
+        provider: stringFlag(parsed, "provider") ?? envString("DSH_PROVIDER"),
         model,
         models,
         maxTokens,

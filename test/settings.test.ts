@@ -31,10 +31,10 @@ afterEach(() => {
 });
 
 describe("resolveSettings", () => {
-    it("provides harness-conventional defaults", () => {
+    it("leaves provider and model unset so the composition default rules", () => {
         const settings = resolveSettings([]);
-        expect(settings.provider).toBe("deepseek-official");
-        expect(settings.model).toBe("deepseek-v4-flash");
+        expect(settings.provider).toBeUndefined();
+        expect(settings.model).toBeUndefined();
         expect(settings.models).toEqual(["deepseek-v4-flash", "deepseek-v4-pro"]);
         expect(settings.permissionMode).toBe("workspace-write");
         expect(settings.thinking).toBe(true);

@@ -17,3 +17,7 @@ export function logError(message: string): void {
 export function logDebug(message: string): void {
     if (process.env["DSH_ACP_DEBUG"]) process.stderr.write(`${PREFIX} debug: ${message}\n`);
 }
+
+export function logInfo(message: string): void {
+    process.stderr.write(`${PREFIX} ${message}\n`);
+}

@@ -1,0 +1,3 @@
+# dsh-acp self-hosted profile root — an empty entry list; the tree is
+# composed as bundle patches (dsh-base, this package) plus the home layer.
+[]

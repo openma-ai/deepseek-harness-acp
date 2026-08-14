@@ -38,6 +38,7 @@ class AcpTestClient {
             ...process.env,
             DEEPSEEK_BASE_URL: "http://127.0.0.1:1", // credential gate only; never dialed
             DSH_SESSION_ROOT: sessionRoot,
+            DSH_HOME: join(sessionRoot, "home"),
             DSH_ACP_WORKSPACE: workspace,
             ...(dshPath !== undefined ? { DSH_PATH: dshPath } : {}),
             ...(envPatch ?? {}),

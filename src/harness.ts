@@ -166,9 +166,6 @@ export function resolveHost(explicit?: string): HarnessHost {
         // silently using another installation would be worse than failing.
         throw new HarnessNotFoundError(probed);
     }
-    const own = hostAt(dirname(fileURLToPath(import.meta.url)), "dsh-acp package tree");
-    if (own !== undefined) return own;
-    probed.push("dsh-acp package tree");
     const local = hostAt(process.cwd(), `invoking directory (${process.cwd()})`);
     if (local !== undefined) return local;
     probed.push(`invoking directory: ${process.cwd()}`);
@@ -178,6 +175,13 @@ export function resolveHost(explicit?: string): HarnessHost {
     const globalNpm = hostFromGlobalNpm();
     if (globalNpm !== undefined) return globalNpm;
     probed.push("npm root -g");
+    // Last: this package's own tree — the vendored @deepseek-ai/dsh
+    // dependency. A dsh the user installed always wins (their Web UI and
+    // this server then run the same code over the shared $DSH_HOME); the
+    // vendored copy makes a machine without dsh work out of the box.
+    const own = hostAt(dirname(fileURLToPath(import.meta.url)), "dsh-acp package tree (vendored)");
+    if (own !== undefined) return own;
+    probed.push("dsh-acp package tree (vendored)");
     throw new HarnessNotFoundError(probed);
 }
 

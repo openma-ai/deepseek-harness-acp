@@ -203,10 +203,11 @@ export async function apply(ctx: Context, config: AppConfig): Promise<void> {
         await compaction;
         yield compaction.dispose;
 
-        // The ACP transport bridge (owns stdout).
+        // The ACP transport bridge (owns stdout). The spine engine keeps its
+        // historical fixed defaults when no explicit selection was given.
         const bridge = anyCtx.plugin(acpBridge, {
-            provider: settings.provider,
-            model: settings.model,
+            provider: settings.provider ?? "deepseek-official",
+            model: settings.model ?? "deepseek-v4-flash",
             models: settings.models,
             ...(settings.maxTokens !== undefined ? { maxTokens: settings.maxTokens } : {}),
             permissionMode: settings.permissionMode,

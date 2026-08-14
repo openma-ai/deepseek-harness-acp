@@ -8,9 +8,12 @@
  * every diagnostic goes to stderr.
  */
 
+import { spawnSync } from "node:child_process";
+
 import * as app from "./app.ts";
 import { HarnessNotFoundError, loadKit, resolveHost } from "./harness.ts";
-import { logDebug, logError } from "./log.ts";
+import { bootAcpProfile, type BootedContext } from "./profile-boot.ts";
+import { logDebug, logError, logInfo } from "./log.ts";
 import { HELP_TEXT, resolveSettings, SettingsError } from "./settings.ts";
 import { VERSION } from "./version.ts";
 
@@ -24,6 +27,19 @@ async function main(): Promise<void> {
     }
     if (argv.includes("--help")) {
         console.log(HELP_TEXT.trimEnd());
+        return;
+    }
+    if (argv[0] === "update") {
+        // Self-update through the same package manager that installed us.
+        logInfo(`updating ${NAME} (npm install -g ${NAME}@latest)…`);
+        const result = spawnSync("npm", ["install", "-g", `${NAME}@latest`], { stdio: ["ignore", 2, 2] });
+        if (result.status !== 0) {
+            logError(`npm install failed with status ${result.status ?? "unknown"}`);
+            process.exitCode = result.status ?? 1;
+            return;
+        }
+        logInfo("updated. If you also keep a global DeepSeek Harness, refresh it with:");
+        logInfo("    npm install -g @deepseek-ai/dsh@latest");
         return;
     }
 
@@ -40,11 +56,28 @@ async function main(): Promise<void> {
         throw error;
     }
 
-    let kit;
+    let ctx: { fiber: { dispose(): Promise<void> } };
     try {
         const host = resolveHost(settings.dshPath);
         logDebug(`harness host: ${host.base} via ${host.source} (${host.version ?? "unknown version"})`);
-        kit = await loadKit(host);
+        if (process.env["DSH_ACP_COMPOSE"] === "spine") {
+            // Legacy engine: the fixed hand-rolled composition.
+            const kit = await loadKit(host);
+            const spineCtx = new kit.cordis.Context();
+            await spineCtx.plugin(app, { settings, kit });
+            ctx = spineCtx as unknown as { fiber: { dispose(): Promise<void> } };
+        } else {
+            // Default engine: the dsh profile composition (dsh-base + this
+            // package's bundle patch + the user's $DSH_HOME layers), sharing
+            // the product's own home state.
+            const booted: BootedContext = await bootAcpProfile(host, {
+                ...(settings.provider !== undefined ? { provider: settings.provider } : {}),
+                ...(settings.model !== undefined ? { model: settings.model } : {}),
+                ...(settings.permissionMode !== undefined ? { permissionMode: settings.permissionMode } : {}),
+                ...(settings.maxTokens !== undefined ? { maxTokens: settings.maxTokens } : {}),
+            });
+            ctx = booted;
+        }
     } catch (error: unknown) {
         if (error instanceof HarnessNotFoundError) {
             logError(error.message);
@@ -53,9 +86,6 @@ async function main(): Promise<void> {
         }
         throw error;
     }
-
-    const ctx = new kit.cordis.Context();
-    await ctx.plugin(app, { settings, kit });
 
     let disposing = false;
     const shutdown = (code: number): void => {
