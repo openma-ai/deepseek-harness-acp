@@ -78,8 +78,9 @@ class AcpTestClient {
             const pending = this.pending.get(id);
             this.pending.delete(id);
             if (message["error"] !== undefined && message["error"] !== null) {
-                const error = message["error"] as { message?: string };
-                pending?.reject(new Error(error.message ?? "JSON-RPC error"));
+                const error = message["error"] as { message?: string; data?: unknown };
+                const detail = error.data === undefined ? "" : ` — ${JSON.stringify(error.data)}`;
+                pending?.reject(new Error(`${error.message ?? "JSON-RPC error"}${detail}`));
             } else {
                 pending?.resolve(message["result"]);
             }
@@ -343,7 +344,9 @@ describe("dsh-acp server (e2e smoke)", () => {
             cwd: workspace,
             mcpServers: [],
         })) as Record<string, unknown>;
-        expect(result["modes"]).toMatchObject({ currentModeId: "workspace-write" });
+        // The mode switched to read-only earlier in this suite; the durable
+        // permission/preset fact must fold back on load (a fresh process).
+        expect(result["modes"]).toMatchObject({ currentModeId: "read-only" });
         // The reloaded session accepts adapter commands again.
         const status = (await client.request("session/prompt", {
             sessionId,
