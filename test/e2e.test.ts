@@ -232,12 +232,24 @@ describe("dsh-acp server (e2e smoke)", () => {
         expect(content.text).toContain("workspace-write");
     }, 60_000);
 
-    it("publishes available commands for new sessions", () => {
-        const updates = client.updatesFor(sessionId);
-        const commands = updates.find((update) => update["sessionUpdate"] === "available_commands_update");
-        const names = (commands?.["availableCommands"] as Array<{ name: string }>).map((c) => c.name);
-        expect(names).toEqual(["status", "login", "logout"]);
-    });
+    it("publishes available commands (builtins + harness registry)", async () => {
+        let names: string[] = [];
+        for (let attempt = 0; attempt < 40; attempt += 1) {
+            const updates = client.updatesFor(sessionId);
+            const commands = [...updates]
+                .reverse()
+                .find((update) => update["sessionUpdate"] === "available_commands_update");
+            const list = commands?.["availableCommands"] as Array<{ name: string }> | undefined;
+            names = list?.map((c) => c.name) ?? [];
+            if (names.length > 0) break;
+            await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        // Adapter built-ins always lead…
+        expect(names.slice(0, 3)).toEqual(["status", "login", "logout"]);
+        // …followed by the composition's own registry (dsh-base mounts
+        // compact among others).
+        expect(names).toContain("compact");
+    }, 60_000);
 
     it("switches session modes", async () => {
         const result = await client.request("session/set_mode", { sessionId, modeId: "read-only" });

@@ -710,6 +710,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         ensureSelection(record);
         // Approval policy is agent-scoped state; re-apply it to the new agent.
         setApprovalPolicy(record, record.approvals);
+        publishCommands(acpSessionId, record);
     };
 
     /** Flip the per-agent approval policy, mirroring the result on the record. */
@@ -893,20 +894,96 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         return result;
     };
 
-    const publishCommands = (sessionId: string): void => {
-        notify(sessionId, {
-            sessionUpdate: "available_commands_update",
-            availableCommands: [
-                { name: "status", description: "Show adapter, model, mode, and token status" },
-                {
-                    name: "login",
-                    description:
-                        "Save a DeepSeek API key into the harness credential store (~/.dsh/.credentials.yaml)",
-                    input: { hint: "<api-key>" },
-                },
-                { name: "logout", description: "Remove the API key stored in the harness credential store" },
-            ],
-        });
+    /** Built-in adapter commands, always first and never shadowed. */
+    const BUILTIN_COMMANDS = [
+        { name: "status", description: "Show adapter, model, mode, and token status" },
+        {
+            name: "login",
+            description: "Save a DeepSeek API key into the harness credential store (~/.dsh/.credentials.yaml)",
+            input: { hint: "<api-key>" },
+        },
+        { name: "logout", description: "Remove the API key stored in the harness credential store" },
+    ];
+
+    /**
+     * The full command surface for one live agent: adapter built-ins, the
+     * harness command registry (compact/goal/permission/plan/… — whatever
+     * the composition mounts, scoped per agent), and user-invocable skills.
+     * A skill needs no dispatch here: `/name` in a user message is the
+     * harness's own invocation gesture, handled inside the agent.
+     */
+    const availableCommandsFor = async (
+        record: SessionRecord,
+    ): Promise<{ name: string; description: string; input?: { hint: string } }[]> => {
+        const list = [...BUILTIN_COMMANDS];
+        const seen = new Set(list.map((command) => command.name));
+        const commandsSvc = ctx.get("commands") as
+            | { list(agent: Agent): readonly { name: string; description: string; input?: { hint: string } }[] }
+            | undefined;
+        if (commandsSvc !== undefined) {
+            try {
+                for (const descriptor of commandsSvc.list(record.agent)) {
+                    if (seen.has(descriptor.name)) continue;
+                    seen.add(descriptor.name);
+                    list.push({
+                        name: descriptor.name,
+                        description: descriptor.description,
+                        ...(descriptor.input !== undefined ? { input: { hint: descriptor.input.hint } } : {}),
+                    });
+                }
+            } catch (error: unknown) {
+                logWarn(`command listing failed: ${String(error)}`);
+            }
+        }
+        const skillsSvc = ctx.get("skills") as
+            | {
+                  list(lookup: {
+                      cwd?: string;
+                      scope: Agent;
+                  }): Promise<
+                      readonly {
+                          name: string;
+                          description: string;
+                          invocation: { userInvocable: boolean };
+                      }[]
+                  >;
+              }
+            | undefined;
+        if (skillsSvc !== undefined) {
+            try {
+                const skills = await skillsSvc.list({
+                    ...(record.agent.session.header.cwd !== undefined
+                        ? { cwd: record.agent.session.header.cwd }
+                        : {}),
+                    scope: record.agent,
+                });
+                for (const skill of skills) {
+                    if (skill.invocation.userInvocable !== true) continue;
+                    if (seen.has(skill.name)) continue;
+                    seen.add(skill.name);
+                    list.push({
+                        name: skill.name,
+                        description: skill.description,
+                        input: { hint: "instructions for the skill" },
+                    });
+                }
+            } catch (error: unknown) {
+                logDebug(`skill listing failed: ${String(error)}`);
+            }
+        }
+        return list;
+    };
+
+    const publishCommands = (sessionId: string, record?: SessionRecord): void => {
+        const target = record ?? sessions.get(sessionId);
+        if (target === undefined) return;
+        void availableCommandsFor(target)
+            .then((availableCommands) => {
+                notify(sessionId, { sessionUpdate: "available_commands_update", availableCommands });
+            })
+            .catch((error: unknown) => {
+                logWarn(`publishing commands failed: ${String(error)}`);
+            });
     };
 
     // ------------------------------------------------------------------ //
@@ -1346,6 +1423,43 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     return respond(await loginText(trimmed.slice(commandMatch[0].length)));
                 }
                 if (commandMatch?.[1] === "logout") return respond(await logoutText());
+                if (commandMatch !== null && commandMatch[1] !== undefined) {
+                    // The harness command registry (compact/goal/permission/…)
+                    // executes without a model turn. An unresolved slash falls
+                    // through: /skill-name is the harness's own skill gesture
+                    // and is claimed inside the agent's next step.
+                    const commandsSvc = ctx.get("commands") as
+                        | {
+                              execute(
+                                  agent: Agent,
+                                  line: string,
+                                  signal: AbortSignal,
+                              ): Promise<{ result: { kind: string; text?: string } } | undefined>;
+                          }
+                        | undefined;
+                    if (commandsSvc !== undefined) {
+                        let execution;
+                        try {
+                            execution = await commandsSvc.execute(
+                                record.agent,
+                                trimmed,
+                                new AbortController().signal,
+                            );
+                        } catch (error: unknown) {
+                            return respond(`⚠ /${commandMatch[1]} failed: ${errorChain(error)}`);
+                        }
+                        if (execution !== undefined) {
+                            const { result } = execution;
+                            const text =
+                                result.text ??
+                                (result.kind === "success" ? `/${commandMatch[1]} ✓` : `/${commandMatch[1]} failed`);
+                            // Commands can change agent-visible state (permission
+                            // preset, plan mode); refresh the advertised options.
+                            publishCommands(params.sessionId, record);
+                            return respond(result.kind === "error" ? `⚠ ${text}` : text);
+                        }
+                    }
+                }
 
                 // Gate model turns (not slash commands) on a usable credential,
                 // with self-service guidance instead of a bare protocol error.
