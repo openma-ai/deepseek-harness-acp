@@ -101,7 +101,14 @@ function bundlePatchPath(packageJsonPath: string): string {
  */
 export async function bootAcpProfile(
     host: HarnessHost,
-    overrides?: { provider?: string; model?: string; permissionMode?: string; maxTokens?: number },
+    overrides?: {
+        provider?: string;
+        model?: string;
+        permissionMode?: string;
+        maxTokens?: number;
+        /** Compose without the ACP stdio server (credential tooling etc.). */
+        serve?: boolean;
+    },
 ): Promise<BootedContext> {
     const req = createRequire(join(host.base, "noop.js"));
     const dshPkgPath = req.resolve("@deepseek-ai/dsh/package.json");
@@ -183,6 +190,10 @@ export async function bootAcpProfile(
     // The CLI-argument layer: an overlay over the acp-bridge row, the same
     // id-targeted override a user patch would express.
     const bridgeRow = rows.get("acp-bridge");
+    if (overrides?.serve === false && bridgeRow !== undefined) {
+        // Tooling boots (login) need the composition without the stdio server.
+        overlays.push({ id: "acp-bridge", disabled: true });
+    }
     if (overrides !== undefined && bridgeRow !== undefined) {
         const patch: Record<string, unknown> = {};
         if (overrides.provider !== undefined) patch["provider"] = overrides.provider;

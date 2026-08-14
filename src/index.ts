@@ -13,6 +13,7 @@ import { spawnSync } from "node:child_process";
 import * as app from "./app.ts";
 import { HarnessNotFoundError, loadKit, resolveHost } from "./harness.ts";
 import { bootAcpProfile, type BootedContext } from "./profile-boot.ts";
+import { runLogin } from "./login.ts";
 import { logDebug, logError, logInfo } from "./log.ts";
 import { HELP_TEXT, resolveSettings, SettingsError } from "./settings.ts";
 import { VERSION } from "./version.ts";
@@ -27,6 +28,35 @@ async function main(): Promise<void> {
     }
     if (argv.includes("--help")) {
         console.log(HELP_TEXT.trimEnd());
+        return;
+    }
+    if (argv[0] === "login") {
+        // ACP Terminal Auth: interactive credential setup, then exit. Boots
+        // the same composition as serving (minus the stdio server) so the
+        // key lands in the shared harness credential store.
+        let booted: BootedContext;
+        let hostBase: string;
+        try {
+            const host = resolveHost(undefined);
+            hostBase = host.base;
+            booted = await bootAcpProfile(host, { serve: false });
+        } catch (error: unknown) {
+            if (error instanceof HarnessNotFoundError) {
+                logError(error.message);
+                process.exitCode = 1;
+                return;
+            }
+            throw error;
+        }
+        try {
+            process.exitCode = await runLogin(
+                booted as unknown as Parameters<typeof runLogin>[0],
+                hostBase,
+                argv.slice(1),
+            );
+        } finally {
+            await booted.fiber.dispose().catch(() => undefined);
+        }
         return;
     }
     if (argv[0] === "update") {

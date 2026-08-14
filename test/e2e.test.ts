@@ -165,7 +165,14 @@ describe("dsh-acp server (e2e smoke)", () => {
         expect(capabilities["promptCapabilities"]).toMatchObject({ embeddedContext: true, image: false });
         // Credential management is the harness's own concern (dsh Web UI /
         // environment); the adapter advertises no ACP auth methods.
-        expect(result["authMethods"]).toEqual([]);
+        // Terminal Auth only: `dsh-acp login` runs out-of-band; no auth flows
+        // through the client itself.
+        const methods = result["authMethods"] as Array<Record<string, unknown>>;
+        expect(methods).toHaveLength(1);
+        expect(methods[0]).toMatchObject({
+            id: "terminal-login",
+            _meta: { "terminal-auth": { args: ["login"] } },
+        });
     }, 60_000);
 
     it("creates a session with sandbox modes and config options (model, effort)", async () => {

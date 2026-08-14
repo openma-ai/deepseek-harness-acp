@@ -1439,17 +1439,29 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                         mcpCapabilities: { http: true, sse: false },
                         ...(hasPersistence ? { sessionCapabilities: { list: {} } } : {}),
                     },
-                    authMethods: [],
+                    authMethods: [
+                        // ACP Terminal Auth (see the registry's AUTHENTICATION.md):
+                        // the client runs `dsh-acp login` in an interactive
+                        // terminal; the key lands in the shared harness
+                        // credential store (~/.dsh/.credentials.yaml).
+                        {
+                            id: "terminal-login",
+                            name: "Log in with a DeepSeek API key",
+                            description:
+                                "Interactive terminal setup — saves the key to the harness credential store shared with the dsh Web UI",
+                            _meta: { "terminal-auth": { args: ["login"], env: {} } },
+                        } as unknown as NonNullable<InitializeResponse["authMethods"]>[number],
+                    ],
                 });
             },
 
             async authenticate(_params: AuthenticateRequest): Promise<void> {
-                // No advertised methods; accept the call defensively and
-                // re-check the ambient credential so a client retry after the
-                // user configures dsh succeeds.
+                // Terminal Auth runs out-of-band (`dsh-acp login`); a direct
+                // authenticate call just re-checks the ambient credential so
+                // a client retry after login succeeds.
                 if (!(await credentialPresent())) {
                     throw authRequired(
-                        "no DeepSeek credential found: save one in the dsh Web UI (Settings → Models) or set DEEPSEEK_API_KEY",
+                        "no DeepSeek credential found: run `dsh-acp login`, save one in the dsh Web UI (Settings → Models), or set DEEPSEEK_API_KEY",
                     );
                 }
             },
