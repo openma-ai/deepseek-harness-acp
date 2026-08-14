@@ -232,9 +232,9 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     }
 
     /** The composition's default selection (agent-default-model → settings.yaml). */
-    const defaultSelection = (): { provider?: string; model?: string } => {
+    const defaultSelection = (): { provider?: string; model?: string; reasoningEffort?: string } => {
         const service = ctx.get("agentDefaultModel") as
-            | { currentSelection(): { provider: string; model: string } }
+            | { currentSelection(): { provider: string; model: string; reasoningEffort?: string } }
             | undefined;
         if (service === undefined) return {};
         try {
@@ -395,7 +395,9 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     /**
      * Install (once per live agent) the mutable selection prompt assembly
      * snapshots. Reads fall back to the logged header, then the session's
-     * route, so installation alone never changes behavior.
+     * route composed with the product-default reasoning effort (the Web UI
+     * saved selection), so an untouched session runs exactly what the other
+     * dsh entry points (web, headless) would run.
      */
     const ensureSelection = (record: SessionRecord): ModelSelectionRef | undefined => {
         const install = harness.installModelSelection;
@@ -409,7 +411,15 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 if (logged !== undefined) return logged;
                 const { provider, model } = routeOf(record);
                 if (provider === undefined || model === undefined) return undefined;
-                return { provider, model };
+                const defaults = defaultSelection();
+                // Effort applies when the route is the default selection's own
+                // model (or the default names no model): a explicitly pinned
+                // different model keeps its adapter-default behavior.
+                const effort =
+                    defaults.model === undefined || defaults.model === model
+                        ? defaults.reasoningEffort
+                        : undefined;
+                return { provider, model, ...(effort !== undefined ? { reasoningEffort: effort } : {}) };
             },
             set current(next: ModelSelectionValue | undefined) {
                 picked = next;
@@ -465,8 +475,10 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         } else {
             delete record.provider;
         }
-        // The old selection ref died with the disposed agent's scope.
+        // The old selection ref died with the disposed agent's scope; reinstall
+        // immediately so the default reasoning effort keeps applying.
         delete record.selection;
+        ensureSelection(record);
         if (record.effort !== undefined) {
             const route = routeOf(record);
             const catalog = await effortCatalog(route.provider, route.model);
@@ -663,7 +675,14 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         const efforts = await effortCatalog(route.provider, route.model);
         if (efforts !== undefined && efforts.efforts.length >= 2) {
             const known = new Set(efforts.efforts.map((effort) => effort.id));
-            const preferred = [record.effort, loggedConfig(record)?.reasoningEffort, efforts.defaultEffort].find(
+            const preferred = [
+                record.effort,
+                loggedConfig(record)?.reasoningEffort,
+                // The user's saved product default (Web UI → settings.yaml),
+                // e.g. reasoningEffort: max, outranks the adapter's default.
+                defaultSelection().reasoningEffort,
+                efforts.defaultEffort,
+            ].find(
                 (candidate): candidate is string => candidate !== undefined && known.has(candidate),
             );
             result.push({
@@ -974,6 +993,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     config.model,
                     config.permissionMode ?? "workspace-write",
                 );
+                ensureSelection(record);
                 queueMicrotask(() => publishCommands(String(sessionId)));
                 const options = await configOptions(record);
                 return {
@@ -1028,6 +1048,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     config.permissionMode ?? "workspace-write",
                     projection,
                 );
+                ensureSelection(record);
                 queueMicrotask(() => publishCommands(sessionId));
                 const options = await configOptions(record);
                 return {
