@@ -245,7 +245,7 @@ describe("dsh-acp server (e2e smoke)", () => {
             await new Promise((resolve) => setTimeout(resolve, 250));
         }
         // Adapter built-ins always lead…
-        expect(names.slice(0, 3)).toEqual(["status", "login", "logout"]);
+        expect(names.slice(0, 4)).toEqual(["status", "login", "logout", "model"]);
         // …followed by the composition's own registry (dsh-base mounts
         // compact among others).
         expect(names).toContain("compact");

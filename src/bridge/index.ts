@@ -741,7 +741,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     }
 
     const permissionService = (): PermissionPresetsService | undefined =>
-        ctx.get("permission") as PermissionPresetsService | undefined;
+        (ctx.get("permissionPresets") ?? ctx.get("permission")) as PermissionPresetsService | undefined;
 
     const applyMode = (record: SessionRecord, sessionId: string, modeId: string): void => {
         const permission = permissionService();
@@ -903,6 +903,11 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             input: { hint: "<api-key>" },
         },
         { name: "logout", description: "Remove the API key stored in the harness credential store" },
+        {
+            name: "model",
+            description: "Select the model for this conversation",
+            input: { hint: "[model] — blank lists available models" },
+        },
     ];
 
     /**
@@ -984,6 +989,47 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             .catch((error: unknown) => {
                 logWarn(`publishing commands failed: ${String(error)}`);
             });
+    };
+
+    /** Push the current config-option surface (Zed re-renders its selectors). */
+    const publishConfigOptions = (sessionId: string, record: SessionRecord): void => {
+        void configOptions(record)
+            .then((options) => {
+                notify(sessionId, {
+                    sessionUpdate: "config_option_update",
+                    configOptions: options,
+                } as unknown as SessionUpdate);
+            })
+            .catch((error: unknown) => {
+                logWarn(`publishing config options failed: ${String(error)}`);
+            });
+    };
+
+    /**
+     * Re-read session-logged permission facts into the record. Harness
+     * commands (e.g. /permission) change durable state behind the adapter's
+     * back; the advertised mode must follow the log, not our last write.
+     */
+    const syncPermissionState = (record: SessionRecord, sessionId: string): void => {
+        const events = (record.agent.session as unknown as { events?: readonly unknown[] }).events;
+        if (events === undefined) return;
+        const permission = permissionService();
+        const storedMode = permission?.current(events as unknown[]);
+        for (let index = events.length - 1; index >= 0; index -= 1) {
+            const event = events[index] as { type?: string; data?: { policy?: string } };
+            if (event?.type === "approval/policy") {
+                const policy = event.data?.policy;
+                if (policy === "ask" || policy === "never") record.approvals = policy;
+                break;
+            }
+        }
+        if (storedMode !== undefined && storedMode !== record.modeId) {
+            record.modeId = storedMode as SandboxMode;
+            notify(sessionId, {
+                sessionUpdate: "current_mode_update",
+                currentModeId: record.modeId,
+            } as unknown as SessionUpdate);
+        }
     };
 
     // ------------------------------------------------------------------ //
@@ -1068,6 +1114,68 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         return remaining === "not configured"
             ? "Removed the stored DEEPSEEK_API_KEY. No credential is configured now."
             : `Removed the stored DEEPSEEK_API_KEY; requests now authenticate via: ${remaining}.`;
+    };
+
+    /**
+     * The /model command: no argument lists the live catalog with the current
+     * route marked; an argument switches by exact id (`provider::model` or
+     * model id) or unique case-insensitive substring of the id or label.
+     */
+    const modelCommandText = async (
+        record: SessionRecord,
+        acpSessionId: string,
+        query: string,
+    ): Promise<string> => {
+        const discovered = await discoverModels();
+        const catalog: { value: string; label: string }[] = [
+            ...discovered.map((entry) => ({
+                value: encodeChoice(entry.provider, entry.model),
+                label: entry.label,
+            })),
+            ...modelCandidates()
+                .filter((model) => !discovered.some((entry) => entry.model === model))
+                .map((model) => ({ value: encodeChoice(undefined, model), label: model })),
+        ];
+        const route = routeOf(record);
+        const currentValue = encodeChoice(record.provider, record.model ?? route.model ?? "");
+        if (query === "") {
+            const lines = catalog.map(
+                (entry) => `${entry.value === currentValue ? "→" : " "} ${entry.label} — ${entry.value}`,
+            );
+            return [
+                `model: ${route.model ?? "(product default)"}${record.effort !== undefined ? ` (effort ${record.effort})` : ""}`,
+                "",
+                ...(lines.length > 0 ? lines : ["no models discovered — check credentials with /status"]),
+                "",
+                "switch with /model <name>",
+            ].join("\n");
+        }
+        const lowered = query.toLowerCase();
+        const exact = catalog.filter(
+            (entry) =>
+                entry.value.toLowerCase() === lowered ||
+                decodeChoice(entry.value).model.toLowerCase() === lowered,
+        );
+        const matches =
+            exact.length > 0
+                ? exact
+                : catalog.filter(
+                      (entry) =>
+                          entry.value.toLowerCase().includes(lowered) ||
+                          entry.label.toLowerCase().includes(lowered),
+                  );
+        if (matches.length === 0) return `no model matches "${query}" — see /model`;
+        if (matches.length > 1) {
+            return [`"${query}" is ambiguous:`, ...matches.map((entry) => `  ${entry.label} — ${entry.value}`)].join(
+                "\n",
+            );
+        }
+        const target = matches[0] as { value: string; label: string };
+        if (target.value === currentValue) return `already on ${target.label}`;
+        await switchModel(record, acpSessionId, target.value);
+        publishCommands(acpSessionId, record);
+        publishConfigOptions(acpSessionId, record);
+        return `model → ${target.label}`;
     };
 
     const statusText = async (record: SessionRecord): Promise<string> => {
@@ -1423,6 +1531,15 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     return respond(await loginText(trimmed.slice(commandMatch[0].length)));
                 }
                 if (commandMatch?.[1] === "logout") return respond(await logoutText());
+                if (commandMatch?.[1] === "model") {
+                    return respond(
+                        await modelCommandText(
+                            record,
+                            params.sessionId,
+                            trimmed.slice(commandMatch[0].length).trim(),
+                        ),
+                    );
+                }
                 if (commandMatch !== null && commandMatch[1] !== undefined) {
                     // The harness command registry (compact/goal/permission/…)
                     // executes without a model turn. An unresolved slash falls
@@ -1454,8 +1571,11 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                                 result.text ??
                                 (result.kind === "success" ? `/${commandMatch[1]} ✓` : `/${commandMatch[1]} failed`);
                             // Commands can change agent-visible state (permission
-                            // preset, plan mode); refresh the advertised options.
+                            // preset, plan mode); follow the session log and
+                            // refresh every advertised surface.
+                            syncPermissionState(record, params.sessionId);
                             publishCommands(params.sessionId, record);
+                            publishConfigOptions(params.sessionId, record);
                             return respond(result.kind === "error" ? `⚠ ${text}` : text);
                         }
                     }
