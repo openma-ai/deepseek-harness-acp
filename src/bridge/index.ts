@@ -713,6 +713,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         record.preset = resolved;
         delete record.selection;
         ensureSelection(record);
+        // Approval policy is agent-scoped state; re-apply it to the new agent.
+        setApprovalPolicy(record, record.approvals);
         notify(acpSessionId, { sessionUpdate: "current_mode_update", currentModeId: resolved });
     };
 
