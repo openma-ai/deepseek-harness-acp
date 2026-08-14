@@ -20,7 +20,91 @@
 - id: hmr
   disabled: true
 
+# Model-facing tool rows move off the host plane and into each agent preset's
+# own composition (standard/code/minimal/cordis ship complete agent.cordis.yml
+# files) — the same split the web-app bundle makes, and what gives "minimal"
+# its two-tool surface. Host-plane services (job/skill/goal registries,
+# shell-env, sandbox, approval) stay in dsh-base and serve every preset.
+
+- id: tool-bash
+  disabled: true
+
+- id: tool-pwsh
+  disabled: true
+
+- id: tool-jobs
+  disabled: true
+
+- id: tool-fs
+  disabled: true
+
+- id: tool-fs-search
+  disabled: true
+
+- id: tool-str-replace-editor
+  disabled: true
+
+- id: skill-filesystem
+  disabled: true
+
+- id: tool-skill
+  disabled: true
+
+- id: tool-goal
+  disabled: true
+
+- id: plan-mode
+  disabled: true
+
+- id: compaction-basic
+  disabled: true
+
+- id: command-compact
+  disabled: true
+
+- id: tool-result-pruner
+  disabled: true
+
+- id: tool-subagent-control
+  disabled: true
+
+- id: tool-subagent-list-agents
+  disabled: true
+
+- id: tool-subagent
+  disabled: true
+
+- id: tool-subagent-fork
+  disabled: true
+
+- id: workflow-worker-thread
+  disabled: true
+
+- id: tool-workflow
+  disabled: true
+
+- id: tool-ralph
+  disabled: true
+
+- id: agent-instructions
+  disabled: true
+
+- id: tool-todo
+  disabled: true
+
+- id: tool-web
+  disabled: true
+
 - insert:
+    # Agent presets: per-session model-facing compositions (persona, tools,
+    # compaction). The dsh CLI injects its shipped root into any row with this
+    # id, so standard/code/minimal/creator are available and ACP session modes
+    # surface them (~/.dsh/agent-presets adds user-authored ones).
+    - id: agent-presets
+      name: '@deepseek-ai/dsh-agent-presets'
+      config:
+        default: standard
+
     - id: acp-bridge
       name: '@openma/deepseek-harness-acp/bridge'
       config:

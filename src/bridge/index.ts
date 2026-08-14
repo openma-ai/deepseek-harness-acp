@@ -156,6 +156,8 @@ interface SessionRecord {
     approvals: ApprovalPolicy;
     /** Installed model-selection ref (lazy; created on the first effort/model pick). */
     selection?: ModelSelectionRef;
+    /** Agent preset joined at creation; undefined = deployment without a roster. */
+    preset?: string;
     cancelled: boolean;
     inflight: Inflight | undefined;
 }
@@ -459,10 +461,14 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         });
         let handle;
         try {
+            const presets = presetsService();
             handle = await agents.resume({
                 resumeSessionId: sessionId,
                 agentOptions: agentOptionsFor(choice.model, choice.provider),
-            });
+                ...(presetSetup(presets, record.preset) !== undefined
+                    ? { setup: presetSetup(presets, record.preset) }
+                    : {}),
+            } as Parameters<typeof agents.resume>[0]);
         } catch (error: unknown) {
             sessions.delete(acpSessionId);
             throw internalError(`model switch failed: ${errorChain(error)}`);
@@ -580,13 +586,135 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         inflight.resolve(reason);
     };
 
-    const modeState = (record: SessionRecord): SessionModeState => ({
-        currentModeId: record.modeId,
-        availableModes: SANDBOX_MODES.map((mode) => {
-            const label = MODE_LABELS[mode] ?? { name: mode, description: "" };
-            return { id: mode, name: label.name, description: label.description };
-        }),
-    });
+    // ------------------------------------------------------------------ //
+    // Agent presets (session modes → preset compositions)                 //
+    // ------------------------------------------------------------------ //
+
+    /**
+     * The optional `agentPresets` roster (mounted by the profile patch; the
+     * dsh CLI injects its shipped root — standard/code/minimal/creator — into
+     * any row with this id). Each preset is one model-facing composition
+     * (persona, tools, compaction) that an agent joins at creation, so ACP
+     * session modes map onto it: pick "minimal" in the client and the next
+     * turn runs the two-tool fixed-prompt agent, exactly like the Web UI.
+     */
+    interface AgentPresetsService {
+        list(): Promise<{ id: string }[]>;
+        resolve(id?: string): Promise<{ id: string }>;
+        mount(agentCtx: unknown, id: string): Promise<void>;
+    }
+
+    const presetsService = (): AgentPresetsService | undefined =>
+        ctx.get("agentPresets") as AgentPresetsService | undefined;
+
+    /** Agent-create/resume `setup` joining one preset; undefined without a roster. */
+    const presetSetup = (
+        presets: AgentPresetsService | undefined,
+        presetId: string | undefined,
+    ): ((agentCtx: unknown) => Promise<void>) | undefined => {
+        if (presets === undefined || presetId === undefined) return undefined;
+        return async (agentCtx: unknown) => {
+            logDebug(`preset setup: mounting "${presetId}"`);
+            await presets.mount(agentCtx, presetId);
+            logDebug(`preset setup: mounted "${presetId}"`);
+        };
+    };
+
+    /** Last selected preset in a stored log, else the creation-time header fact. */
+    const presetFromLog = (
+        header: { agentPreset?: string } | undefined,
+        events: readonly { type?: string; data?: unknown }[],
+    ): string | undefined => {
+        for (let index = events.length - 1; index >= 0; index -= 1) {
+            const event = events[index];
+            if (event?.type === "agent-preset/selected") {
+                return (event.data as { agentPreset?: string } | undefined)?.agentPreset;
+            }
+        }
+        return header?.agentPreset;
+    };
+
+    const presetLabel = (id: string): string => id.charAt(0).toUpperCase() + id.slice(1);
+
+    const modeState = async (record: SessionRecord): Promise<SessionModeState> => {
+        const presets = presetsService();
+        if (presets !== undefined && record.preset !== undefined) {
+            try {
+                const roster = await presets.list();
+                if (roster.length > 0) {
+                    return {
+                        currentModeId: record.preset,
+                        availableModes: roster.map((preset) => ({
+                            id: preset.id,
+                            name: presetLabel(preset.id),
+                            description: `Agent preset “${preset.id}”`,
+                        })),
+                    };
+                }
+            } catch (error: unknown) {
+                logWarn(`preset roster unavailable: ${String(error)}`);
+            }
+        }
+        return {
+            currentModeId: record.modeId,
+            availableModes: SANDBOX_MODES.map((mode) => {
+                const label = MODE_LABELS[mode] ?? { name: mode, description: "" };
+                return { id: mode, name: label.name, description: label.description };
+            }),
+        };
+    };
+
+    /**
+     * Switch the agent preset: record the durable fact, then rebuild the
+     * agent over the same session so the new composition (persona, tool set,
+     * compaction) joins from the next turn — the resume-based swap the model
+     * switch already uses. The Web UI locks the preset at creation; ACP
+     * clients get a live switch because rebuilding is this bridge's norm.
+     */
+    const switchPreset = async (record: SessionRecord, acpSessionId: string, presetId: string): Promise<void> => {
+        if (record.inflight !== undefined) {
+            throw invalidParams("cannot switch presets while a prompt is running");
+        }
+        const presets = presetsService();
+        if (presets === undefined) throw invalidParams(`unknown mode: ${presetId}`);
+        let resolved: string;
+        try {
+            resolved = (await presets.resolve(presetId)).id;
+        } catch (error: unknown) {
+            throw invalidParams(`unknown preset: ${presetId} (${errorChain(error)})`);
+        }
+        if (resolved === record.preset) return;
+        try {
+            (
+                record.agent.session as unknown as {
+                    append(type: string, data: unknown): unknown;
+                }
+            ).append("agent-preset/selected", { agentPreset: resolved });
+        } catch (error: unknown) {
+            logWarn(`recording preset selection failed: ${String(error)}`);
+        }
+        const sessionId = record.agent.session.id;
+        await record.dispose().catch((error: unknown) => {
+            logWarn(`dispose during preset switch failed: ${String(error)}`);
+        });
+        let handle;
+        try {
+            handle = await agents.resume({
+                resumeSessionId: sessionId,
+                agentOptions: agentOptionsFor(record.model ?? config.model, record.provider),
+                setup: presetSetup(presets, resolved),
+            } as Parameters<typeof agents.resume>[0]);
+        } catch (error: unknown) {
+            sessions.delete(acpSessionId);
+            throw internalError(`preset switch failed: ${errorChain(error)}`);
+        }
+        record.agent = handle.agent;
+        record.dispose = () => handle.dispose();
+        record.preset = resolved;
+        delete record.selection;
+        ensureSelection(record);
+        notify(acpSessionId, { sessionUpdate: "current_mode_update", currentModeId: resolved });
+    };
 
     /** Flip the per-agent approval policy, mirroring the result on the record. */
     const setApprovalPolicy = (record: SessionRecord, policy: ApprovalPolicy): void => {
@@ -826,6 +954,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             `| Model | ${route.model ?? "(composition default)"} |`,
             `| Reasoning | ${effort ?? "(adapter default)"} |`,
             `| Credential | ${await describeCredential()} |`,
+            ...(record.preset !== undefined ? [`| Preset | ${record.preset} |`] : []),
             `| Permission mode | ${record.modeId} |`,
             `| Approvals | ${record.approvals} |`,
             `| Workspace | ${record.agent.session.header.cwd ?? process.cwd()} |`,
@@ -977,11 +1106,16 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 // reach a session so /login has somewhere to run. The prompt
                 // handler guides them before anything touches the model.
                 const sessionId = SessionId(randomUUID());
+                const presets = presetsService();
+                const presetId = presets === undefined ? undefined : (await presets.resolve(undefined)).id;
                 const handle = await agents.create({
                     sessionId,
-                    meta: { cwd: params.cwd },
+                    meta: { cwd: params.cwd, ...(presetId !== undefined ? { agentPreset: presetId } : {}) },
                     agentOptions: agentOptionsFor(config.model),
-                });
+                    ...(presetSetup(presets, presetId) !== undefined
+                        ? { setup: presetSetup(presets, presetId) }
+                        : {}),
+                } as Parameters<typeof agents.create>[0]);
                 if (closed) {
                     await handle.dispose();
                     throw internalError("connection closed during session/new");
@@ -993,12 +1127,13 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     config.model,
                     config.permissionMode ?? "workspace-write",
                 );
+                if (presetId !== undefined) record.preset = presetId;
                 ensureSelection(record);
                 queueMicrotask(() => publishCommands(String(sessionId)));
                 const options = await configOptions(record);
                 return {
                     sessionId: String(sessionId),
-                    modes: modeState(record),
+                    modes: await modeState(record),
                     ...(options.length > 0 ? { configOptions: options } : {}),
                 };
             },
@@ -1021,8 +1156,11 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     });
                 }
                 let events: readonly SessionEvent[];
+                let storedHeader: { agentPreset?: string } | undefined;
                 try {
-                    ({ events } = await persistence.inspect(SessionId(sessionId)));
+                    const inspected = await persistence.inspect(SessionId(sessionId));
+                    events = inspected.events;
+                    storedHeader = (inspected as unknown as { header?: { agentPreset?: string } }).header;
                 } catch (error: unknown) {
                     throw invalidParams(`session not found: ${sessionId} (${errorChain(error)})`);
                 }
@@ -1034,10 +1172,17 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                         title: replay.title,
                     });
                 }
+                const presets = presetsService();
+                const storedPreset = presetFromLog(storedHeader, events as unknown as { type?: string }[]);
+                const presetId =
+                    presets === undefined ? undefined : (await presets.resolve(storedPreset)).id;
                 const handle = await agents.resume({
                     resumeSessionId: SessionId(sessionId),
                     agentOptions: agentOptionsFor(config.model),
-                });
+                    ...(presetSetup(presets, presetId) !== undefined
+                        ? { setup: presetSetup(presets, presetId) }
+                        : {}),
+                } as Parameters<typeof agents.resume>[0]);
                 const projection = new SessionProjection(replay.contextWindow);
                 projection.title = replay.title;
                 const record = registerRecord(
@@ -1048,11 +1193,12 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     config.permissionMode ?? "workspace-write",
                     projection,
                 );
+                if (presetId !== undefined) record.preset = presetId;
                 ensureSelection(record);
                 queueMicrotask(() => publishCommands(sessionId));
                 const options = await configOptions(record);
                 return {
-                    modes: modeState(record),
+                    modes: await modeState(record),
                     ...(options.length > 0 ? { configOptions: options } : {}),
                 };
             },
@@ -1180,7 +1326,14 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
 
             async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
                 const record = requireSession(params.sessionId);
-                applyMode(record, params.sessionId, params.modeId);
+                // With a preset roster, session modes are agent presets; the
+                // sandbox lives in the "mode" config option. Without one, modes
+                // keep their original sandbox meaning.
+                if (presetsService() !== undefined && record.preset !== undefined) {
+                    await switchPreset(record, params.sessionId, params.modeId);
+                } else {
+                    applyMode(record, params.sessionId, params.modeId);
+                }
                 notify(params.sessionId, {
                     sessionUpdate: "config_option_update",
                     configOptions: await configOptions(record),
