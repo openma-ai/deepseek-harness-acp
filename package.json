@@ -24,7 +24,8 @@
     "README.md",
     "LICENSE",
     "package.json",
-    "profile-root.cordis.yml"
+    "profile-root.cordis.yml",
+    "assets/icon.svg"
   ],
   "scripts": {
     "prepublishOnly": "npm run build",
