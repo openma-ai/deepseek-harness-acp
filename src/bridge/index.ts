@@ -570,6 +570,110 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         return record;
     };
 
+    /**
+     * The session record, restored from the persisted log when the process
+     * no longer holds it live. Zed keeps threads across agent restarts and
+     * may prompt an old session without `session/load` first; recovering
+     * silently (no history replay — the client already renders it) beats
+     * failing the turn with `unknown session`.
+     */
+    const requireOrRestoreSession = async (sessionId: string): Promise<SessionRecord> => {
+        const record = sessions.get(sessionId);
+        if (record !== undefined) return record;
+        if (ctx.get("sessionPersistence") === undefined) throw invalidParams(`unknown session: ${sessionId}`);
+        logWarn(`restoring session ${sessionId} from the persisted log`);
+        try {
+            return await restoreSession(sessionId, { replay: false });
+        } catch (error: unknown) {
+            throw invalidParams(`unknown session: ${sessionId} (${errorChain(error)})`);
+        }
+    };
+
+    /**
+     * Resume one persisted session into a live record: inspect the log,
+     * optionally replay its history to the client, rebuild the agent with
+     * its stored preset, and fold logged permission facts. Shared by
+     * `session/load` (replay: true) and silent restore (replay: false).
+     */
+    const restoreSession = async (
+        sessionId: string,
+        options: { replay: boolean; cwd?: string },
+    ): Promise<SessionRecord> => {
+        const persistence = requirePersistence();
+        const existing = sessions.get(sessionId);
+        if (existing !== undefined) {
+            // Reloading an open session: drop the live agent first so
+            // resume owns the log exclusively.
+            sessions.delete(sessionId);
+            existing.agent.cancel({ kind: "user" });
+            settlePrompt(existing, "cancelled");
+            await existing.dispose().catch((error: unknown) => {
+                logWarn(`dispose before reload failed: ${String(error)}`);
+            });
+        }
+        let events: readonly SessionEvent[];
+        let storedHeader: { agentPreset?: string; cwd?: string } | undefined;
+        try {
+            const inspected = await persistence.inspect(SessionId(sessionId));
+            events = inspected.events;
+            storedHeader = (inspected as unknown as { header?: { agentPreset?: string; cwd?: string } }).header;
+        } catch (error: unknown) {
+            throw invalidParams(`session not found: ${sessionId} (${errorChain(error)})`);
+        }
+        const replay = buildReplay(events as unknown as HarnessEvent[]);
+        if (options.replay) {
+            for (const update of replay.updates) notify(sessionId, update);
+            if (replay.title !== undefined) {
+                notify(sessionId, {
+                    sessionUpdate: "session_info_update",
+                    title: replay.title,
+                });
+            }
+        }
+        const presets = presetsService();
+        const storedPreset = presetFromLog(storedHeader, events as unknown as { type?: string }[]);
+        const presetId = presets === undefined ? undefined : (await presets.resolve(storedPreset)).id;
+        const handle = await agents.resume({
+            resumeSessionId: SessionId(sessionId),
+            agentOptions: agentOptionsFor(config.model),
+            ...(presetSetup(presets, presetId) !== undefined ? { setup: presetSetup(presets, presetId) } : {}),
+        } as Parameters<typeof agents.resume>[0]);
+        const cwd = options.cwd ?? storedHeader?.cwd;
+        const projection = new SessionProjection(replay.contextWindow, {
+            terminalOutput: clientTerminalOutput,
+            ...(cwd !== undefined ? { cwd } : {}),
+        });
+        projection.title = replay.title;
+        const record = registerRecord(
+            sessionId,
+            handle.agent,
+            () => handle.dispose(),
+            config.model,
+            config.permissionMode ?? "workspace-write",
+            projection,
+        );
+        if (presetId !== undefined) record.preset = presetId;
+        // Permission facts are logged and replayed (permission/preset,
+        // sandbox/mode, approval/policy events); mirror the service folds
+        // so the advertised state matches what is enforced.
+        {
+            const permission = permissionService();
+            const storedMode = permission?.current(events as unknown as unknown[]);
+            if (storedMode !== undefined) record.modeId = storedMode as SandboxMode;
+            for (let index = events.length - 1; index >= 0; index -= 1) {
+                const event = events[index] as unknown as { type?: string; data?: { policy?: string } };
+                if (event?.type === "approval/policy") {
+                    const policy = event.data?.policy;
+                    if (policy === "ask" || policy === "never") record.approvals = policy;
+                    break;
+                }
+            }
+        }
+        ensureSelection(record);
+        queueMicrotask(() => publishCommands(sessionId));
+        return record;
+    };
+
     const assertOpen = (): void => {
         if (closed) throw internalError("the ACP bridge has been disposed");
     };
@@ -1394,76 +1498,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 assertOpen();
                 validateCwd(params.cwd);
                 syncMcpServers(params.mcpServers, params.cwd);
-                const persistence = requirePersistence();
-                const sessionId = params.sessionId;
-                const existing = sessions.get(sessionId);
-                if (existing !== undefined) {
-                    // Reloading an open session: drop the live agent first so
-                    // resume owns the log exclusively.
-                    sessions.delete(sessionId);
-                    existing.agent.cancel({ kind: "user" });
-                    settlePrompt(existing, "cancelled");
-                    await existing.dispose().catch((error: unknown) => {
-                        logWarn(`dispose before reload failed: ${String(error)}`);
-                    });
-                }
-                let events: readonly SessionEvent[];
-                let storedHeader: { agentPreset?: string } | undefined;
-                try {
-                    const inspected = await persistence.inspect(SessionId(sessionId));
-                    events = inspected.events;
-                    storedHeader = (inspected as unknown as { header?: { agentPreset?: string } }).header;
-                } catch (error: unknown) {
-                    throw invalidParams(`session not found: ${sessionId} (${errorChain(error)})`);
-                }
-                const replay = buildReplay(events as unknown as HarnessEvent[]);
-                for (const update of replay.updates) notify(sessionId, update);
-                if (replay.title !== undefined) {
-                    notify(sessionId, {
-                        sessionUpdate: "session_info_update",
-                        title: replay.title,
-                    });
-                }
-                const presets = presetsService();
-                const storedPreset = presetFromLog(storedHeader, events as unknown as { type?: string }[]);
-                const presetId =
-                    presets === undefined ? undefined : (await presets.resolve(storedPreset)).id;
-                const handle = await agents.resume({
-                    resumeSessionId: SessionId(sessionId),
-                    agentOptions: agentOptionsFor(config.model),
-                    ...(presetSetup(presets, presetId) !== undefined
-                        ? { setup: presetSetup(presets, presetId) }
-                        : {}),
-                } as Parameters<typeof agents.resume>[0]);
-                const projection = new SessionProjection(replay.contextWindow);
-                projection.title = replay.title;
-                const record = registerRecord(
-                    sessionId,
-                    handle.agent,
-                    () => handle.dispose(),
-                    config.model,
-                    config.permissionMode ?? "workspace-write",
-                    projection,
-                );
-                if (presetId !== undefined) record.preset = presetId;
-                // Permission facts are logged and replayed (permission/preset,
-                // sandbox/mode, approval/policy events); mirror the service
-                // folds so the advertised state matches what is enforced.
-                {
-                    const permission = permissionService();
-                    const storedMode = permission?.current(events as unknown as unknown[]);
-                    if (storedMode !== undefined) record.modeId = storedMode as SandboxMode;
-                    for (let index = events.length - 1; index >= 0; index -= 1) {
-                        const event = events[index] as unknown as { type?: string; data?: { policy?: string } };
-                        if (event?.type === "approval/policy") {
-                            const policy = event.data?.policy;
-                            if (policy === "ask" || policy === "never") record.approvals = policy;
-                            break;
-                        }
-                    }
-                }
-                ensureSelection(record);
-                queueMicrotask(() => publishCommands(sessionId));
+                requirePersistence();
+                const record = await restoreSession(params.sessionId, { replay: true, cwd: params.cwd });
                 const options = await configOptions(record);
                 return {
                     modes: modeState(record),
@@ -1503,7 +1539,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
 
             async prompt(params: PromptRequest): Promise<PromptResponse> {
                 assertOpen();
-                const record = requireSession(params.sessionId);
+                const record = await requireOrRestoreSession(params.sessionId);
                 if (record.inflight !== undefined) {
                     throw invalidParams("a prompt is already in flight for this session");
                 }
@@ -1642,7 +1678,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             },
 
             async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
-                const record = requireSession(params.sessionId);
+                const record = await requireOrRestoreSession(params.sessionId);
                 applyMode(record, params.sessionId, params.modeId);
                 notify(params.sessionId, {
                     sessionUpdate: "config_option_update",
@@ -1654,7 +1690,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             async setSessionConfigOption(
                 params: SetSessionConfigOptionRequest,
             ): Promise<SetSessionConfigOptionResponse> {
-                const record = requireSession(params.sessionId);
+                const record = await requireOrRestoreSession(params.sessionId);
                 const value = typeof params.value === "string" ? params.value : undefined;
                 if (value === undefined) throw invalidParams(`invalid value: ${String(params.value)}`);
 

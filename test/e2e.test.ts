@@ -357,6 +357,26 @@ describe("dsh-acp server (e2e smoke)", () => {
             client.request("session/load", { sessionId: "missing", cwd: workspace, mcpServers: [] }),
         ).rejects.toThrow(/session not found/);
     }, 60_000);
+
+    it("restores a persisted session on direct prompt without session/load", async () => {
+        // Zed keeps threads across agent restarts and may prompt an old
+        // session id directly; the adapter restores it from the log.
+        await client.close();
+        client = new AcpTestClient(sessionRoot, workspace);
+        await client.request("initialize", { protocolVersion: 1 });
+        const status = (await client.request("session/prompt", {
+            sessionId,
+            prompt: [{ type: "text", text: "/status" }],
+        })) as Record<string, unknown>;
+        expect(status["stopReason"]).toBe("end_turn");
+        // Truly unknown ids still fail loudly.
+        await expect(
+            client.request("session/prompt", {
+                sessionId: "11111111-1111-4111-8111-111111111111",
+                prompt: [{ type: "text", text: "hi" }],
+            }),
+        ).rejects.toThrow(/unknown session/);
+    }, 60_000);
 });
 
 // Optional: run the same handshake against a real standalone host install
