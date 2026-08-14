@@ -1,0 +1,68 @@
+name: Release
+
+# Publishing flow: bump version in package.json, tag the commit `vX.Y.Z`,
+# push the tag. Tests gate the publish; npm auth is OIDC trusted publishing
+# (no token, provenance attached automatically).
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # windows is exercised in ci.yml but does not gate releases yet.
+        os: [ubuntu-latest, macos-latest]
+        node: [20, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # npm OIDC trusted publishing
+      contents: write # create the GitHub Release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24 # bundles npm >= 11.5.1 (OIDC-capable)
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+      - run: npm ci
+      - name: Tag must match package.json version
+        run: |
+          PKG="v$(node -p "require('./package.json').version")"
+          if [ "$PKG" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME != package.json $PKG"
+            exit 1
+          fi
+      - name: Publish to npm (OIDC)
+        run: |
+          case "$GITHUB_REF_NAME" in
+            *-alpha.*|*-beta.*|*-rc.*) DIST_TAG=beta ;;
+            *) DIST_TAG=latest ;;
+          esac
+          echo "publishing with dist-tag: $DIST_TAG"
+          npm publish --tag "$DIST_TAG"
+      - name: Pack release asset
+        run: npm pack
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PRERELEASE=""
+          case "$GITHUB_REF_NAME" in *-*) PRERELEASE="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" *.tgz --generate-notes --verify-tag $PRERELEASE
