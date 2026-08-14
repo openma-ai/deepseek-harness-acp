@@ -14,7 +14,7 @@ import { logDebug, logError } from "./log.ts";
 import { HELP_TEXT, resolveSettings, SettingsError } from "./settings.ts";
 import { VERSION } from "./version.ts";
 
-const NAME = "@deepseek-ai-harness/dsh-acp";
+const NAME = "@openma/deepseek-harness-acp";
 
 async function main(): Promise<void> {
     const argv = process.argv.slice(2);

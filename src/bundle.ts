@@ -1,7 +1,7 @@
 /**
  * Bundle entry: the ACP bridge as a dsh profile plugin.
  *
- * This is what `@deepseek-ai-harness/dsh-acp/bridge` resolves to when the
+ * This is what `@openma/deepseek-harness-acp/bridge` resolves to when the
  * package is installed into a dsh profile (`dsh plugin --profile acp add …`)
  * and named by the bundle patch. In a profile, the surrounding dsh
  * installation provides every `@deepseek-ai/*` module, so — unlike the

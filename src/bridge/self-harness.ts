@@ -2,7 +2,7 @@
  * Self-contained harness helpers for bundle/library mounting.
  *
  * When the bridge is mounted by the dsh profile loader (a `cordis.patch.yml`
- * row naming `@deepseek-ai-harness/dsh-acp/bridge`), plugin config is plain
+ * row naming `@openma/deepseek-harness-acp/bridge`), plugin config is plain
  * YAML — no way to inject functions. This module builds the {@link
  * BridgeHarness} from ordinary imports instead; the packages are declared as
  * regular dependencies, so the profile's pnpm install provides them. All of

@@ -1,4 +1,4 @@
-# @deepseek-ai-harness/dsh-acp bundle patch: mounts the ACP stdio bridge over
+# @openma/deepseek-harness-acp bundle patch: mounts the ACP stdio bridge over
 # the profile's base bundle. Stdout carries ACP JSON-RPC exclusively, so the
 # module-reload HMR row stays off (its watcher is unnecessary for a
 # client-owned server process); dsh-base mounts no stdout logger.
@@ -7,7 +7,7 @@
 # credentials, persistence (the shared $DSH_HOME/sessions store), sandbox,
 # tools, skills, subagents — and exposes it to ACP clients such as Zed:
 #
-#     dsh plugin --profile acp add -w @deepseek-ai-harness/dsh-acp
+#     dsh plugin --profile acp add -w @openma/deepseek-harness-acp
 #     dsh --profile acp
 #
 # No provider/model is pinned here: sessions inherit the composition default
@@ -22,7 +22,7 @@
 
 - insert:
     - id: acp-bridge
-      name: '@deepseek-ai-harness/dsh-acp/bridge'
+      name: '@openma/deepseek-harness-acp/bridge'
       config:
         model: !!js process.env.DSH_MODEL
         permissionMode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'

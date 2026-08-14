@@ -2,7 +2,7 @@
 
 Use [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) from [Agent Client Protocol](https://agentclientprotocol.com/) clients such as [Zed](https://zed.dev).
 
-`@deepseek-ai-harness/dsh-acp` is a **dsh profile plugin** (a harness bundle) and a standalone stdio ACP server. In both shapes it maps the harness session-event log onto the full ACP update vocabulary and reuses your existing dsh setup — including the API key you saved in the dsh Web UI. No credentials in your editor config.
+`@openma/deepseek-harness-acp` is a **dsh profile plugin** (a harness bundle) and a standalone stdio ACP server. In both shapes it maps the harness session-event log onto the full ACP update vocabulary and reuses your existing dsh setup — including the API key you saved in the dsh Web UI. No credentials in your editor config.
 
 ## Install (recommended: as a dsh plugin)
 
@@ -16,7 +16,7 @@ dsh web        # first run: save your DeepSeek API key in Settings → Models
 **2. Add the ACP bundle to a profile:**
 
 ```bash
-dsh plugin --profile acp add -w @deepseek-ai-harness/dsh-acp
+dsh plugin --profile acp add -w @openma/deepseek-harness-acp
 ```
 
 This creates `$DSH_HOME/profiles/acp`, installs the package, and registers the
@@ -63,7 +63,7 @@ The package is also a self-contained ACP server that attaches to a DeepSeek
 Harness installation — the way codex-acp runs the Codex you point it at:
 
 ```bash
-npm install -g @deepseek-ai-harness/dsh-acp
+npm install -g @openma/deepseek-harness-acp
 dsh-acp --help
 ```
 
