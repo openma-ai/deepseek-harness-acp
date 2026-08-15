@@ -770,11 +770,10 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     };
 
     /**
-     * Switch the agent preset: record the durable fact, then rebuild the
-     * agent over the same session so the new composition (persona, tool set,
-     * compaction) joins from the next turn — the resume-based swap the model
-     * switch already uses. The Web UI locks the preset at creation; ACP
-     * clients get a live switch because rebuilding is this bridge's norm.
+     * Switch the agent preset: rebuild the agent over the same session so the
+     * new composition joins from the next turn. Record the durable
+     * `agent-preset/selected` fact only after the new composition mounts — a
+     * failed mount must not poison the log or drop the live session.
      */
     const switchPreset = async (record: SessionRecord, acpSessionId: string, presetId: string): Promise<void> => {
         if (record.inflight !== undefined) {
@@ -788,33 +787,49 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             throw invalidParams(`unknown preset: ${presetId} (${errorChain(error)})`);
         }
         if (resolved === record.preset) return;
+        const previous = record.preset;
+        const sessionId = record.agent.session.id;
+        const resumeWith = (id: string | undefined) =>
+            agents.resume({
+                resumeSessionId: sessionId,
+                agentOptions: agentOptionsFor(record.model ?? config.model, record.provider),
+                ...(presetSetup(presets, id) !== undefined ? { setup: presetSetup(presets, id) } : {}),
+            } as Parameters<typeof agents.resume>[0]);
+        await record.dispose().catch((error: unknown) => {
+            logWarn(`dispose during preset switch failed: ${String(error)}`);
+        });
+        let handle: Awaited<ReturnType<typeof resumeWith>>;
+        try {
+            handle = await resumeWith(resolved);
+        } catch (error: unknown) {
+            try {
+                handle = await resumeWith(previous);
+            } catch (restoreError: unknown) {
+                sessions.delete(acpSessionId);
+                throw internalError(
+                    `preset switch failed: ${errorChain(error)}; restore also failed: ${errorChain(restoreError)}`,
+                );
+            }
+            record.agent = handle.agent;
+            record.dispose = () => handle.dispose();
+            delete record.selection;
+            ensureSelection(record);
+            setApprovalPolicy(record, record.approvals);
+            publishCommands(acpSessionId, record);
+            throw invalidParams(`preset "${resolved}" failed to mount: ${errorChain(error)}`);
+        }
+        record.agent = handle.agent;
+        record.dispose = () => handle.dispose();
+        record.preset = resolved;
         try {
             (
-                record.agent.session as unknown as {
+                handle.agent.session as unknown as {
                     append(type: string, data: unknown): unknown;
                 }
             ).append("agent-preset/selected", { agentPreset: resolved });
         } catch (error: unknown) {
             logWarn(`recording preset selection failed: ${String(error)}`);
         }
-        const sessionId = record.agent.session.id;
-        await record.dispose().catch((error: unknown) => {
-            logWarn(`dispose during preset switch failed: ${String(error)}`);
-        });
-        let handle;
-        try {
-            handle = await agents.resume({
-                resumeSessionId: sessionId,
-                agentOptions: agentOptionsFor(record.model ?? config.model, record.provider),
-                setup: presetSetup(presets, resolved),
-            } as Parameters<typeof agents.resume>[0]);
-        } catch (error: unknown) {
-            sessions.delete(acpSessionId);
-            throw internalError(`preset switch failed: ${errorChain(error)}`);
-        }
-        record.agent = handle.agent;
-        record.dispose = () => handle.dispose();
-        record.preset = resolved;
         delete record.selection;
         ensureSelection(record);
         // Approval policy is agent-scoped state; re-apply it to the new agent.
@@ -975,8 +990,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         }
 
         // Agent presets: one model-facing composition (persona, tool surface,
-        // compaction) per entry, switchable per session alongside the sandbox
-        // mode rather than instead of it.
+        // compaction) per entry. ACP has no icon on configOptions; clients
+        // special-case `id: "agent"` / `name: "Agent"`.
         const presets = presetsService();
         if (record.preset !== undefined) {
             try {
@@ -984,8 +999,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 if (roster.length >= 2) {
                     result.push({
                         type: "select",
-                        id: "preset",
-                        name: "Preset",
+                        id: "agent",
+                        name: "Agent",
                         currentValue: record.preset,
                         options: roster.map((preset) => ({
                             value: preset.id,
@@ -1634,6 +1649,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                         applyMode(record, params.sessionId, value);
                         break;
                     }
+                    case "agent":
                     case "preset": {
                         await switchPreset(record, params.sessionId, value);
                         break;

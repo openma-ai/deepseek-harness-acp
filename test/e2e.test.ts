@@ -202,6 +202,9 @@ describe("dsh-acp server (e2e smoke)", () => {
         expect(byId.get("effort")).toMatchObject({ type: "select", category: "thought_level" });
         const efforts = (byId.get("effort") as { options: Array<{ value: string }> }).options.map((o) => o.value);
         expect(efforts).toContain("high");
+        expect(byId.get("agent")).toMatchObject({ type: "select", currentValue: "standard" });
+        const agents = (byId.get("agent") as { options: Array<{ value: string }> }).options.map((o) => o.value);
+        expect(agents).toEqual(expect.arrayContaining(["standard", "code", "minimal", "cordis"]));
     }, 60_000);
 
     it("rejects relative cwds", async () => {
@@ -341,6 +344,23 @@ describe("dsh-acp server (e2e smoke)", () => {
         const list = (await client.request("session/list", {})) as Record<string, unknown>;
         const sessions = list["sessions"] as Array<Record<string, unknown>>;
         expect(sessions.some((session) => session["sessionId"] === sessionId)).toBe(true);
+    }, 60_000);
+
+    it("switches the Agent preset to cordis without dropping the session", async () => {
+        const result = (await client.request("session/set_config_option", {
+            sessionId,
+            configId: "agent",
+            value: "cordis",
+        })) as Record<string, unknown>;
+        const configOptions = result["configOptions"] as Array<Record<string, unknown>>;
+        const agent = configOptions.find((option) => option["id"] === "agent");
+        expect(agent).toMatchObject({ id: "agent", currentValue: "cordis" });
+
+        const status = (await client.request("session/prompt", {
+            sessionId,
+            prompt: [{ type: "text", text: "/status" }],
+        })) as Record<string, unknown>;
+        expect(status["stopReason"]).toBe("end_turn");
     }, 60_000);
 
     it("cancels idle sessions without error and answers unknown sessions loudly", async () => {

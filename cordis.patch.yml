@@ -24,7 +24,8 @@
 # own composition (standard/code/minimal/cordis ship complete agent.cordis.yml
 # files) — the same split the web-app bundle makes, and what gives "minimal"
 # its two-tool surface. Host-plane services (job/skill/goal registries,
-# shell-env, sandbox, approval) stay in dsh-base and serve every preset.
+# shell-env, sandbox, approval, the dynamic Cordis runner the cordis preset
+# injects) stay on the host and serve every preset.
 
 - id: tool-bash
   disabled: true
@@ -104,6 +105,11 @@
       name: '@deepseek-ai/dsh-agent-presets'
       config:
         default: standard
+
+    # Same host row the web-app bundle mounts. Without it, preset "cordis"
+    # never activates: tool-cordis waits for dynamicCordisRunner, cordisInspect.
+    - id: cordis-host-runner
+      name: '@deepseek-ai/dsh-cordis-host-runner'
 
     - id: acp-bridge
       name: '@openma/deepseek-harness-acp/bridge'
