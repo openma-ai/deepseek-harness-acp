@@ -81,9 +81,6 @@ export async function apply(ctx: Context, config: AppConfig): Promise<void> {
     };
 
     // The bridge needs a handful of host functions beyond the plugin tree.
-    const credentialsSeam = p["credentialsSeam"] as
-        | { credentialRef?: (value: string) => unknown }
-        | undefined;
     // rc builds shipped `installModelSelection` under a mangled name for a
     // while; accept either so attach mode works across host versions.
     const agentsModule = p["agents"] as unknown as {
@@ -99,9 +96,6 @@ export async function apply(ctx: Context, config: AppConfig): Promise<void> {
         setSandboxMode: kit.sandboxPolicy.setSandboxMode,
         sandboxModes: kit.sandboxPolicy.SANDBOX_MODES,
         ...(installModelSelection !== undefined ? { installModelSelection } : {}),
-        ...(credentialsSeam?.credentialRef !== undefined
-            ? { credentialRef: credentialsSeam.credentialRef }
-            : {}),
         ...(p["mcpClient"] !== undefined
             ? { mcpClient: p["mcpClient"] as unknown as NonNullable<BridgeHarness["mcpClient"]> }
             : {}),
@@ -116,16 +110,15 @@ export async function apply(ctx: Context, config: AppConfig): Promise<void> {
         await spine;
         yield spine.dispose;
 
-        // User credentials: reuse the key the user saved through the dsh
-        // Web UI (~/.dsh/.credentials.yaml, hot-reloaded), with the process
-        // environment as a fallback layer. Optional: older hosts without the
-        // local provider still work via DEEPSEEK_API_KEY.
+        // User credentials: the official local provider owns
+        // `$DSH_HOME/.credentials.yaml`. Required — the bridge injects it.
         const credentialsModule = p["credentials"];
-        if (credentialsModule !== undefined) {
-            const credentials = anyCtx.plugin(pluginOf(credentialsModule), {});
-            await credentials;
-            yield credentials.dispose;
+        if (credentialsModule === undefined) {
+            throw new Error("this host has no @deepseek-ai/dsh-credentials-local; the ACP bridge injects ctx.credentials");
         }
+        const credentials = anyCtx.plugin(pluginOf(credentialsModule), {});
+        await credentials;
+        yield credentials.dispose;
 
         // Model adapter: resolves DEEPSEEK_API_KEY through the credential
         // seam mounted above, falling back to the launching environment;

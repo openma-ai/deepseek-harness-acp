@@ -1,22 +1,15 @@
 /**
- * `dsh-acp login` — interactive terminal credential setup (ACP Terminal Auth).
+ * `dsh-acp login` — interactive CLI credential setup.
  *
  * Boots the same composition the server uses and writes the API key through
- * the harness credential seam (`~/.dsh/.credentials.yaml`, mode 600 — the
- * exact file the dsh Web UI reads and writes). Never echoes the key.
+ * `ctx.credentials` (`dsh-credentials-local` in dsh-base). That provider owns
+ * `$DSH_HOME/.credentials.yaml`; this command never writes the file itself.
+ * Never echoes the key.
  */
 
+import { parseLoginArgv, primaryCredentialName } from "./auth.ts";
 import type { Context } from "@deepseek-ai/cordis";
-import { createRequire } from "node:module";
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
-
-interface CredentialStore {
-    resolve(ref: unknown): Promise<{ value: string } | undefined>;
-    describe(ref: unknown): Promise<{ configured: boolean; source?: string; writable: boolean }>;
-    set(ref: unknown, value: string): Promise<void>;
-    unset(ref: unknown): Promise<void>;
-}
+import { credentialRef } from "@deepseek-ai/dsh-credentials";
 
 /** Read one secret line: raw-mode TTY without echo, or a piped line. */
 async function readSecret(promptText: string): Promise<string> {
@@ -68,38 +61,24 @@ async function readSecret(promptText: string): Promise<string> {
  * code. The key comes from the argument list (`dsh-acp login sk-…`) or an
  * un-echoed interactive prompt.
  */
-export async function runLogin(ctx: Context, hostBase: string, argv: string[]): Promise<number> {
-    const req = createRequire(join(hostBase, "noop.js"));
-    let credentialRef: ((name: string) => unknown) | undefined;
-    try {
-        const mod = (await import(pathToFileURL(req.resolve("@deepseek-ai/dsh-credentials")).href)) as {
-            credentialRef?: (name: string) => unknown;
-        };
-        credentialRef = mod.credentialRef;
-    } catch {
-        credentialRef = undefined;
-    }
-    const store = ctx.get("credentials") as CredentialStore | undefined;
-    if (store === undefined || credentialRef === undefined) {
-        process.stderr.write(
-            "This composition has no writable credential store; export DEEPSEEK_API_KEY instead.\n",
-        );
-        return 1;
-    }
-    const ref = credentialRef("DEEPSEEK_API_KEY");
-    const before = await store.describe(ref);
+export async function runLogin(ctx: Context, argv: string[]): Promise<number> {
+    const parsed = parseLoginArgv(argv);
+    const name = primaryCredentialName(parsed.provider);
+    const credentials = ctx.credentials;
+    const ref = credentialRef(name);
+    const before = await credentials.describe(ref);
     if (before.configured && before.source !== undefined) {
-        process.stderr.write(`A key is already configured (source: ${before.source}).\n`);
+        process.stderr.write(`A key is already configured for ${name} (source: ${before.source}).\n`);
     }
-    const key = argv[0] ?? (await readSecret("DeepSeek API key (input hidden): "));
+    const key = parsed.key ?? (await readSecret(`${name} (input hidden): `));
     if (key.length === 0) {
         process.stderr.write("No key entered; nothing saved.\n");
         return 1;
     }
-    await store.set(ref, key);
+    await credentials.set(ref, key);
     const masked = key.length <= 8 ? "…" : `${key.slice(0, 4)}…${key.slice(-4)}`;
     process.stderr.write(
-        `Saved ${masked} to the harness credential store (~/.dsh/.credentials.yaml, mode 600).\n` +
+        `Saved ${masked} as ${name} in the harness credential store (~/.dsh/.credentials.yaml, mode 600).\n` +
             "The dsh Web UI and every dsh surface share this credential.\n",
     );
     return 0;

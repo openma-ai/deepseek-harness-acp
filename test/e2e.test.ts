@@ -4,7 +4,8 @@
  *
  * No model calls are made: session/new only constructs an agent, and the
  * /status prompt is intercepted by the adapter before it would reach the
- * model. A fake DEEPSEEK_BASE_URL satisfies the credential gate.
+ * model. A dummy DEEPSEEK_API_KEY plus a fake DEEPSEEK_BASE_URL satisfy
+ * the credential gate without ever dialing a provider.
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -36,6 +37,7 @@ class AcpTestClient {
     ) {
         const env: Record<string, string | undefined> = {
             ...process.env,
+            DEEPSEEK_API_KEY: "sk-test-e2e-not-a-real-key",
             DEEPSEEK_BASE_URL: "http://127.0.0.1:1", // credential gate only; never dialed
             DSH_SESSION_ROOT: sessionRoot,
             DSH_HOME: join(sessionRoot, "home"),
@@ -78,9 +80,12 @@ class AcpTestClient {
             const pending = this.pending.get(id);
             this.pending.delete(id);
             if (message["error"] !== undefined && message["error"] !== null) {
-                const error = message["error"] as { message?: string; data?: unknown };
+                const error = message["error"] as { code?: number; message?: string; data?: unknown };
                 const detail = error.data === undefined ? "" : ` — ${JSON.stringify(error.data)}`;
-                pending?.reject(new Error(`${error.message ?? "JSON-RPC error"}${detail}`));
+                pending?.reject(Object.assign(
+                    new Error(`${error.message ?? "JSON-RPC error"}${detail}`),
+                    { code: error.code },
+                ));
             } else {
                 pending?.resolve(message["result"]);
             }
@@ -153,7 +158,7 @@ describe("dsh-acp server (e2e smoke)", () => {
 
     let sessionId: string;
 
-    it("initializes with capabilities and no ACP-mediated auth", async () => {
+    it("initializes with Agent Auth and logout", async () => {
         const result = (await client.request("initialize", {
             protocolVersion: 1,
             clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
@@ -163,16 +168,15 @@ describe("dsh-acp server (e2e smoke)", () => {
         const capabilities = result["agentCapabilities"] as Record<string, unknown>;
         expect(capabilities["loadSession"]).toBe(true);
         expect(capabilities["promptCapabilities"]).toMatchObject({ embeddedContext: true, image: false });
-        // Credential management is the harness's own concern (dsh Web UI /
-        // environment); the adapter advertises no ACP auth methods.
-        // Terminal Auth only: `dsh-acp login` runs out-of-band; no auth flows
-        // through the client itself.
+        expect(capabilities["auth"]).toEqual({ logout: {} });
         const methods = result["authMethods"] as Array<Record<string, unknown>>;
-        expect(methods).toHaveLength(1);
-        expect(methods[0]).toMatchObject({
-            id: "terminal-login",
-            _meta: { "terminal-auth": { args: ["login"] } },
-        });
+        expect(methods.length).toBeGreaterThanOrEqual(1);
+        expect(methods.every((method) => method["type"] === undefined || method["type"] === "agent")).toBe(true);
+        expect(methods.some((method) => {
+            const id = method["id"];
+            return typeof id === "string" && id.startsWith("api-key");
+        })).toBe(true);
+        expect(methods[0]?.["_meta"]).toMatchObject({ "api-key": {} });
     }, 60_000);
 
     it("creates a session with sandbox modes and config options (model, effort)", async () => {
@@ -252,8 +256,12 @@ describe("dsh-acp server (e2e smoke)", () => {
             if (names.length > 0) break;
             await new Promise((resolve) => setTimeout(resolve, 250));
         }
-        // Adapter built-ins always lead…
-        expect(names.slice(0, 4)).toEqual(["status", "login", "logout", "model"]);
+        // Adapter built-ins always lead. Login/logout are ACP methods, not
+        // slash commands — putting `/login` in the catalogue made clients
+        // treat credential setup as a chat command.
+        expect(names.slice(0, 2)).toEqual(["status", "model"]);
+        expect(names).not.toContain("login");
+        expect(names).not.toContain("logout");
         // …followed by the composition's own registry (dsh-base mounts
         // compact among others).
         expect(names).toContain("compact");
@@ -424,12 +432,11 @@ describe.skipIf(HOST_TREE === undefined)("dsh-acp against a standalone host inst
     }, 120_000);
 });
 
-describe("credential self-service (/login flow)", () => {
+describe("ACP authentication (Agent Auth + logout)", () => {
     let client: AcpTestClient;
     let sessionRoot: string;
     let workspace: string;
     let home: string;
-    let sessionId: string;
 
     beforeAll(async () => {
         sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-login-sessions-"));
@@ -443,11 +450,6 @@ describe("credential self-service (/login flow)", () => {
             DSH_HOME: home,
         });
         await client.request("initialize", { protocolVersion: 1 });
-        const created = (await client.request("session/new", { cwd: workspace, mcpServers: [] })) as Record<
-            string,
-            unknown
-        >;
-        sessionId = created["sessionId"] as string;
     }, 120_000);
 
     afterAll(async () => {
@@ -455,42 +457,53 @@ describe("credential self-service (/login flow)", () => {
         for (const dir of [sessionRoot, workspace, home]) rmSync(dir, { recursive: true, force: true });
     });
 
-    const promptText = async (text: string): Promise<string> => {
-        const before = client.updatesFor(sessionId).length;
-        const result = (await client.request("session/prompt", {
-            sessionId,
-            prompt: [{ type: "text", text }],
-        })) as Record<string, unknown>;
-        expect(result["stopReason"]).toBe("end_turn");
-        return client
-            .updatesFor(sessionId)
-            .slice(before)
-            .filter((update) => update["sessionUpdate"] === "agent_message_chunk")
-            .map((update) => (update["content"] as { text: string }).text)
-            .join("");
-    };
+    it("refuses session/new without a credential via auth_required", async () => {
+        await expect(client.request("session/new", { cwd: workspace, mcpServers: [] })).rejects.toMatchObject({
+            message: expect.stringMatching(/Authentication required/i),
+            code: -32000,
+        });
+    }, 60_000);
 
-    it("creates a session without any credential and guides instead of erroring", async () => {
-        expect(sessionId).toBeTruthy();
-        const guidance = await promptText("hello there");
-        expect(guidance).toContain("/login");
-        expect(guidance).toContain("not sent to the model");
+    it("refuses authenticate until a credential is in the harness store", async () => {
+        await expect(client.request("authenticate", { methodId: "api-key" })).rejects.toMatchObject({
+            message: expect.stringMatching(/Authentication required/i),
+            code: -32000,
+        });
+    }, 60_000);
+
+    it("accepts authenticate with an API key in _meta and then allows session/new", async () => {
+        await expect(client.request("authenticate", {
+            methodId: "api-key",
+            _meta: { "api-key": { apiKey: "sk-test-abcdef1234567890" } },
+        })).resolves.toEqual({});
+        expect(existsSync(join(home, ".credentials.yaml"))).toBe(true);
+        const created = (await client.request("session/new", { cwd: workspace, mcpServers: [] })) as Record<
+            string,
+            unknown
+        >;
+        expect(created["sessionId"]).toBeTruthy();
+
+        await expect(client.request("logout", {})).resolves.toEqual({});
+        await expect(client.request("session/new", { cwd: workspace, mcpServers: [] })).rejects.toMatchObject({
+            code: -32000,
+        });
     }, 120_000);
 
-    it("stores a key via /login, reports it in /status, removes it via /logout", async () => {
-        const saved = await promptText("/login sk-test-abcdef1234567890");
-        expect(saved).toContain("Saved DEEPSEEK_API_KEY");
-        expect(saved).toContain("sk-t…7890");
+    it("accepts authenticate with gateway _meta and then allows session/new", async () => {
+        await expect(client.request("authenticate", {
+            methodId: "gateway",
+            _meta: {
+                gateway: {
+                    baseUrl: "https://api.example.com/v1",
+                    headers: { Authorization: "Bearer sk-gateway-abcdef1234567890" },
+                },
+            },
+        })).resolves.toEqual({});
         expect(existsSync(join(home, ".credentials.yaml"))).toBe(true);
-
-        const status = await promptText("/status");
-        expect(status).toContain("| Credential |");
-        expect(status).not.toContain("not configured");
-
-        const removed = await promptText("/logout");
-        expect(removed).toContain("Removed the stored DEEPSEEK_API_KEY");
-
-        const guidance = await promptText("are you there?");
-        expect(guidance).toContain("/login");
+        const created = (await client.request("session/new", { cwd: workspace, mcpServers: [] })) as Record<
+            string,
+            unknown
+        >;
+        expect(created["sessionId"]).toBeTruthy();
     }, 120_000);
 });

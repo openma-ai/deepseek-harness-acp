@@ -89,16 +89,31 @@ profile.
 
 ## Authentication
 
-No keys in editor config, no ACP-mediated secrets. In order:
+No keys in editor config, no secrets pasted into chat. ACP clients follow
+the protocol: `initialize` advertises three **Agent Auth** methods.
+
+1. **API key** — `api-key`, or `api-key:<provider>` when more than one
+   route is live. The client may pass `_meta["api-key"].apiKey`.
+2. **Browser** — `browser`. The adapter opens a localhost sign-in page;
+   the secret never travels over ACP. Hidden when `NO_BROWSER` is set.
+3. **Custom gateway** — `gateway`, only when the client opts in with
+   `clientCapabilities.auth._meta.gateway === true`. The client sends
+   `_meta.gateway` `{ baseUrl, headers, providerName? }`.
+
+The adapter writes credentials to the harness store. Missing credentials
+fail `session/new` and `session/prompt` with `auth_required` (`-32000`).
+Logout is the ACP `logout` method.
 
 1. **Harness credential store** — `$DSH_HOME/.credentials.yaml` (mode 600),
    the file the dsh Web UI writes; hot-reloaded. Save a key with
-   `dsh-acp login`, the Web UI (Settings → Models), or `/login <key>` in chat.
-2. **Process environment** — `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` in the
-   environment that launches the agent.
+   `dsh-acp login [--provider <route>]`, or the Web UI (Settings → Models).
+2. **Process environment** — `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` (and
+   the matching `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` for those routes) in
+   the environment that launches the agent.
 
-The initialize handshake advertises **Terminal Auth** (`dsh-acp login`), so
-registry-driven clients can run the interactive setup for you.
+The credential gate is the **current provider route**. An Anthropic-only
+store is enough for an Anthropic session; a DeepSeek key does not unlock
+another provider.
 
 ## Features
 
@@ -107,7 +122,7 @@ registry-driven clients can run the interactive setup for you.
 - **Permission presets as session modes** — `read-only` / `workspace-write` / `danger-full-access`, each a named `{sandbox, approval}` pair recorded as a durable session fact (also exposed as a config option for clients that only render those).
 - **Agent presets** — `standard` / `code` / `minimal` / `cordis` as a config option; switching rebuilds the agent live with history preserved.
 - **Live model catalog** — providers × models from the running composition (third-party providers added in the Web UI appear immediately), plus reasoning-effort selection that follows your product default.
-- **Slash commands** — adapter built-ins (`/status`, `/login`, `/logout`, `/model`) plus the harness command registry (`/compact`, `/goal`, `/permission`, `/plan`, …) executed without a model turn, plus **skills** (`/skill-name` — the harness's own invocation gesture).
+- **Slash commands** — adapter built-ins (`/status`, `/model`) plus the harness command registry (`/compact`, `/goal`, `/permission`, `/plan`, …) executed without a model turn, plus **skills** (`/skill-name` — the harness's own invocation gesture). Login and logout are ACP methods, not chat commands.
 - **Plans & usage** — `todo_write` snapshots as ACP plans; token accounting as `usage_update` and per-turn usage.
 - **Sessions** — `session/load` with full history replay, `session/list`, silent restore when a client prompts an old session after an agent restart, titles as `session_info_update`.
 - **MCP servers** — per-session `mcpServers` mount `@deepseek-ai/dsh-mcp-client` instances (stdio + streamable HTTP); tools join as `mcp__<server>__<tool>`; a failing server never takes the session down.

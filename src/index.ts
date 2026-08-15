@@ -10,8 +10,7 @@
 
 import { spawnSync } from "node:child_process";
 
-import * as app from "./app.ts";
-import { HarnessNotFoundError, loadKit, resolveHost } from "./harness.ts";
+import { HarnessNotFoundError, resolveHost } from "./harness.ts";
 import { bootAcpProfile, type BootedContext } from "./profile-boot.ts";
 import { runLogin } from "./login.ts";
 import { logDebug, logError, logInfo } from "./log.ts";
@@ -31,14 +30,12 @@ async function main(): Promise<void> {
         return;
     }
     if (argv[0] === "login") {
-        // ACP Terminal Auth: interactive credential setup, then exit. Boots
+        // CLI login: interactive credential setup, then exit. Boots
         // the same composition as serving (minus the stdio server) so the
         // key lands in the shared harness credential store.
         let booted: BootedContext;
-        let hostBase: string;
         try {
             const host = resolveHost(undefined);
-            hostBase = host.base;
             booted = await bootAcpProfile(host, { serve: false });
         } catch (error: unknown) {
             if (error instanceof HarnessNotFoundError) {
@@ -51,7 +48,6 @@ async function main(): Promise<void> {
         try {
             process.exitCode = await runLogin(
                 booted as unknown as Parameters<typeof runLogin>[0],
-                hostBase,
                 argv.slice(1),
             );
         } finally {
@@ -91,23 +87,21 @@ async function main(): Promise<void> {
         const host = resolveHost(settings.dshPath);
         logDebug(`harness host: ${host.base} via ${host.source} (${host.version ?? "unknown version"})`);
         if (process.env["DSH_ACP_COMPOSE"] === "spine") {
-            // Legacy engine: the fixed hand-rolled composition.
-            const kit = await loadKit(host);
-            const spineCtx = new kit.cordis.Context();
-            await spineCtx.plugin(app, { settings, kit });
-            ctx = spineCtx as unknown as { fiber: { dispose(): Promise<void> } };
-        } else {
-            // Default engine: the dsh profile composition (dsh-base + this
-            // package's bundle patch + the user's $DSH_HOME layers), sharing
-            // the product's own home state.
-            const booted: BootedContext = await bootAcpProfile(host, {
-                ...(settings.provider !== undefined ? { provider: settings.provider } : {}),
-                ...(settings.model !== undefined ? { model: settings.model } : {}),
-                ...(settings.permissionMode !== undefined ? { permissionMode: settings.permissionMode } : {}),
-                ...(settings.maxTokens !== undefined ? { maxTokens: settings.maxTokens } : {}),
-            });
-            ctx = booted;
+            logError(
+                "DSH_ACP_COMPOSE=spine is no longer supported: the ACP bridge injects dsh-base services (credentials, models, permissions, presets). Unset DSH_ACP_COMPOSE to use the profile engine.",
+            );
+            process.exitCode = 1;
+            return;
         }
+        // The dsh profile composition (dsh-base + this package's bundle patch +
+        // the user's $DSH_HOME layers), sharing the product's own home state.
+        const booted: BootedContext = await bootAcpProfile(host, {
+            ...(settings.provider !== undefined ? { provider: settings.provider } : {}),
+            ...(settings.model !== undefined ? { model: settings.model } : {}),
+            ...(settings.permissionMode !== undefined ? { permissionMode: settings.permissionMode } : {}),
+            ...(settings.maxTokens !== undefined ? { maxTokens: settings.maxTokens } : {}),
+        });
+        ctx = booted;
     } catch (error: unknown) {
         if (error instanceof HarnessNotFoundError) {
             logError(error.message);

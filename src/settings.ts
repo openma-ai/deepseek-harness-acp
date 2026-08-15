@@ -153,7 +153,8 @@ export function resolveSettings(argv: string[]): Settings {
 }
 
 export const HELP_TEXT = `Usage: dsh-acp [options]
-       dsh-acp login [api-key]   Save a DeepSeek API key (interactive when omitted)
+       dsh-acp login [--provider <route>] [api-key]
+                                 Save a provider API key (interactive when omitted)
        dsh-acp update            Self-update via npm
 
 Agent Client Protocol (ACP) stdio server for DeepSeek Harness. Speak ACP on

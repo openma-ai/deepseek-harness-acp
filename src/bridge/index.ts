@@ -36,6 +36,7 @@ import {
     type ListSessionsResponse,
     type LoadSessionRequest,
     type LoadSessionResponse,
+    type LogoutRequest,
     type NewSessionRequest,
     type NewSessionResponse,
     type PromptRequest,
@@ -51,6 +52,7 @@ import {
     type Stream,
 } from "@agentclientprotocol/sdk";
 import type { Context } from "@deepseek-ai/cordis";
+import { credentialRef } from "@deepseek-ai/dsh-credentials";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import type { createUserMessage, errorChain } from "@deepseek-ai/dsh-llm";
 import type { SessionId, SessionEvent } from "@deepseek-ai/dsh-session";
@@ -60,16 +62,37 @@ import type { SandboxMode } from "@deepseek-ai/dsh-sandbox";
 // Side-effect type imports: declaration-merge the approval waterfall and agent events.
 import type {} from "@deepseek-ai/dsh-user-approval";
 import type {} from "@deepseek-ai/dsh-session-persistence";
+import type {} from "@deepseek-ai/dsh-commands";
+import type {} from "@deepseek-ai/dsh-skill";
+import type {} from "@deepseek-ai/dsh-agent-default-model";
+import type {} from "@deepseek-ai/dsh-permission-presets";
+import type {} from "@deepseek-ai/dsh-agent-presets";
+import type {} from "@deepseek-ai/dsh-subagent";
 
 import { VERSION } from "../version.ts";
+import {
+    advertisedAuthMethods,
+    apiKeyFromAuthenticate,
+    credentialBaseUrlName,
+    credentialEnvNames,
+    gatewayFromAuthenticate,
+    isBrowserAuthMethod,
+    isGatewayAuthMethod,
+    primaryCredentialName,
+    providerFromAuthMethodId,
+    shouldOfferLocalAuthPage,
+    type ClientAuthCapabilities,
+    type ProviderRoute,
+} from "../auth.ts";
+import { openLocalAuthPage, startLocalAuthPage } from "../auth-page.ts";
 import { logDebug, logWarn } from "../log.ts";
 import { buildReplay } from "./history.ts";
 import { convertPrompt, UnsupportedPromptContentError } from "./prompt.ts";
 import { SessionProjection, turnEndToStopReason, type HarnessEvent, type SessionUpdate } from "./translate.ts";
 
 export const name = "acp-bridge";
-/** The bridge creates and owns agents; every other capability is optional. */
-export const inject = ["agents"];
+/** Wait for the dsh-base services this bridge captures during apply. */
+export const inject = ["agents", "credentials", "llm", "agentDefaultModel", "sessionPersistence", "approval", "permissionPresets", "commands", "agentPresets", "skills", "subagents"];
 
 /** Host functions the bridge needs beyond the plugin tree (see loadKit). */
 export interface BridgeHarness {
@@ -79,8 +102,6 @@ export interface BridgeHarness {
     foldSessionTitle: typeof foldSessionTitle;
     setSandboxMode: typeof setSandboxMode;
     sandboxModes: readonly SandboxMode[];
-    /** Brands a credential reference for `ctx.credentials` lookups (optional seam). */
-    credentialRef?: (value: string) => unknown;
     /**
      * `installModelSelection` from `@deepseek-ai/dsh-agent` (optional seam):
      * couples one mutable selection to the agent's prompt assembly so
@@ -175,11 +196,6 @@ function authRequired(detail: string): RequestError {
     return RequestError.authRequired(undefined, detail);
 }
 
-function envCredentialPresent(): boolean {
-    // A custom base URL counts: OpenAI-compatible proxies may not need a key.
-    return Boolean(process.env["DEEPSEEK_API_KEY"] || process.env["DEEPSEEK_BASE_URL"]);
-}
-
 const MODE_LABELS: Record<SandboxMode, { name: string; description: string }> = {
     "read-only": { name: "Read-only", description: "Bash and file mutations are denied by the sandbox" },
     "workspace-write": {
@@ -195,13 +211,22 @@ const MODE_LABELS: Record<SandboxMode, { name: string; description: string }> = 
 /**
  * Mount the ACP bridge.
  *
- * @param ctx - cordis context carrying `agents` plus optional
- *   `sessionPersistence`, `approval`, and `subagents` services.
+ * @param ctx - cordis context carrying the injected dsh-base services.
  * @param config - provider/model selection and optional test transport.
  */
 export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise<void> {
     // Capture injected services during apply; handlers run outside the scope.
     const agents = ctx.agents;
+    const credentials = ctx.credentials;
+    const llm = ctx.llm;
+    const agentDefaultModel = ctx.agentDefaultModel;
+    const sessionPersistence = ctx.sessionPersistence;
+    const approval = ctx.approval;
+    const permissionPresets = ctx.permissionPresets;
+    const commandRuntime = ctx.commands;
+    const agentPresets = ctx.agentPresets;
+    const skillRegistry = ctx.skills;
+    const subagents = ctx.subagents;
     const harness = config.harness ?? (await import("./self-harness.ts")).selfHarness();
     const { createUserMessage, errorChain, sessionId: SessionId, foldSessionTitle, setSandboxMode } = harness;
     const SANDBOX_MODES = harness.sandboxModes;
@@ -237,12 +262,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
 
     /** The composition's default selection (agent-default-model → settings.yaml). */
     const defaultSelection = (): { provider?: string; model?: string; reasoningEffort?: string } => {
-        const service = ctx.get("agentDefaultModel") as
-            | { currentSelection(): { provider: string; model: string; reasoningEffort?: string } }
-            | undefined;
-        if (service === undefined) return {};
         try {
-            return service.currentSelection();
+            return agentDefaultModel.currentSelection();
         } catch (error: unknown) {
             logDebug(`agentDefaultModel.currentSelection failed: ${String(error)}`);
             return {};
@@ -272,33 +293,25 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
 
     const discoverModels = async (): Promise<ModelChoice[]> => {
         if (liveCatalog !== undefined) return liveCatalog;
-        const llm = ctx.get("llm") as
-            | {
-                  listProviders(): { id: string; name: string }[];
-                  listModels(provider: string): Promise<{ provider: string; id: string; name: string }[]>;
-              }
-            | undefined;
         const found: ModelChoice[] = [];
-        if (llm !== undefined) {
-            try {
-                const providers = llm.listProviders();
-                const multi = providers.length > 1;
-                for (const provider of providers) {
-                    const models = await llm.listModels(provider.id).catch((error: unknown) => {
-                        logDebug(`listModels(${provider.id}) failed: ${String(error)}`);
-                        return [];
+        try {
+            const providers = llm.listProviders();
+            const multi = providers.length > 1;
+            for (const provider of providers) {
+                const models = await llm.listModels(provider.id).catch((error: unknown) => {
+                    logDebug(`listModels(${provider.id}) failed: ${String(error)}`);
+                    return [];
+                });
+                for (const model of models) {
+                    found.push({
+                        provider: provider.id,
+                        model: model.id,
+                        label: multi ? `${model.name} (${provider.name})` : model.name,
                     });
-                    for (const model of models) {
-                        found.push({
-                            provider: provider.id,
-                            model: model.id,
-                            label: multi ? `${model.name} (${provider.name})` : model.name,
-                        });
-                    }
                 }
-            } catch (error: unknown) {
-                logDebug(`model discovery failed: ${String(error)}`);
             }
+        } catch (error: unknown) {
+            logDebug(`model discovery failed: ${String(error)}`);
         }
         liveCatalog = found;
         return found;
@@ -361,22 +374,9 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         if (provider === undefined || model === undefined) return undefined;
         const key = `${provider}::${model}`;
         if (effortCache.has(key)) return effortCache.get(key);
-        const llm = ctx.get("llm") as
-            | {
-                  resolveModelInfo?(
-                      provider: string,
-                      model: string,
-                  ): Promise<{
-                      reasoning?: {
-                          efforts: readonly { id: unknown; name: string; description?: string }[];
-                          defaultEffort?: unknown;
-                      };
-                  }>;
-              }
-            | undefined;
         let catalog: EffortCatalog | undefined;
         try {
-            const reasoning = (await llm?.resolveModelInfo?.(provider, model))?.reasoning;
+            const reasoning = (await llm.resolveModelInfo(provider, model)).reasoning;
             if (reasoning !== undefined && reasoning.efforts.length > 0) {
                 catalog = {
                     efforts: reasoning.efforts.map((effort) => ({
@@ -514,35 +514,43 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     };
 
     /**
-     * Whether a model call has any chance of authenticating: the credential
-     * seam first (the key saved through the dsh Web UI, hot-reloaded from
-     * ~/.dsh/.credentials.yaml), then the process environment. Composition
-     * boots activate plugins concurrently, so wait briefly for the seam to
-     * register instead of failing a session that raced the loader.
+     * Live adapter directory. Third-party routes configured in the dsh Web UI
+     * (`llm-pi-ai:` settings) show up here the moment they register.
      */
-    const credentialPresent = async (): Promise<boolean> => {
-        if (envCredentialPresent()) return true;
-        const brand = harness.credentialRef;
-        if (brand === undefined) return false;
-        const deadline = Date.now() + 5000;
-        for (;;) {
-            const seam = ctx.get("credentials") as
-                | { resolve(ref: unknown): Promise<{ value: string } | undefined> }
-                | undefined;
-            if (seam !== undefined) {
-                try {
-                    return (await seam.resolve(brand("DEEPSEEK_API_KEY"))) !== undefined;
-                } catch (error: unknown) {
-                    logWarn(`credential lookup failed: ${String(error)}`);
-                    return false;
-                }
-            }
-            if (Date.now() >= deadline) {
-                logDebug("credential gate: no credentials service registered within 5s");
-                return false;
-            }
-            await new Promise((resolve) => setTimeout(resolve, 100));
+    const listProviderRoutes = async (): Promise<ProviderRoute[]> => {
+        try {
+            const raw = llm.listProviders();
+            if (!Array.isArray(raw)) return [];
+            return raw.flatMap((entry) => {
+                if (!entry || typeof entry !== "object") return [];
+                const id = (entry as { id?: unknown }).id;
+                if (typeof id !== "string" || id.length === 0) return [];
+                const name = (entry as { name?: unknown }).name;
+                return [{ id, ...(typeof name === "string" && name.length > 0 ? { name } : {}) }];
+            });
+        } catch (error: unknown) {
+            logDebug(`listProviders failed: ${String(error)}`);
+            return [];
         }
+    };
+
+    const credentialPresent = async (provider?: string): Promise<boolean> => {
+        const names = credentialEnvNames(provider).filter((name) => !name.endsWith("_BASE_URL"));
+        for (const name of names) {
+            try {
+                if ((await credentials.resolve(credentialRef(name))) !== undefined) return true;
+            } catch (error: unknown) {
+                logWarn(`credential lookup failed: ${String(error)}`);
+            }
+        }
+        return false;
+    };
+
+    const requireCredential = async (provider?: string): Promise<void> => {
+        if (await credentialPresent(provider)) return;
+        throw authRequired(
+            "no credential found for this provider: call authenticate with `_meta[\"api-key\"].apiKey` or `_meta.gateway`, use the browser method, run `dsh-acp login`, or save a key in the dsh Web UI (Settings → Models)",
+        );
     };
 
     const agentOptionsFor = (
@@ -580,7 +588,6 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     const requireOrRestoreSession = async (sessionId: string): Promise<SessionRecord> => {
         const record = sessions.get(sessionId);
         if (record !== undefined) return record;
-        if (ctx.get("sessionPersistence") === undefined) throw invalidParams(`unknown session: ${sessionId}`);
         logWarn(`restoring session ${sessionId} from the persisted log`);
         try {
             return await restoreSession(sessionId, { replay: false });
@@ -632,7 +639,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         }
         const presets = presetsService();
         const storedPreset = presetFromLog(storedHeader, events as unknown as { type?: string }[]);
-        const presetId = presets === undefined ? undefined : (await presets.resolve(storedPreset)).id;
+        const presetId = (await presets.resolve(storedPreset)).id;
         const handle = await agents.resume({
             resumeSessionId: SessionId(sessionId),
             agentOptions: agentOptionsFor(config.model),
@@ -658,7 +665,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         // so the advertised state matches what is enforced.
         {
             const permission = permissionService();
-            const storedMode = permission?.current(events as unknown as unknown[]);
+            const storedMode = permission.current(events as unknown as unknown[]);
             if (storedMode !== undefined) record.modeId = storedMode as SandboxMode;
             for (let index = events.length - 1; index >= 0; index -= 1) {
                 const event = events[index] as unknown as { type?: string; data?: { policy?: string } };
@@ -710,15 +717,14 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         mount(agentCtx: unknown, id: string): Promise<void>;
     }
 
-    const presetsService = (): AgentPresetsService | undefined =>
-        ctx.get("agentPresets") as AgentPresetsService | undefined;
+    const presetsService = (): AgentPresetsService => agentPresets as unknown as AgentPresetsService;
 
     /** Agent-create/resume `setup` joining one preset; undefined without a roster. */
     const presetSetup = (
-        presets: AgentPresetsService | undefined,
+        presets: AgentPresetsService,
         presetId: string | undefined,
     ): ((agentCtx: unknown) => Promise<void>) | undefined => {
-        if (presets === undefined || presetId === undefined) return undefined;
+        if (presetId === undefined) return undefined;
         return async (agentCtx: unknown) => {
             logDebug(`preset setup: mounting "${presetId}"`);
             await presets.mount(agentCtx, presetId);
@@ -745,7 +751,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     /** Sandbox confinement levels: the session-mode selector, always. */
     const modeState = (record: SessionRecord): SessionModeState => {
         const permission = permissionService();
-        if (permission !== undefined && permission.names.length > 0) {
+        if (permission.names.length > 0) {
             return {
                 currentModeId: record.modeId,
                 availableModes: permission.names.map((name) => {
@@ -775,7 +781,6 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             throw invalidParams("cannot switch presets while a prompt is running");
         }
         const presets = presetsService();
-        if (presets === undefined) throw invalidParams(`unknown mode: ${presetId}`);
         let resolved: string;
         try {
             resolved = (await presets.resolve(presetId)).id;
@@ -820,8 +825,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     /** Flip the per-agent approval policy, mirroring the result on the record. */
     const setApprovalPolicy = (record: SessionRecord, policy: ApprovalPolicy): void => {
         try {
-            (ctx.get("approval") as { setPolicy?: (agent: Agent, policy: ApprovalPolicy) => void } | undefined)
-                ?.setPolicy?.(record.agent, policy);
+            approval.setPolicy(record.agent, policy);
         } catch (error: unknown) {
             logWarn(`approval policy switch failed: ${String(error)}`);
         }
@@ -844,12 +848,12 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         apply(session: unknown, name: string, setApproval: (policy: ApprovalPolicy) => void): void;
     }
 
-    const permissionService = (): PermissionPresetsService | undefined =>
-        (ctx.get("permissionPresets") ?? ctx.get("permission")) as PermissionPresetsService | undefined;
+    const permissionService = (): PermissionPresetsService =>
+        permissionPresets as unknown as PermissionPresetsService;
 
     const applyMode = (record: SessionRecord, sessionId: string, modeId: string): void => {
         const permission = permissionService();
-        if (permission !== undefined && permission.names.includes(modeId)) {
+        if (permission.names.includes(modeId)) {
             // The authoritative path: records the durable permission/preset
             // fact, applies the sandbox, and writes the bundled approval
             // policy through the live agent.
@@ -911,7 +915,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         {
             const permission = permissionService();
             const levels =
-                permission !== undefined && permission.names.length > 0
+                permission.names.length > 0
                     ? permission.names.map((name) => {
                           const spec = permission.resolve(name);
                           return { value: name, name: spec.name, description: spec.description };
@@ -974,7 +978,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         // compaction) per entry, switchable per session alongside the sandbox
         // mode rather than instead of it.
         const presets = presetsService();
-        if (presets !== undefined && record.preset !== undefined) {
+        if (record.preset !== undefined) {
             try {
                 const roster = await presets.list();
                 if (roster.length >= 2) {
@@ -1002,12 +1006,6 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     const BUILTIN_COMMANDS = [
         { name: "status", description: "Show adapter, model, mode, and token status" },
         {
-            name: "login",
-            description: "Save a DeepSeek API key into the harness credential store (~/.dsh/.credentials.yaml)",
-            input: { hint: "<api-key>" },
-        },
-        { name: "logout", description: "Remove the API key stored in the harness credential store" },
-        {
             name: "model",
             description: "Select the model for this conversation",
             input: { hint: "[model] — blank lists available models" },
@@ -1026,59 +1024,38 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     ): Promise<{ name: string; description: string; input?: { hint: string } }[]> => {
         const list = [...BUILTIN_COMMANDS];
         const seen = new Set(list.map((command) => command.name));
-        const commandsSvc = ctx.get("commands") as
-            | { list(agent: Agent): readonly { name: string; description: string; input?: { hint: string } }[] }
-            | undefined;
-        if (commandsSvc !== undefined) {
-            try {
-                for (const descriptor of commandsSvc.list(record.agent)) {
-                    if (seen.has(descriptor.name)) continue;
-                    seen.add(descriptor.name);
-                    list.push({
-                        name: descriptor.name,
-                        description: descriptor.description,
-                        ...(descriptor.input !== undefined ? { input: { hint: descriptor.input.hint } } : {}),
-                    });
-                }
-            } catch (error: unknown) {
-                logWarn(`command listing failed: ${String(error)}`);
-            }
-        }
-        const skillsSvc = ctx.get("skills") as
-            | {
-                  list(lookup: {
-                      cwd?: string;
-                      scope: Agent;
-                  }): Promise<
-                      readonly {
-                          name: string;
-                          description: string;
-                          invocation: { userInvocable: boolean };
-                      }[]
-                  >;
-              }
-            | undefined;
-        if (skillsSvc !== undefined) {
-            try {
-                const skills = await skillsSvc.list({
-                    ...(record.agent.session.header.cwd !== undefined
-                        ? { cwd: record.agent.session.header.cwd }
-                        : {}),
-                    scope: record.agent,
+        try {
+            for (const descriptor of commandRuntime.list(record.agent)) {
+                if (seen.has(descriptor.name)) continue;
+                seen.add(descriptor.name);
+                list.push({
+                    name: descriptor.name,
+                    description: descriptor.description,
+                    ...(descriptor.input !== undefined ? { input: { hint: descriptor.input.hint } } : {}),
                 });
-                for (const skill of skills) {
-                    if (skill.invocation.userInvocable !== true) continue;
-                    if (seen.has(skill.name)) continue;
-                    seen.add(skill.name);
-                    list.push({
-                        name: skill.name,
-                        description: skill.description,
-                        input: { hint: "instructions for the skill" },
-                    });
-                }
-            } catch (error: unknown) {
-                logDebug(`skill listing failed: ${String(error)}`);
             }
+        } catch (error: unknown) {
+            logWarn(`command listing failed: ${String(error)}`);
+        }
+        try {
+            const skills = await skillRegistry.list({
+                ...(record.agent.session.header.cwd !== undefined
+                    ? { cwd: record.agent.session.header.cwd }
+                    : {}),
+                scope: record.agent,
+            });
+            for (const skill of skills) {
+                if (skill.invocation.userInvocable !== true) continue;
+                if (seen.has(skill.name)) continue;
+                seen.add(skill.name);
+                list.push({
+                    name: skill.name,
+                    description: skill.description,
+                    input: { hint: "instructions for the skill" },
+                });
+            }
+        } catch (error: unknown) {
+            logDebug(`skill listing failed: ${String(error)}`);
         }
         return list;
     };
@@ -1118,7 +1095,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         const events = (record.agent.session as unknown as { events?: readonly unknown[] }).events;
         if (events === undefined) return;
         const permission = permissionService();
-        const storedMode = permission?.current(events as unknown[]);
+        const storedMode = permission.current(events as unknown[]);
         for (let index = events.length - 1; index >= 0; index -= 1) {
             const event = events[index] as { type?: string; data?: { policy?: string } };
             if (event?.type === "approval/policy") {
@@ -1137,87 +1114,45 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     };
 
     // ------------------------------------------------------------------ //
-    // Credential store (the same writable seam the dsh Web UI uses)        //
+    // Host credential seam (`ctx.credentials` / dsh-credentials-local)     //
     // ------------------------------------------------------------------ //
 
-    interface CredentialStore {
-        resolve(ref: unknown): Promise<{ value: string } | undefined>;
-        describe(ref: unknown): Promise<{ configured: boolean; source?: string; writable: boolean }>;
-        set(ref: unknown, value: string): Promise<void>;
-        unset(ref: unknown): Promise<void>;
-    }
-
-    const credentialStore = (): { store: CredentialStore; ref: unknown } | undefined => {
-        const brand = harness.credentialRef;
-        const store = ctx.get("credentials") as CredentialStore | undefined;
-        if (brand === undefined || store === undefined) return undefined;
-        return { store, ref: brand("DEEPSEEK_API_KEY") };
+    const describeCredential = async (provider?: string): Promise<string> => {
+        const names = credentialEnvNames(provider).filter((candidate) => !candidate.endsWith("_BASE_URL"));
+        for (const name of names) {
+            try {
+                const info = await credentials.describe(credentialRef(name));
+                if (info.configured) return info.source ?? "credential store";
+            } catch (error: unknown) {
+                logWarn(`credential describe failed: ${String(error)}`);
+            }
+        }
+        return "not configured";
     };
 
-    const maskKey = (value: string): string =>
-        value.length <= 8 ? "…" : `${value.slice(0, 4)}…${value.slice(-4)}`;
-
-    const describeCredential = async (): Promise<string> => {
-        if (envCredentialPresent()) {
-            const viaEnv =
-                process.env["DEEPSEEK_API_KEY"] !== undefined ? "DEEPSEEK_API_KEY" : "DEEPSEEK_BASE_URL";
-            return `process environment (${viaEnv})`;
-        }
-        const cs = credentialStore();
-        if (cs === undefined) return "not configured";
-        try {
-            const info = await cs.store.describe(cs.ref);
-            if (!info.configured) return "not configured";
-            return info.source ?? "credential store";
-        } catch (error: unknown) {
-            logWarn(`credential describe failed: ${String(error)}`);
-            return "unknown";
-        }
+    const saveCredential = async (provider: string | undefined, key: string): Promise<void> => {
+        await credentials.set(credentialRef(primaryCredentialName(provider)), key);
     };
 
-    const loginText = async (rawArgument: string): Promise<string> => {
-        const key = rawArgument.trim();
-        const cs = credentialStore();
-        if (cs === undefined) {
-            return "This composition has no writable credential store; export DEEPSEEK_API_KEY in the environment that launches the agent instead.";
-        }
-        if (key.length === 0) {
-            return [
-                "Usage: `/login <api-key>` — stores the key in the harness credential store",
-                "(`~/.dsh/.credentials.yaml`, the same file the dsh Web UI writes; mode 600).",
-                "",
-                `Current credential source: ${await describeCredential()}.`,
-                "",
-                "Note: text entered here also lands in your client's chat history. If you",
-                "prefer to keep the key out of it, save the key in the dsh Web UI instead.",
-            ].join("\n");
-        }
-        try {
-            await cs.store.set(cs.ref, key);
-        } catch (error: unknown) {
-            return [
-                `Could not store the key: ${error instanceof Error ? error.message : String(error)}`,
-                "",
-                "A read-only source (usually the process environment) is currently supplying",
-                "this credential, so a stored value would be shadowed. Unset DEEPSEEK_API_KEY",
-                "in the launching environment, or keep using it as the credential.",
-            ].join("\n");
-        }
-        return `Saved DEEPSEEK_API_KEY (${maskKey(key)}) to the harness credential store — source now: ${await describeCredential()}. The dsh Web UI sees the same key.`;
+    const saveGateway = async (
+        provider: string | undefined,
+        key: string,
+        baseUrl: string,
+    ): Promise<void> => {
+        await saveCredential(provider, key);
+        await credentials.set(credentialRef(credentialBaseUrlName(provider)), baseUrl);
     };
 
-    const logoutText = async (): Promise<string> => {
-        const cs = credentialStore();
-        if (cs === undefined) return "This composition has no writable credential store; nothing to remove.";
-        try {
-            await cs.store.unset(cs.ref);
-        } catch (error: unknown) {
-            return `Could not remove the stored key: ${error instanceof Error ? error.message : String(error)}`;
+    const logoutStored = async (): Promise<void> => {
+        const routes = await listProviderRoutes();
+        const providers = routes.length > 0 ? routes.map((route) => route.id) : [config.provider];
+        for (const provider of providers) {
+            try {
+                await credentials.unset(credentialRef(primaryCredentialName(provider)));
+            } catch (error: unknown) {
+                logWarn(`credential unset failed: ${String(error)}`);
+            }
         }
-        const remaining = await describeCredential();
-        return remaining === "not configured"
-            ? "Removed the stored DEEPSEEK_API_KEY. No credential is configured now."
-            : `Removed the stored DEEPSEEK_API_KEY; requests now authenticate via: ${remaining}.`;
     };
 
     /**
@@ -1294,7 +1229,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             `| Provider | ${route.provider ?? "(composition default)"} |`,
             `| Model | ${route.model ?? "(composition default)"} |`,
             `| Reasoning | ${effort ?? "(adapter default)"} |`,
-            `| Credential | ${await describeCredential()} |`,
+            `| Credential | ${await describeCredential(route.provider)} |`,
             ...(record.preset !== undefined ? [`| Preset | ${record.preset} |`] : []),
             `| Permission mode | ${record.modeId} |`,
             `| Approvals | ${record.approvals} |`,
@@ -1389,12 +1324,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             .then(({ outcome }) => {
                 if (outcome.outcome === "cancelled") return "cancelled" as const;
                 if (outcome.optionId === "allow-always") {
-                    try {
-                        (ctx.get("approval") as { setPolicy?: (agent: Agent, policy: "ask" | "never") => void } | undefined)
-                            ?.setPolicy?.(record.agent, "never");
-                    } catch (error: unknown) {
-                        logWarn(`approval policy switch failed: ${String(error)}`);
-                    }
+                    setApprovalPolicy(record, "never");
                     return "allowed-once" as const;
                 }
                 return outcome.optionId === "allow-once" ? ("allowed-once" as const) : ("rejected" as const);
@@ -1408,8 +1338,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     const makeAgent = (connection: AgentSideConnection): AcpAgent => {
         conn = connection;
         return {
-            initialize(params: InitializeRequest): Promise<InitializeResponse> {
-                const hasPersistence = ctx.get("sessionPersistence") !== undefined;
+            async initialize(params: InitializeRequest): Promise<InitializeResponse> {
                 const requested = params.protocolVersion;
                 // Zed's display-terminal extension: command tool calls embed a
                 // presentation terminal when the client advertises it in the
@@ -1421,61 +1350,80 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     capsMeta !== null && typeof capsMeta === "object"
                         ? capsMeta["terminal_output"] === true
                         : false;
-                // No ACP auth methods: credential management belongs to the
-                // harness (dsh Web UI → ~/.dsh/.credentials.yaml, hot-reloaded)
-                // or the launching environment. The adapter reuses whatever
-                // the user already configured; clients never mediate auth.
-                return Promise.resolve({
+                const providers = await listProviderRoutes();
+                return {
                     protocolVersion:
                         typeof requested === "number" && requested >= 1 && requested < PROTOCOL_VERSION
                             ? requested
                             : PROTOCOL_VERSION,
                     agentInfo: { name: "dsh-acp", title: "DeepSeek Harness", version: VERSION },
                     agentCapabilities: {
-                        loadSession: hasPersistence,
+                        loadSession: true,
                         promptCapabilities: { image: false, audio: false, embeddedContext: true },
                         // Stdio servers always work; streamable HTTP maps onto
                         // mcp-client's second transport. Legacy SSE does not.
                         mcpCapabilities: { http: true, sse: false },
-                        ...(hasPersistence ? { sessionCapabilities: { list: {} } } : {}),
+                        auth: { logout: {} },
+                        sessionCapabilities: { list: {} },
                     },
-                    authMethods: [
-                        // ACP Terminal Auth (see the registry's AUTHENTICATION.md):
-                        // the client runs `dsh-acp login` in an interactive
-                        // terminal; the key lands in the shared harness
-                        // credential store (~/.dsh/.credentials.yaml).
-                        {
-                            id: "terminal-login",
-                            name: "Log in with a DeepSeek API key",
-                            description:
-                                "Interactive terminal setup — saves the key to the harness credential store shared with the dsh Web UI",
-                            _meta: { "terminal-auth": { args: ["login"], env: {} } },
-                        } as unknown as NonNullable<InitializeResponse["authMethods"]>[number],
-                    ],
-                });
+                    authMethods: advertisedAuthMethods(
+                        providers,
+                        params.clientCapabilities as ClientAuthCapabilities | undefined,
+                    ) as AuthMethod[],
+                };
             },
 
-            async authenticate(_params: AuthenticateRequest): Promise<void> {
-                // Terminal Auth runs out-of-band (`dsh-acp login`); a direct
-                // authenticate call just re-checks the ambient credential so
-                // a client retry after login succeeds.
-                if (!(await credentialPresent())) {
-                    throw authRequired(
-                        "no DeepSeek credential found: run `dsh-acp login`, save one in the dsh Web UI (Settings → Models), or set DEEPSEEK_API_KEY",
+            async authenticate(params: AuthenticateRequest): Promise<void> {
+                const gateway = gatewayFromAuthenticate(params);
+                if (isGatewayAuthMethod(params.methodId) || gateway.baseUrl) {
+                    if (!gateway.baseUrl || !gateway.key) {
+                        throw authRequired(
+                            "authenticate gateway requires `_meta.gateway.baseUrl` and an Authorization header",
+                        );
+                    }
+                    await saveGateway(
+                        gateway.providerName ?? config.provider,
+                        gateway.key,
+                        gateway.baseUrl,
                     );
+                    return;
                 }
+                const submitted = apiKeyFromAuthenticate(params);
+                const provider =
+                    submitted.provider ?? providerFromAuthMethodId(params.methodId) ?? config.provider;
+                if (submitted.key) {
+                    await saveCredential(provider, submitted.key);
+                    return;
+                }
+                if (await credentialPresent(provider)) return;
+                if (isBrowserAuthMethod(params.methodId) && shouldOfferLocalAuthPage()) {
+                    const page = await startLocalAuthPage({
+                        credentialName: primaryCredentialName(provider),
+                    });
+                    openLocalAuthPage(page.url);
+                    try {
+                        const key = await page.completed;
+                        await saveCredential(provider, key);
+                        return;
+                    } finally {
+                        page.close();
+                    }
+                }
+                await requireCredential(provider);
+            },
+
+            async logout(_params: LogoutRequest): Promise<void> {
+                await logoutStored();
             },
 
             async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
                 assertOpen();
+                await requireCredential(config.provider);
                 validateCwd(params.cwd);
                 syncMcpServers(params.mcpServers, params.cwd);
-                // No credential gate here: an unauthenticated user must still
-                // reach a session so /login has somewhere to run. The prompt
-                // handler guides them before anything touches the model.
                 const sessionId = SessionId(randomUUID());
                 const presets = presetsService();
-                const presetId = presets === undefined ? undefined : (await presets.resolve(undefined)).id;
+                const presetId = (await presets.resolve(undefined)).id;
                 const handle = await agents.create({
                     sessionId,
                     meta: { cwd: params.cwd, ...(presetId !== undefined ? { agentPreset: presetId } : {}) },
@@ -1508,6 +1456,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
 
             async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
                 assertOpen();
+                await requireCredential(config.provider);
                 validateCwd(params.cwd);
                 syncMcpServers(params.mcpServers, params.cwd);
                 requirePersistence();
@@ -1575,10 +1524,6 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     return { stopReason: "end_turn" };
                 };
                 if (commandMatch?.[1] === "status") return respond(await statusText(record));
-                if (commandMatch?.[1] === "login") {
-                    return respond(await loginText(trimmed.slice(commandMatch[0].length)));
-                }
-                if (commandMatch?.[1] === "logout") return respond(await logoutText());
                 if (commandMatch?.[1] === "model") {
                     return respond(
                         await modelCommandText(
@@ -1593,56 +1538,34 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     // executes without a model turn. An unresolved slash falls
                     // through: /skill-name is the harness's own skill gesture
                     // and is claimed inside the agent's next step.
-                    const commandsSvc = ctx.get("commands") as
-                        | {
-                              execute(
-                                  agent: Agent,
-                                  line: string,
-                                  signal: AbortSignal,
-                              ): Promise<{ result: { kind: string; text?: string } } | undefined>;
-                          }
-                        | undefined;
-                    if (commandsSvc !== undefined) {
-                        let execution;
-                        try {
-                            execution = await commandsSvc.execute(
-                                record.agent,
-                                trimmed,
-                                new AbortController().signal,
-                            );
-                        } catch (error: unknown) {
-                            return respond(`⚠ /${commandMatch[1]} failed: ${errorChain(error)}`);
-                        }
-                        if (execution !== undefined) {
-                            const { result } = execution;
-                            const text =
-                                result.text ??
-                                (result.kind === "success" ? `/${commandMatch[1]} ✓` : `/${commandMatch[1]} failed`);
-                            // Commands can change agent-visible state (permission
-                            // preset, plan mode); follow the session log and
-                            // refresh every advertised surface.
-                            syncPermissionState(record, params.sessionId);
-                            publishCommands(params.sessionId, record);
-                            publishConfigOptions(params.sessionId, record);
-                            return respond(result.kind === "error" ? `⚠ ${text}` : text);
-                        }
+                    let execution;
+                    try {
+                        execution = await commandRuntime.execute(
+                            record.agent,
+                            trimmed,
+                            new AbortController().signal,
+                        );
+                    } catch (error: unknown) {
+                        return respond(`⚠ /${commandMatch[1]} failed: ${errorChain(error)}`);
+                    }
+                    if (execution !== undefined) {
+                        const { result } = execution;
+                        const text =
+                            result.text ??
+                            (result.kind === "success" ? `/${commandMatch[1]} ✓` : `/${commandMatch[1]} failed`);
+                        // Commands can change agent-visible state (permission
+                        // preset, plan mode); follow the session log and
+                        // refresh every advertised surface.
+                        syncPermissionState(record, params.sessionId);
+                        publishCommands(params.sessionId, record);
+                        publishConfigOptions(params.sessionId, record);
+                        return respond(result.kind === "error" ? `⚠ ${text}` : text);
                     }
                 }
 
-                // Gate model turns (not slash commands) on a usable credential,
-                // with self-service guidance instead of a bare protocol error.
-                if (!(await credentialPresent())) {
-                    return respond(
-                        [
-                            "No DeepSeek credential is configured, so this prompt was not sent to the model.",
-                            "",
-                            "Configure one of:",
-                            "- `/login <api-key>` — store a key in the harness credential store right here,",
-                            "- the dsh Web UI (`dsh web`, Settings → Models),",
-                            "- `DEEPSEEK_API_KEY` in the environment that launches this agent.",
-                        ].join("\n"),
-                    );
-                }
+                // Gate model turns (not slash commands) on a usable credential
+                // for the session's current provider route.
+                await requireCredential(record.provider ?? config.provider);
 
                 // Never drive a retired agent: an agent-loop reload disposes
                 // agents while bridge records survive.
@@ -1767,16 +1690,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         };
     };
 
-    function requirePersistence(): NonNullable<ReturnType<typeof getPersistence>> {
-        const persistence = getPersistence();
-        if (persistence === undefined) {
-            throw internalError("session persistence is not composed; session history is unavailable");
-        }
-        return persistence;
-    }
-
-    function getPersistence(): Context["sessionPersistence"] | undefined {
-        return ctx.get("sessionPersistence") as Context["sessionPersistence"] | undefined;
+    function requirePersistence(): Context["sessionPersistence"] {
+        return sessionPersistence;
     }
 
     function validateCwd(cwd: string): void {
@@ -1919,15 +1834,10 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         quiescing = (async () => {
             // Continuable subagents (when composed) own descendant teardown;
             // drain them child-first before disposing the top-level agents.
-            const subagents = ctx.get("subagents") as
-                | { drainContinuableDescendants(parents: readonly Agent[]): Promise<void> }
-                | undefined;
-            if (subagents !== undefined) {
-                try {
-                    await subagents.drainContinuableDescendants(records.map((record) => record.agent));
-                } catch (error: unknown) {
-                    logWarn(`continuable subagent teardown failed: ${String(error)}`);
-                }
+            try {
+                await subagents.drainContinuableDescendants(records.map((record) => record.agent));
+            } catch (error: unknown) {
+                logWarn(`continuable subagent teardown failed: ${String(error)}`);
             }
             const disposals = await Promise.allSettled(records.map((record) => record.dispose()));
             const failures = disposals.filter(
