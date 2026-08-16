@@ -160,7 +160,7 @@ describe("ACP bridge credential wiring", () => {
 
     it("injects the host credentials service instead of writing the store itself", () => {
         expect(bridge).toContain(
-            'inject = ["agents", "credentials", "llm", "agentDefaultModel", "sessionPersistence", "approval", "permissionPresets", "commands", "agentPresets", "skills", "subagents"]',
+            'inject = ["agents", "credentials", "llm", "agentDefaultModel", "sessionPersistence", "approval", "permissionPresets", "commands", "agentPresets", "skills", "subagents", "userQuestions"]',
         );
         expect(bridge).toContain('from "@deepseek-ai/dsh-credentials"');
         expect(bridge).toContain("ctx.credentials");

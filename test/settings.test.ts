@@ -45,9 +45,18 @@ describe("resolveSettings", () => {
     it("lets flags win over environment variables", () => {
         process.env["DSH_MODEL"] = "env-model";
         process.env["DSH_PERMISSION_MODE"] = "read-only";
-        const settings = resolveSettings(["--model", "flag-model", "--models=a, b", "--no-thinking"]);
+        const settings = resolveSettings([
+            "--model",
+            "flag-model",
+            "--models=a, b",
+            "--bundle",
+            "/plugins/creator",
+            "--bundle=/plugins/team-policy",
+            "--no-thinking",
+        ]);
         expect(settings.model).toBe("flag-model");
         expect(settings.models).toEqual(["a", "b"]);
+        expect(settings.bundles).toEqual(["/plugins/creator", "/plugins/team-policy"]);
         expect(settings.permissionMode).toBe("read-only");
         expect(settings.thinking).toBe(false);
     });
@@ -56,6 +65,8 @@ describe("resolveSettings", () => {
         expect(() => resolveSettings(["--permission-mode", "yolo"])).toThrow(SettingsError);
         expect(() => resolveSettings(["--max-tokens", "-3"])).toThrow(SettingsError);
         expect(() => resolveSettings(["--reasoning-effort", "extreme"])).toThrow(SettingsError);
+        expect(() => resolveSettings(["--bundle"])).toThrow(/requires a value/);
+        expect(() => resolveSettings(["--bundle="])).toThrow(/requires a value/);
         expect(() => resolveSettings(["--unknown-flag"])).toThrow(SettingsError);
         expect(() => resolveSettings(["positional"])).toThrow(SettingsError);
     });

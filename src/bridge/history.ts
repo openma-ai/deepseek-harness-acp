@@ -21,7 +21,7 @@ export interface ReplayResult {
     contextWindow: number | undefined;
 }
 
-function userText(data: Record<string, unknown> | undefined): string | undefined {
+function userMessage(data: Record<string, unknown> | undefined): { text?: string } | undefined {
     if (data === undefined) return undefined;
     const source = data["source"];
     const kind =
@@ -37,7 +37,7 @@ function userText(data: Record<string, unknown> | undefined): string | undefined
         }
     }
     const text = parts.join("");
-    return text.length > 0 ? text : undefined;
+    return text.length > 0 ? { text } : {};
 }
 
 /**
@@ -48,14 +48,22 @@ export function buildReplay(events: readonly HarnessEvent[]): ReplayResult {
     const updates: SessionUpdate[] = [];
     let plan: SessionUpdate | undefined;
     let title: string | undefined;
+    let sawUserInteraction = false;
 
     for (const event of events) {
         if (event.type === "user/message") {
-            const text = userText(event.data);
-            if (text !== undefined) {
-                updates.push({ sessionUpdate: "user_message_chunk", content: { type: "text", text } });
+            const user = userMessage(event.data);
+            if (user !== undefined) {
+                projection.beginPrompt();
+                sawUserInteraction = true;
+                if (user.text !== undefined) {
+                    updates.push({
+                        sessionUpdate: "user_message_chunk",
+                        content: { type: "text", text: user.text },
+                    });
+                }
+                continue;
             }
-            continue;
         }
         if (event.type === "session/title") {
             const t = event.data?.["title"];
@@ -73,5 +81,12 @@ export function buildReplay(events: readonly HarnessEvent[]): ReplayResult {
         }
     }
     if (plan !== undefined) updates.push(plan);
+    const usage = sawUserInteraction ? projection.promptUsage() : undefined;
+    if (usage !== undefined) {
+        updates.push({
+            sessionUpdate: "session_info_update",
+            _meta: { dsh: { event: "prompt/usage", usage } },
+        } as SessionUpdate);
+    }
     return { updates, title, contextWindow: projection.contextWindow };
 }

@@ -303,6 +303,7 @@ export const OPTIONAL_PLUGIN_SPECIFIERS = {
     credentials: "@deepseek-ai/dsh-credentials-local",
     credentialsSeam: "@deepseek-ai/dsh-credentials",
     mcpClient: "@deepseek-ai/dsh-mcp-client",
+    attachmentLocal: "@deepseek-ai/dsh-attachment-local",
 } as const;
 
 export type PluginKey = keyof typeof PLUGIN_SPECIFIERS;

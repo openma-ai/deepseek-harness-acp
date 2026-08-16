@@ -96,6 +96,7 @@ async function main(): Promise<void> {
         // The dsh profile composition (dsh-base + this package's bundle patch +
         // the user's $DSH_HOME layers), sharing the product's own home state.
         const booted: BootedContext = await bootAcpProfile(host, {
+            bundles: settings.bundles,
             ...(settings.provider !== undefined ? { provider: settings.provider } : {}),
             ...(settings.model !== undefined ? { model: settings.model } : {}),
             ...(settings.permissionMode !== undefined ? { permissionMode: settings.permissionMode } : {}),

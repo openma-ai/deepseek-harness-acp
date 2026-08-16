@@ -9,7 +9,7 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -34,6 +34,7 @@ class AcpTestClient {
         workspace: string,
         dshPath?: string,
         envPatch?: Record<string, string | undefined>,
+        serverArgs: string[] = [],
     ) {
         const env: Record<string, string | undefined> = {
             ...process.env,
@@ -46,7 +47,7 @@ class AcpTestClient {
             ...(envPatch ?? {}),
         };
         for (const [key, value] of Object.entries(env)) if (value === undefined) delete env[key];
-        this.child = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
+        this.child = spawn(process.execPath, ["--import", "tsx", "src/index.ts", ...serverArgs], {
             cwd: ROOT,
             env: env as Record<string, string>,
             stdio: ["pipe", "pipe", "pipe"],
@@ -139,6 +140,59 @@ class AcpTestClient {
     }
 }
 
+describe("dsh-acp bundle overlays", () => {
+    let client: AcpTestClient;
+    const roots: string[] = [];
+
+    function testBundle(name: string): { root: string; marker: string } {
+        const root = mkdtempSync(join(tmpdir(), "dsh-acp-bundle-"));
+        roots.push(root);
+        const marker = join(root, "activated.txt");
+        writeFileSync(join(root, "package.json"), JSON.stringify({
+            name,
+            type: "module",
+            main: "./index.js",
+            dsh: { bundle: { patch: "./cordis.patch.yml" } },
+        }));
+        writeFileSync(
+            join(root, "cordis.patch.yml"),
+            JSON.stringify([{
+                insert: [{ id: `${name}-marker`, name, config: { marker } }],
+            }]),
+        );
+        writeFileSync(
+            join(root, "index.js"),
+            "import { writeFileSync } from 'node:fs'\n"
+                + "export function apply(_ctx, config) { writeFileSync(config.marker, 'active') }\n",
+        );
+        return { root, marker };
+    }
+
+    afterAll(async () => {
+        await client?.close();
+        for (const root of roots) rmSync(root, { recursive: true, force: true });
+    });
+
+    it("activates every bundle supplied on the command line", async () => {
+        const sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-bundle-sessions-"));
+        const workspace = mkdtempSync(join(tmpdir(), "dsh-acp-bundle-workspace-"));
+        roots.push(sessionRoot, workspace);
+        const first = testBundle("dsh-acp-test-first");
+        const second = testBundle("dsh-acp-test-second");
+        client = new AcpTestClient(
+            sessionRoot,
+            workspace,
+            undefined,
+            undefined,
+            ["--bundle", first.root, "--bundle", second.root],
+        );
+
+        await client.request("initialize", { protocolVersion: 1 }, 60_000);
+        expect(existsSync(first.marker)).toBe(true);
+        expect(existsSync(second.marker)).toBe(true);
+    }, 90_000);
+});
+
 describe("dsh-acp server (e2e smoke)", () => {
     let client: AcpTestClient;
     let sessionRoot: string;
@@ -167,7 +221,7 @@ describe("dsh-acp server (e2e smoke)", () => {
         expect(result["agentInfo"]).toMatchObject({ name: "dsh-acp" });
         const capabilities = result["agentCapabilities"] as Record<string, unknown>;
         expect(capabilities["loadSession"]).toBe(true);
-        expect(capabilities["promptCapabilities"]).toMatchObject({ embeddedContext: true, image: false });
+        expect(capabilities["promptCapabilities"]).toMatchObject({ embeddedContext: true, image: true });
         expect(capabilities["auth"]).toEqual({ logout: {} });
         const methods = result["authMethods"] as Array<Record<string, unknown>>;
         expect(methods.length).toBeGreaterThanOrEqual(1);
@@ -200,6 +254,14 @@ describe("dsh-acp server (e2e smoke)", () => {
         expect(byId.has("approvals")).toBe(false);
         expect(byId.get("model")).toMatchObject({ type: "select", category: "model", currentValue: "deepseek-v4-flash" });
         expect(byId.get("effort")).toMatchObject({ type: "select", category: "thought_level" });
+        expect(byId.get("collaboration_mode")).toMatchObject({
+            type: "select",
+            currentValue: "default",
+            options: [
+                { value: "default", name: "Default" },
+                { value: "plan", name: "Plan" },
+            ],
+        });
         const efforts = (byId.get("effort") as { options: Array<{ value: string }> }).options.map((o) => o.value);
         expect(efforts).toContain("high");
         expect(byId.get("agent")).toMatchObject({ type: "select", currentValue: "standard" });
@@ -268,6 +330,44 @@ describe("dsh-acp server (e2e smoke)", () => {
         // …followed by the composition's own registry (dsh-base mounts
         // compact among others).
         expect(names).toContain("compact");
+        const commands = [...client.updatesFor(sessionId)]
+            .reverse()
+            .find((update) => update["sessionUpdate"] === "available_commands_update")?.[
+                "availableCommands"
+            ] as Array<Record<string, unknown>> | undefined;
+        expect(commands?.find((command) => command["name"] === "plan")).toMatchObject({
+            _meta: {
+                commandAction: {
+                    kind: "setConfigOption",
+                    configId: "collaboration_mode",
+                    value: "plan",
+                    resetValue: "default",
+                    presentation: "state",
+                },
+            },
+        });
+    }, 60_000);
+
+    it("switches plan mode through the standard collaboration config option", async () => {
+        const on = (await client.request("session/set_config_option", {
+            sessionId,
+            configId: "collaboration_mode",
+            value: "plan",
+        })) as Record<string, unknown>;
+        const onById = new Map(
+            (on["configOptions"] as Array<Record<string, unknown>>).map((option) => [option["id"], option]),
+        );
+        expect(onById.get("collaboration_mode")).toMatchObject({ currentValue: "plan" });
+
+        const off = (await client.request("session/set_config_option", {
+            sessionId,
+            configId: "collaboration_mode",
+            value: "default",
+        })) as Record<string, unknown>;
+        const offById = new Map(
+            (off["configOptions"] as Array<Record<string, unknown>>).map((option) => [option["id"], option]),
+        );
+        expect(offById.get("collaboration_mode")).toMatchObject({ currentValue: "default" });
     }, 60_000);
 
     it("switches session modes", async () => {

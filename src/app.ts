@@ -196,6 +196,22 @@ export async function apply(ctx: Context, config: AppConfig): Promise<void> {
         await compaction;
         yield compaction.dispose;
 
+        // Durable image store so session/prompt Image blocks can become
+        // harness ImageBlocks. Profile-boot gets this from dsh-base; spine
+        // mounts it here when the host installation provides the package.
+        const attachmentModule = p["attachmentLocal"];
+        if (attachmentModule !== undefined) {
+            const resolveDshHome = (p["homePaths"] as { resolveDshHome?: (home?: string) => string })
+                .resolveDshHome;
+            const dshHome = resolveDshHome?.();
+            const attachments = anyCtx.plugin(
+                pluginOf(attachmentModule),
+                dshHome !== undefined ? { dshHome } : {},
+            );
+            await attachments;
+            yield attachments.dispose;
+        }
+
         // The ACP transport bridge (owns stdout). The spine engine keeps its
         // historical fixed defaults when no explicit selection was given.
         const bridge = anyCtx.plugin(acpBridge, {

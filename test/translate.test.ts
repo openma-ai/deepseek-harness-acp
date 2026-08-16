@@ -53,13 +53,174 @@ describe("classifyToolCall", () => {
 });
 
 describe("SessionProjection streaming", () => {
+    it("maps a subagent lifecycle to a standard ACP tool call pair", () => {
+        const p = new SessionProjection();
+
+        expect(
+            p.onEvent(
+                event("subagent/start", {
+                    runId: "run-1",
+                    provider: "local",
+                    id: "child-1",
+                    local: true,
+                    parentToolCallId: "subagent:parent-run",
+                }),
+            ),
+        ).toEqual([
+            {
+                sessionUpdate: "tool_call",
+                toolCallId: "subagent:run-1",
+                title: "Start subagent child-1",
+                kind: "other",
+                status: "in_progress",
+                rawInput: { childSessionId: "child-1", provider: "local", local: true },
+                _meta: {
+                    dsh: {
+                        subagent: {
+                            state: "started",
+                            runId: "run-1",
+                            childSessionId: "child-1",
+                            provider: "local",
+                            local: true,
+                            parentToolCallId: "subagent:parent-run",
+                        },
+                    },
+                },
+            },
+        ]);
+
+        expect(
+            p.onEvent(
+                event("subagent/end", {
+                    runId: "run-1",
+                    provider: "local",
+                    id: "child-1",
+                    local: true,
+                    stopReason: "completed",
+                    lastAssistantMessage: [{ type: "text", text: "done" }],
+                    parentToolCallId: "subagent:parent-run",
+                }),
+            ),
+        ).toEqual([
+            {
+                sessionUpdate: "tool_call_update",
+                toolCallId: "subagent:run-1",
+                status: "completed",
+                rawOutput: {
+                    stopReason: "completed",
+                    lastAssistantMessage: [{ type: "text", text: "done" }],
+                },
+                _meta: {
+                    dsh: {
+                        subagent: {
+                            state: "finished",
+                            runId: "run-1",
+                            childSessionId: "child-1",
+                            provider: "local",
+                            local: true,
+                            parentToolCallId: "subagent:parent-run",
+                        },
+                    },
+                },
+            },
+        ]);
+    });
+
+    it("attributes nested child updates to their subagent tool call", () => {
+        const p = new SessionProjection(undefined, {
+            subagent: {
+                childSessionId: "child-1",
+                parentToolCallId: "subagent:run-1",
+                provider: "local",
+            },
+        } as never);
+
+        expect(
+            p.onEvent(
+                event("assistant/chunk", {
+                    turn: 1,
+                    step: 0,
+                    chunk: { type: "text-delta", index: 0, text: "child says hi" },
+                }),
+            ),
+        ).toEqual([
+            {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "child says hi" },
+                messageId: "1:0",
+                _meta: {
+                    dsh: {
+                        subagent: {
+                            childSessionId: "child-1",
+                            parentToolCallId: "subagent:run-1",
+                            provider: "local",
+                        },
+                    },
+                },
+            },
+        ]);
+    });
+
+    it("puts the standard ACP messageId on streamed assistant chunks", () => {
+        const p = new SessionProjection();
+        const updates = p.onEvent(
+            event("assistant/chunk", {
+                turn: 2,
+                step: 3,
+                chunk: { type: "text-delta", index: 0, text: "hi" },
+            }),
+        );
+
+        expect(updates[0]).toMatchObject({
+            sessionUpdate: "agent_message_chunk",
+            messageId: "2:3",
+        });
+    });
+
+    it("marks an assembled assistant message complete without duplicating streamed text", () => {
+        const p = new SessionProjection();
+        p.onEvent(
+            event("assistant/chunk", {
+                turn: 2,
+                step: 3,
+                chunk: { type: "text-delta", index: 0, text: "hi" },
+            }),
+        );
+
+        const updates = p.onEvent(
+            event("assistant/message", {
+                turn: 2,
+                step: 3,
+                message: {
+                    content: [{ type: "text", text: "hi" }],
+                    source: { model: "deepseek-v4" },
+                },
+            }),
+        );
+
+        expect(updates).toEqual([
+            {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "" },
+                messageId: "2:3",
+                _meta: {
+                    dsh: { event: "assistant_message", model: "deepseek-v4" },
+                },
+            },
+        ]);
+    });
+
     it("streams text deltas and suppresses the assembled duplicate", () => {
         const p = new SessionProjection();
         const chunkUpdates = p.onEvent(
             event("assistant/chunk", { turn: 1, step: 0, chunk: { type: "text-delta", index: 0, text: "Hel" } }),
         );
         expect(chunkUpdates).toEqual([
-            { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hel" } },
+            {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "Hel" },
+                messageId: "1:0",
+            },
         ]);
         const assembled = p.onEvent(
             event("assistant/message", {
@@ -68,7 +229,14 @@ describe("SessionProjection streaming", () => {
                 message: { content: [{ type: "text", text: "Hello" }] },
             }),
         );
-        expect(assembled).toEqual([]);
+        expect(assembled).toEqual([
+            {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "" },
+                messageId: "1:0",
+                _meta: { dsh: { event: "assistant_message" } },
+            },
+        ]);
     });
 
     it("falls back to the assembled message when no deltas streamed", () => {
@@ -81,8 +249,17 @@ describe("SessionProjection streaming", () => {
             }),
         );
         expect(updates).toEqual([
-            { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "hmm" } },
-            { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hi" } },
+            {
+                sessionUpdate: "agent_thought_chunk",
+                content: { type: "text", text: "hmm" },
+                messageId: "1:0",
+            },
+            {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "Hi" },
+                messageId: "1:0",
+                _meta: { dsh: { event: "assistant_message" } },
+            },
         ]);
     });
 
@@ -219,6 +396,38 @@ describe("diffsFromToolMeta", () => {
 });
 
 describe("plans, usage, titles, turn ends", () => {
+    it("carries non-human injected context in metadata without echoing user prompts", () => {
+        const p = new SessionProjection();
+
+        expect(
+            p.onEvent(
+                event("user/message", {
+                    source: { kind: "compaction" },
+                    content: [{ type: "text", text: "summary context" }],
+                }),
+            ),
+        ).toEqual([
+            {
+                sessionUpdate: "session_info_update",
+                _meta: {
+                    dsh: {
+                        event: "user/message",
+                        source: "compaction",
+                        preview: "summary context",
+                    },
+                },
+            },
+        ]);
+        expect(
+            p.onEvent(
+                event("user/message", {
+                    source: { kind: "user" },
+                    content: [{ type: "text", text: "hello" }],
+                }),
+            ),
+        ).toEqual([]);
+    });
+
     it("maps todo/write onto a plan update", () => {
         const p = new SessionProjection();
         const updates = p.onEvent(
@@ -238,6 +447,17 @@ describe("plans, usage, titles, turn ends", () => {
                     { content: "b", priority: "medium", status: "in_progress" },
                     { content: "c", priority: "medium", status: "pending" },
                 ],
+            },
+        ]);
+    });
+
+    it("maps an empty todo/write snapshot so clients can clear the plan", () => {
+        const p = new SessionProjection();
+
+        expect(p.onEvent(event("todo/write", { todos: [] }))).toEqual([
+            {
+                sessionUpdate: "plan",
+                entries: [],
             },
         ]);
     });

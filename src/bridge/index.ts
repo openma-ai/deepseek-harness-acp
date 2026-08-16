@@ -67,7 +67,7 @@ import type {} from "@deepseek-ai/dsh-skill";
 import type {} from "@deepseek-ai/dsh-agent-default-model";
 import type {} from "@deepseek-ai/dsh-permission-presets";
 import type {} from "@deepseek-ai/dsh-agent-presets";
-import type {} from "@deepseek-ai/dsh-subagent";
+import type { SubagentRunEndInfo, SubagentRunInfo } from "@deepseek-ai/dsh-subagent";
 
 import { VERSION } from "../version.ts";
 import {
@@ -87,12 +87,27 @@ import {
 import { openLocalAuthPage, startLocalAuthPage } from "../auth-page.ts";
 import { logDebug, logWarn } from "../log.ts";
 import { buildReplay } from "./history.ts";
-import { convertPrompt, UnsupportedPromptContentError } from "./prompt.ts";
+import {
+    attachmentIngestOf,
+    convertPrompt,
+    deliverPrompt,
+    PromptImageError,
+    UnsupportedPromptContentError,
+} from "./prompt.ts";
 import { SessionProjection, turnEndToStopReason, type HarnessEvent, type SessionUpdate } from "./translate.ts";
+import { AcpRpc, muxAcpStream } from "./rpc.ts";
+import { installTuiClientPlane, type TuiClientAdvertisement } from "./tui-client.ts";
+import { installAcpUserQuestionProvider } from "./user-questions.ts";
+export {
+    answerFromElicitation,
+    askUserQuestionsOverAcp,
+    installAcpUserQuestionProvider,
+    questionsToElicitation,
+} from "./user-questions.ts";
 
 export const name = "acp-bridge";
 /** Wait for the dsh-base services this bridge captures during apply. */
-export const inject = ["agents", "credentials", "llm", "agentDefaultModel", "sessionPersistence", "approval", "permissionPresets", "commands", "agentPresets", "skills", "subagents"];
+export const inject = ["agents", "credentials", "llm", "agentDefaultModel", "sessionPersistence", "approval", "permissionPresets", "commands", "agentPresets", "skills", "subagents", "userQuestions"];
 
 /** Host functions the bridge needs beyond the plugin tree (see loadKit). */
 export interface BridgeHarness {
@@ -227,14 +242,41 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     const agentPresets = ctx.agentPresets;
     const skillRegistry = ctx.skills;
     const subagents = ctx.subagents;
+    const userQuestions = ctx.userQuestions;
     const harness = config.harness ?? (await import("./self-harness.ts")).selfHarness();
     const { createUserMessage, errorChain, sessionId: SessionId, foldSessionTitle, setSandboxMode } = harness;
     const SANDBOX_MODES = harness.sandboxModes;
     const sessions = new Map<string, SessionRecord>();
+    interface LiveSubagent {
+        rootSessionId: string;
+        childSessionId: string;
+        runId: string;
+        provider: string;
+        toolCallId: string;
+        projection: SessionProjection;
+    }
+    const subagentByChild = new Map<string, LiveSubagent>();
+    const subagentByRun = new Map<string, LiveSubagent>();
+    const watchedSubagentParents = new WeakSet<object>();
     let closed = false;
     let conn: AgentSideConnection;
     /** Whether the client renders `_meta.terminal_output` display terminals. */
     let clientTerminalOutput = false;
+    /** Whether the client wants nested child text/thought/tool updates. */
+    let clientSubagentTranscript = false;
+    /** Whether the client can render standard ACP form elicitation. */
+    let clientElicitationForm = false;
+    const tuiClient: TuiClientAdvertisement = { advertised: false };
+    const rpc = new AcpRpc();
+    const findAgent = (agentId: string): Agent | undefined => {
+        const fromRegistry = agents.get(agentId as never);
+        if (fromRegistry !== undefined) return fromRegistry;
+        for (const record of sessions.values()) {
+            if (record.agent.id === agentId) return record.agent;
+        }
+        return undefined;
+    };
+    installTuiClientPlane(ctx, rpc, { findAgent, advertisement: tuiClient });
 
     const modelCandidates = (): string[] => {
         const seen = new Set<string>();
@@ -699,6 +741,78 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         inflight.resolve(reason);
     };
 
+    /** Observe one parent agent's scoped subagent lifecycle. */
+    const watchSubagentParent = (parent: Agent): void => {
+        if (watchedSubagentParents.has(parent as object)) return;
+        watchedSubagentParents.add(parent as object);
+
+        parent.ctx.on("subagent/start", (info: SubagentRunInfo) => {
+            const parentLink = subagentByChild.get(String(parent.id));
+            const rootSessionId = parentLink?.rootSessionId ?? String(parent.session.id);
+            const record = sessions.get(rootSessionId);
+            if (record === undefined) return;
+
+            const runId = String(info.runId);
+            const childSessionId = String(info.id);
+            const toolCallId = `subagent:${runId}`;
+            const payload: Record<string, unknown> = {
+                runId,
+                provider: info.provider,
+                id: childSessionId,
+                local: info.local,
+                ...(parentLink !== undefined ? { parentToolCallId: parentLink.toolCallId } : {}),
+            };
+            for (const update of record.projection.onEvent({ type: "subagent/start", data: payload })) {
+                notify(rootSessionId, update);
+            }
+
+            const child = agents.get(info.id);
+            const link: LiveSubagent = {
+                rootSessionId,
+                childSessionId,
+                runId,
+                provider: info.provider,
+                toolCallId,
+                projection: new SessionProjection(undefined, {
+                    terminalOutput: clientTerminalOutput,
+                    ...(child?.session.header.cwd !== undefined ? { cwd: child.session.header.cwd } : {}),
+                    subagent: { childSessionId, parentToolCallId: toolCallId, provider: info.provider },
+                }),
+            };
+            subagentByChild.set(childSessionId, link);
+            subagentByRun.set(runId, link);
+            if (child !== undefined) watchSubagentParent(child);
+        });
+
+        parent.ctx.on("subagent/end", (info: SubagentRunEndInfo) => {
+            const runId = String(info.runId);
+            const link = subagentByRun.get(runId);
+            if (link === undefined) return;
+            const record = sessions.get(link.rootSessionId);
+            if (record !== undefined) {
+                const parentLink = subagentByChild.get(String(parent.id));
+                const payload: Record<string, unknown> = {
+                    runId,
+                    provider: info.provider,
+                    id: String(info.id),
+                    local: info.local,
+                    stopReason: info.stopReason,
+                    ...(info.lastAssistantMessage !== undefined
+                        ? { lastAssistantMessage: info.lastAssistantMessage }
+                        : {}),
+                    ...(parentLink !== undefined ? { parentToolCallId: parentLink.toolCallId } : {}),
+                };
+                for (const update of record.projection.onEvent({ type: "subagent/end", data: payload })) {
+                    notify(link.rootSessionId, update);
+                }
+            }
+            subagentByRun.delete(runId);
+            if (subagentByChild.get(link.childSessionId)?.runId === runId) {
+                subagentByChild.delete(link.childSessionId);
+            }
+        });
+    };
+
     // ------------------------------------------------------------------ //
     // Agent presets (session modes → preset compositions)                 //
     // ------------------------------------------------------------------ //
@@ -726,9 +840,10 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     ): ((agentCtx: unknown) => Promise<void>) | undefined => {
         if (presetId === undefined) return undefined;
         return async (agentCtx: unknown) => {
+            const started = performance.now();
             logDebug(`preset setup: mounting "${presetId}"`);
             await presets.mount(agentCtx, presetId);
-            logDebug(`preset setup: mounted "${presetId}"`);
+            logDebug(`preset setup: mounted "${presetId}" in ${(performance.now() - started).toFixed(1)}ms`);
         };
     };
 
@@ -949,6 +1064,23 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             });
         }
 
+        if (commandRuntime.list(record.agent).some((command) => command.name === "plan")) {
+            const active = [...record.agent.session.events]
+                .reverse()
+                .map((event) => event as unknown as HarnessEvent)
+                .find((event) => event.type === "plan/mode")?.data?.["active"] === true;
+            result.push({
+                type: "select",
+                id: "collaboration_mode",
+                name: "Collaboration mode",
+                currentValue: active ? "plan" : "default",
+                options: [
+                    { value: "default", name: "Default" },
+                    { value: "plan", name: "Plan" },
+                ],
+            });
+        }
+
         const models = await modelChoices(record);
         if (models.length >= 2) {
             result.push({
@@ -1036,7 +1168,14 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
      */
     const availableCommandsFor = async (
         record: SessionRecord,
-    ): Promise<{ name: string; description: string; input?: { hint: string } }[]> => {
+    ): Promise<
+        {
+            name: string;
+            description: string;
+            input?: { hint: string };
+            _meta?: Record<string, unknown>;
+        }[]
+    > => {
         const list = [...BUILTIN_COMMANDS];
         const seen = new Set(list.map((command) => command.name));
         try {
@@ -1047,6 +1186,19 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     name: descriptor.name,
                     description: descriptor.description,
                     ...(descriptor.input !== undefined ? { input: { hint: descriptor.input.hint } } : {}),
+                    ...(descriptor.name === "plan"
+                        ? {
+                              _meta: {
+                                  commandAction: {
+                                      kind: "setConfigOption",
+                                      configId: "collaboration_mode",
+                                      value: "plan",
+                                      resetValue: "default",
+                                      presentation: "state",
+                                  },
+                              },
+                          }
+                        : {}),
                 });
             }
         } catch (error: unknown) {
@@ -1279,6 +1431,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             inflight: undefined,
         };
         sessions.set(sessionId, record);
+        watchSubagentParent(agent);
         return record;
     };
 
@@ -1289,11 +1442,21 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     ctx.on("session/event", (session, event: SessionEvent) => {
         const sessionId = String(session.header.id);
         const record = sessions.get(sessionId);
-        if (record === undefined || record.agent.session !== session) return;
+        if (record === undefined || record.agent.session !== session) {
+            const child = subagentByChild.get(sessionId);
+            if (child !== undefined && clientSubagentTranscript) {
+                for (const update of child.projection.onEvent(event as unknown as HarnessEvent)) {
+                    notify(child.rootSessionId, update);
+                }
+            }
+            return;
+        }
         try {
-            for (const update of record.projection.onEvent(event as unknown as HarnessEvent)) {
+            const harnessEvent = event as unknown as HarnessEvent;
+            for (const update of record.projection.onEvent(harnessEvent)) {
                 notify(sessionId, update);
             }
+            if (harnessEvent.type === "plan/mode") publishConfigOptions(sessionId, record);
         } finally {
             const inflight = record.inflight;
             if (inflight !== undefined && event.type === "turn/end" && inflight.turn === event.data.turn) {
@@ -1365,6 +1528,16 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     capsMeta !== null && typeof capsMeta === "object"
                         ? capsMeta["terminal_output"] === true
                         : false;
+                clientSubagentTranscript =
+                    capsMeta !== null && typeof capsMeta === "object"
+                        ? capsMeta["subagent-transcript"] === true
+                        : false;
+                clientElicitationForm =
+                    params.clientCapabilities?.elicitation?.form !== undefined &&
+                    params.clientCapabilities.elicitation.form !== null;
+                if (capsMeta !== null && typeof capsMeta === "object" && capsMeta["tuiInspect"] === true) {
+                    tuiClient.advertised = true;
+                }
                 const providers = await listProviderRoutes();
                 return {
                     protocolVersion:
@@ -1374,7 +1547,11 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     agentInfo: { name: "dsh-acp", title: "DeepSeek Harness", version: VERSION },
                     agentCapabilities: {
                         loadSession: true,
-                        promptCapabilities: { image: false, audio: false, embeddedContext: true },
+                        promptCapabilities: {
+                            image: attachmentIngestOf(ctx.get("attachments")) !== undefined,
+                            audio: false,
+                            embeddedContext: true,
+                        },
                         // Stdio servers always work; streamable HTTP maps onto
                         // mcp-client's second transport. Legacy SSE does not.
                         mcpCapabilities: { http: true, sse: false },
@@ -1433,12 +1610,22 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
 
             async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
                 assertOpen();
+                const started = performance.now();
+                let checkpoint = started;
+                const mark = (name: string): void => {
+                    const now = performance.now();
+                    logDebug(`session/new ${name}: ${(now - checkpoint).toFixed(1)}ms (+${(now - started).toFixed(1)}ms)`);
+                    checkpoint = now;
+                };
                 await requireCredential(config.provider);
+                mark("credential");
                 validateCwd(params.cwd);
                 syncMcpServers(params.mcpServers, params.cwd);
+                mark("request setup");
                 const sessionId = SessionId(randomUUID());
                 const presets = presetsService();
                 const presetId = (await presets.resolve(undefined)).id;
+                mark("preset resolve");
                 const handle = await agents.create({
                     sessionId,
                     meta: { cwd: params.cwd, ...(presetId !== undefined ? { agentPreset: presetId } : {}) },
@@ -1447,6 +1634,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                         ? { setup: presetSetup(presets, presetId) }
                         : {}),
                 } as Parameters<typeof agents.create>[0]);
+                mark("agent create");
                 if (closed) {
                     await handle.dispose();
                     throw internalError("connection closed during session/new");
@@ -1462,6 +1650,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 ensureSelection(record);
                 queueMicrotask(() => publishCommands(String(sessionId)));
                 const options = await configOptions(record);
+                mark("response surface");
                 return {
                     sessionId: String(sessionId),
                     modes: modeState(record),
@@ -1516,17 +1705,45 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             async prompt(params: PromptRequest): Promise<PromptResponse> {
                 assertOpen();
                 const record = await requireOrRestoreSession(params.sessionId);
-                if (record.inflight !== undefined) {
-                    throw invalidParams("a prompt is already in flight for this session");
-                }
                 let converted;
                 try {
-                    converted = convertPrompt(params.prompt);
+                    converted = await convertPrompt(
+                        params.prompt,
+                        attachmentIngestOf(ctx.get("attachments")),
+                    );
                 } catch (error: unknown) {
-                    if (error instanceof UnsupportedPromptContentError) throw invalidParams(error.message);
+                    if (
+                        error instanceof UnsupportedPromptContentError ||
+                        error instanceof PromptImageError
+                    ) {
+                        throw invalidParams(error.message);
+                    }
                     throw error;
                 }
                 if (converted.blocks.length === 0) throw invalidParams("empty prompt");
+
+                // ACP clients steer by issuing another session/prompt while
+                // the active one is still in flight. Queueing is client-side;
+                // the bridge must deliver an immediate second prompt to the
+                // harness's next-step inbox without disturbing the active
+                // request or its projection window.
+                if (record.inflight !== undefined) {
+                    await requireCredential(record.provider ?? config.provider);
+                    if (agents.get(record.agent.id) !== record.agent) {
+                        throw internalError("prompt was not steered: the agent was disposed outside the bridge");
+                    }
+                    const message = createUserMessage({
+                        content: converted.blocks,
+                        source: { kind: "user" },
+                    });
+                    try {
+                        deliverPrompt(record.agent, message, true);
+                    } catch (error: unknown) {
+                        const detail = error instanceof Error ? error.message : String(error);
+                        throw internalError(`prompt was not steered: ${detail}`);
+                    }
+                    return { stopReason: "end_turn" };
+                }
 
                 // Adapter-level slash commands never reach the model.
                 const trimmed = converted.displayText.trim();
@@ -1589,17 +1806,32 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 }
 
                 record.cancelled = false;
-                record.projection.beginPrompt();
                 const message = createUserMessage({
                     content: converted.blocks,
                     source: { kind: "user" },
                 });
 
+                // Prompt conversion and credential lookup can yield. A second
+                // request may have won the turn slot while this one awaited;
+                // re-check immediately before admission so it becomes steer
+                // instead of overwriting the active inflight record.
+                if (record.inflight !== undefined) {
+                    try {
+                        deliverPrompt(record.agent, message, true);
+                    } catch (error: unknown) {
+                        const detail = error instanceof Error ? error.message : String(error);
+                        throw internalError(`prompt was not steered: ${detail}`);
+                    }
+                    return { stopReason: "end_turn" };
+                }
+
+                record.projection.beginPrompt();
+
                 const stopReason = await new Promise<StopReason>((resolve, reject) => {
                     const inflight: Inflight = { resolve, reject, messageId: message.id, turn: undefined };
                     record.inflight = inflight;
                     try {
-                        record.agent.followup(message);
+                        deliverPrompt(record.agent, message, false);
                     } catch (error: unknown) {
                         record.inflight = undefined;
                         const detail = error instanceof Error ? error.message : String(error);
@@ -1672,6 +1904,23 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                             reasoningEffort: value,
                         };
                         record.effort = value;
+                        break;
+                    }
+                    case "collaboration_mode": {
+                        if (value !== "default" && value !== "plan") {
+                            throw invalidParams(`unknown collaboration mode: ${value}`);
+                        }
+                        const execution = await commandRuntime.execute(
+                            record.agent,
+                            value === "plan" ? "/plan" : "/plan off",
+                            new AbortController().signal,
+                        );
+                        if (execution === undefined) {
+                            throw invalidParams("plan mode is unavailable on this session");
+                        }
+                        if (execution.result.kind === "error") {
+                            throw invalidParams(execution.result.text);
+                        }
                         break;
                     }
                     case "model": {
@@ -1829,13 +2078,23 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     // Transport wiring and teardown                                       //
     // ------------------------------------------------------------------ //
 
-    const stream: Stream =
+    const raw: Stream =
         config.stream ??
         ndJsonStream(
             Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
             Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>,
         );
+    const stream = muxAcpStream(raw, rpc);
     conn = new AgentSideConnection(makeAgent, stream);
+    const disposeUserQuestions = installAcpUserQuestionProvider(userQuestions, {
+        formSupported: () => clientElicitationForm,
+        sessionIdForRequest: (request) => {
+            if (request.agent === undefined) return undefined;
+            const record = ownedRecord(request.agent);
+            return record === undefined ? undefined : String(record.agent.session.id);
+        },
+        create: (request) => conn.unstable_createElicitation(request),
+    });
 
     let quiescing: Promise<void> | undefined;
     const quiesce = (): Promise<void> => {
@@ -1843,6 +2102,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         closed = true;
         const records = [...sessions.values()];
         sessions.clear();
+        subagentByChild.clear();
+        subagentByRun.clear();
         for (const record of records) {
             record.agent.cancel({ kind: "user" });
             settlePrompt(record, "cancelled");
@@ -1880,4 +2141,5 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         });
 
     ctx.effect(() => quiesce, "acp-bridge.connection");
+    ctx.effect(() => disposeUserQuestions, "acp-bridge.user-questions");
 }

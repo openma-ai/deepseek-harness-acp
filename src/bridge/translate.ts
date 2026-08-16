@@ -37,6 +37,12 @@ export interface HarnessEvent {
     time?: number;
 }
 
+export interface SubagentAttribution {
+    childSessionId: string;
+    parentToolCallId: string;
+    provider: string;
+}
+
 /** Harness `TurnEndReason` (structurally typed; see dsh-session types). */
 export interface TurnEndReason {
     kind: string;
@@ -247,9 +253,9 @@ function extractMessageTexts(message: unknown): MessageTexts {
 // Plan (todo) mapping
 // ---------------------------------------------------------------------------
 
-function planEntries(data: Record<string, unknown>): PlanEntry[] {
+function planEntries(data: Record<string, unknown>): PlanEntry[] | undefined {
     const todos = data["todos"];
-    if (!Array.isArray(todos)) return [];
+    if (!Array.isArray(todos)) return undefined;
     const entries: PlanEntry[] = [];
     for (const todo of todos) {
         if (todo === null || typeof todo !== "object") continue;
@@ -327,12 +333,61 @@ function emptyWindow(): PromptWindow {
     };
 }
 
+/** Optional `presentCall` card used instead of the name heuristic. */
+export interface ToolPresentView {
+    card?: string;
+    title?: string;
+    kind?: string;
+    locations?: { path: string; line?: number }[];
+}
+
+const TOOL_KINDS = new Set<ToolKind>([
+    "read",
+    "edit",
+    "delete",
+    "move",
+    "search",
+    "execute",
+    "think",
+    "fetch",
+    "switch_mode",
+    "other",
+]);
+
+/**
+ * Map a tool-owned `presentCall` card onto ACP tool-call facts.
+ * Unknown kinds and empty titles fall back to {@link classifyToolCall}.
+ */
+function factsFromPresentCall(
+    name: string,
+    rawArguments: string,
+    presented: ToolPresentView,
+): ToolCallFacts {
+    const fallback = classifyToolCall(name, rawArguments);
+    const kind =
+        presented.kind !== undefined && TOOL_KINDS.has(presented.kind as ToolKind)
+            ? (presented.kind as ToolKind)
+            : fallback.kind;
+    const title =
+        presented.title !== undefined && presented.title.length > 0 ? presented.title : fallback.title;
+    const locations =
+        presented.locations !== undefined && presented.locations.length > 0
+            ? presented.locations.map((location) =>
+                  location.line === undefined
+                      ? { path: location.path }
+                      : { path: location.path, line: location.line },
+              )
+            : fallback.locations;
+    return { kind, title, locations, rawInput: fallback.rawInput };
+}
+
 /**
  * Stateful projection of one harness session's event stream onto ACP updates.
  *
  * Owns streaming bookkeeping (which steps already streamed deltas so the
  * assembled message is not duplicated), tool-call registry, context-window
  * knowledge, per-prompt usage accumulation, and turn-ending capture.
+ *
  */
 export class SessionProjection {
     /** Context capacity from the latest `request/context` event, when known. */
@@ -349,11 +404,23 @@ export class SessionProjection {
     private readonly terminalOutput: boolean;
     /** Session working directory, advertised on display terminals. */
     private readonly cwd: string | undefined;
+    private readonly presentCall: ((name: string, args: unknown) => ToolPresentView | undefined) | undefined;
+    private readonly subagent: SubagentAttribution | undefined;
 
-    constructor(contextWindow?: number, options?: { terminalOutput?: boolean; cwd?: string }) {
+    constructor(
+        contextWindow?: number,
+        options?: {
+            terminalOutput?: boolean;
+            cwd?: string;
+            presentCall?: (name: string, args: unknown) => ToolPresentView | undefined;
+            subagent?: SubagentAttribution;
+        },
+    ) {
         this.contextWindow = contextWindow;
         this.terminalOutput = options?.terminalOutput ?? false;
         this.cwd = options?.cwd;
+        this.presentCall = options?.presentCall;
+        this.subagent = options?.subagent;
     }
 
     /** Reset per-prompt accumulators; call when a new `session/prompt` starts. */
@@ -394,6 +461,14 @@ export class SessionProjection {
      * Project one session event onto zero or more ACP updates.
      */
     onEvent(event: HarnessEvent): SessionUpdate[] {
+        const updates = this.projectEvent(event);
+        return this.subagent === undefined
+            ? updates
+            : updates.map((update) => this.withSubagentAttribution(update));
+    }
+
+    /** Project one event before optional subagent attribution is attached. */
+    private projectEvent(event: HarnessEvent): SessionUpdate[] {
         const data = event.data ?? {};
         switch (event.type) {
             case "assistant/chunk":
@@ -404,9 +479,46 @@ export class SessionProjection {
                 return this.onToolCall(data);
             case "tool/result":
                 return this.onToolResult(data);
+            case "subagent/start":
+                return this.onSubagentStart(data);
+            case "subagent/end":
+                return this.onSubagentEnd(data);
             case "todo/write": {
                 const entries = planEntries(data);
-                return entries.length > 0 ? [{ sessionUpdate: "plan", entries }] : [];
+                return entries !== undefined ? [{ sessionUpdate: "plan", entries }] : [];
+            }
+            case "user/message": {
+                const source = data["source"];
+                const kind =
+                    source !== null && typeof source === "object"
+                        ? asString((source as Record<string, unknown>)["kind"])
+                        : undefined;
+                if (kind === undefined || kind === "user") return [];
+                const content = data["content"];
+                const text = Array.isArray(content)
+                    ? content
+                          .filter(
+                              (block): block is Record<string, unknown> =>
+                                  block !== null &&
+                                  typeof block === "object" &&
+                                  (block as Record<string, unknown>)["type"] === "text" &&
+                                  typeof (block as Record<string, unknown>)["text"] === "string",
+                          )
+                          .map((block) => block["text"] as string)
+                          .join("")
+                    : "";
+                return [
+                    {
+                        sessionUpdate: "session_info_update",
+                        _meta: {
+                            dsh: {
+                                event: "user/message",
+                                source: kind,
+                                preview: Array.from(text).slice(0, 160).join(""),
+                            },
+                        },
+                    } as SessionUpdate,
+                ];
             }
             case "turn/end":
                 return this.onTurnEnd(data);
@@ -430,19 +542,89 @@ export class SessionProjection {
         return `${String(data["turn"])}:${String(data["step"])}`;
     }
 
+    private withSubagentAttribution(update: SessionUpdate): SessionUpdate {
+        const value = update as unknown as Record<string, unknown>;
+        const meta =
+            value["_meta"] !== null && typeof value["_meta"] === "object"
+                ? (value["_meta"] as Record<string, unknown>)
+                : {};
+        const dsh =
+            meta["dsh"] !== null && typeof meta["dsh"] === "object"
+                ? (meta["dsh"] as Record<string, unknown>)
+                : {};
+        return {
+            ...value,
+            _meta: { ...meta, dsh: { ...dsh, subagent: this.subagent } },
+        } as unknown as SessionUpdate;
+    }
+
+    private subagentMeta(data: Record<string, unknown>, state: "started" | "finished"): Record<string, unknown> | undefined {
+        const runId = asString(data["runId"]);
+        const childSessionId = asString(data["id"]);
+        const provider = asString(data["provider"]);
+        if (runId === undefined || childSessionId === undefined || provider === undefined) return undefined;
+        const parentToolCallId = asString(data["parentToolCallId"]);
+        return {
+            state,
+            runId,
+            childSessionId,
+            provider,
+            local: data["local"] === true,
+            ...(parentToolCallId !== undefined ? { parentToolCallId } : {}),
+        };
+    }
+
+    private onSubagentStart(data: Record<string, unknown>): SessionUpdate[] {
+        const subagent = this.subagentMeta(data, "started");
+        if (subagent === undefined) return [];
+        const runId = subagent["runId"] as string;
+        const childSessionId = subagent["childSessionId"] as string;
+        return [{
+            sessionUpdate: "tool_call",
+            toolCallId: `subagent:${runId}`,
+            title: `Start subagent ${childSessionId}`,
+            kind: "other",
+            status: "in_progress",
+            rawInput: {
+                childSessionId,
+                provider: subagent["provider"],
+                local: subagent["local"],
+            },
+            _meta: { dsh: { subagent } },
+        } as unknown as SessionUpdate];
+    }
+
+    private onSubagentEnd(data: Record<string, unknown>): SessionUpdate[] {
+        const subagent = this.subagentMeta(data, "finished");
+        if (subagent === undefined) return [];
+        const stopReason = asString(data["stopReason"]) ?? "error";
+        const lastAssistantMessage = data["lastAssistantMessage"];
+        return [{
+            sessionUpdate: "tool_call_update",
+            toolCallId: `subagent:${String(subagent["runId"])}`,
+            status: stopReason === "completed" ? "completed" : "failed",
+            rawOutput: {
+                stopReason,
+                ...(Array.isArray(lastAssistantMessage) ? { lastAssistantMessage } : {}),
+            },
+            _meta: { dsh: { subagent } },
+        } as unknown as SessionUpdate];
+    }
+
     private onChunk(data: Record<string, unknown>): SessionUpdate[] {
         const chunk = data["chunk"];
         if (chunk === null || typeof chunk === "undefined" || typeof chunk !== "object") return [];
         const c = chunk as Record<string, unknown>;
         const text = c["text"];
         if (typeof text !== "string" || text.length === 0) return [];
+        const messageId = this.stepKey(data);
         if (c["type"] === "text-delta") {
-            this.streamedText.add(this.stepKey(data));
-            return [{ sessionUpdate: "agent_message_chunk", content: { type: "text", text } }];
+            this.streamedText.add(messageId);
+            return [{ sessionUpdate: "agent_message_chunk", content: { type: "text", text }, messageId }];
         }
         if (c["type"] === "reasoning-delta") {
-            this.streamedReasoning.add(this.stepKey(data));
-            return [{ sessionUpdate: "agent_thought_chunk", content: { type: "text", text } }];
+            this.streamedReasoning.add(messageId);
+            return [{ sessionUpdate: "agent_thought_chunk", content: { type: "text", text }, messageId }];
         }
         return [];
     }
@@ -450,15 +632,51 @@ export class SessionProjection {
     private onAssistantMessage(data: Record<string, unknown>): SessionUpdate[] {
         const updates: SessionUpdate[] = [];
         const key = this.stepKey(data);
-        const { text, reasoning } = extractMessageTexts(data["message"]);
+        const message = data["message"];
+        const { text, reasoning } = extractMessageTexts(message);
+        const model =
+            message !== null && typeof message === "object"
+                ? asString(
+                      (message as Record<string, unknown>)["source"] !== null &&
+                          typeof (message as Record<string, unknown>)["source"] === "object"
+                          ? ((message as Record<string, unknown>)["source"] as Record<string, unknown>)["model"]
+                          : undefined,
+                  )
+                : undefined;
+        const completionMeta = {
+            dsh: {
+                event: "assistant_message",
+                ...(model !== undefined ? { model } : {}),
+            },
+        };
         // The assembled message is the durable source of truth; emit it only
         // when the adapter streamed no deltas for this step (some adapters or
         // replays carry no chunk events).
         if (reasoning.length > 0 && !this.streamedReasoning.has(key)) {
-            updates.push({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: reasoning } });
+            updates.push({
+                sessionUpdate: "agent_thought_chunk",
+                content: { type: "text", text: reasoning },
+                messageId: key,
+            });
         }
         if (text.length > 0 && !this.streamedText.has(key)) {
-            updates.push({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
+            updates.push({
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text },
+                messageId: key,
+                _meta: completionMeta,
+            } as SessionUpdate);
+        } else {
+            // ACP has standard message identity but no message-complete update.
+            // A metadata-only empty chunk closes the step without duplicating
+            // streamed text; clients that do not understand the metadata see
+            // no additional content.
+            updates.push({
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "" },
+                messageId: key,
+                _meta: completionMeta,
+            } as SessionUpdate);
         }
         this.streamedText.delete(key);
         this.streamedReasoning.delete(key);
@@ -495,7 +713,17 @@ export class SessionProjection {
         const name = asString(data["name"]) ?? "tool";
         if (callId === undefined) return [];
         const rawArguments = typeof data["arguments"] === "string" ? (data["arguments"] as string) : "{}";
-        const facts = classifyToolCall(name, rawArguments);
+        let parsedArgs: unknown = {};
+        try {
+            parsedArgs = JSON.parse(rawArguments);
+        } catch {
+            parsedArgs = { arguments: rawArguments };
+        }
+        const presented = this.presentCall?.(name, parsedArgs);
+        const facts =
+            presented !== undefined
+                ? factsFromPresentCall(name, rawArguments, presented)
+                : classifyToolCall(name, rawArguments);
         this.toolCalls.set(callId, facts);
         // Command tools embed a display-only terminal when the client supports
         // one (the codex-acp `_meta` contract Zed renders): content carries the

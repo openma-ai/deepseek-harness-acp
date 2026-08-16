@@ -13,6 +13,8 @@ import type { SandboxMode } from "@deepseek-ai/dsh-sandbox";
 export interface Settings {
     /** Explicit DeepSeek Harness installation (DSH_PATH); auto-detected when unset. */
     dshPath: string | undefined;
+    /** Additional dsh bundle layers, applied to the agent tree in argv order. */
+    bundles: string[];
     provider: string | undefined;
     model: string | undefined;
     /** Selectable model candidates (session config option). */
@@ -42,10 +44,12 @@ function envString(name: string): string | undefined {
 
 interface ParsedArgs {
     flags: Map<string, string | true>;
+    bundles: string[];
 }
 
 function parseFlags(argv: string[]): ParsedArgs {
     const flags = new Map<string, string | true>();
+    const bundles: string[] = [];
     for (let i = 0; i < argv.length; i += 1) {
         const arg = argv[i];
         if (arg === undefined || !arg.startsWith("--")) {
@@ -53,19 +57,23 @@ function parseFlags(argv: string[]): ParsedArgs {
         }
         const eq = arg.indexOf("=");
         if (eq >= 0) {
-            flags.set(arg.slice(2, eq), arg.slice(eq + 1));
+            const name = arg.slice(2, eq);
+            const value = arg.slice(eq + 1);
+            if (name === "bundle") bundles.push(value);
+            else flags.set(name, value);
             continue;
         }
         const name = arg.slice(2);
         const next = argv[i + 1];
         if (next !== undefined && !next.startsWith("--") && FLAGS_WITH_VALUES.has(name)) {
-            flags.set(name, next);
+            if (name === "bundle") bundles.push(next);
+            else flags.set(name, next);
             i += 1;
         } else {
             flags.set(name, true);
         }
     }
-    return { flags };
+    return { flags, bundles };
 }
 
 const FLAGS_WITH_VALUES = new Set([
@@ -79,6 +87,7 @@ const FLAGS_WITH_VALUES = new Set([
     "persona",
     "reasoning-effort",
     "bash-timeout",
+    "bundle",
 ]);
 
 function stringFlag(parsed: ParsedArgs, name: string): string | undefined {
@@ -93,6 +102,10 @@ function stringFlag(parsed: ParsedArgs, name: string): string | undefined {
  */
 export function resolveSettings(argv: string[]): Settings {
     const parsed = parseFlags(argv);
+    if (parsed.flags.has("bundle")) stringFlag(parsed, "bundle");
+    if (parsed.bundles.some((bundle) => bundle.length === 0)) {
+        throw new SettingsError("--bundle requires a value");
+    }
     for (const name of parsed.flags.keys()) {
         if (!FLAGS_WITH_VALUES.has(name) && name !== "no-thinking") {
             throw new SettingsError(`unknown flag: --${name}`);
@@ -136,6 +149,7 @@ export function resolveSettings(argv: string[]): Settings {
 
     return {
         dshPath: stringFlag(parsed, "dsh-path") ?? envString("DSH_PATH"),
+        bundles: parsed.bundles,
         provider: stringFlag(parsed, "provider") ?? envString("DSH_PROVIDER"),
         model,
         models,
@@ -165,6 +179,7 @@ Options:
                               package dir, or any dir carrying node_modules/@deepseek-ai
                               (DSH_PATH; auto-detected when unset — own tree, ./node_modules,
                               dsh on PATH, npm root -g)
+  --bundle <package-dir>      Add a dsh bundle layer to the agent tree (repeatable)
   --provider <route>          Provider route (DSH_PROVIDER, default deepseek-official)
   --model <id>                Default model (DSH_MODEL, default deepseek-v4-flash)
   --models <a,b,...>          Selectable models for the session "Model" option

@@ -7,7 +7,8 @@
 <p align="center">
   Use <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness</a> from
   <a href="https://agentclientprotocol.com/">Agent Client Protocol</a> clients such as
-  <a href="https://zed.dev">Zed</a>.
+  <a href="https://zed.dev">Zed</a> and
+  <a href="https://github.com/openma-ai/backchat">Backchat</a>.
 </p>
 
 <p align="center">
@@ -118,9 +119,10 @@ another provider.
 ## Features
 
 - **Streaming** — assistant text and reasoning deltas; assembled-message fallback.
+- **Images** — `promptCapabilities.image` is advertised when the composition mounts `ctx.attachments` (dsh-base does). ACP `image` blocks are validated, stored with `saveImage`, and kept in wire order with surrounding text. `resource_link` stays a textual file pointer.
 - **Tool calls** — ACP kinds, human titles, file locations, real diffs from fs-tool hunks, raw input/output; command output on a **display terminal** when the client supports one, fenced output otherwise.
 - **Permission presets as session modes** — `read-only` / `workspace-write` / `danger-full-access`, each a named `{sandbox, approval}` pair recorded as a durable session fact (also exposed as a config option for clients that only render those).
-- **Agent presets** — `standard` / `code` / `minimal` / `cordis` as a config option; switching rebuilds the agent live with history preserved.
+- **Agent composition** — when the profile mounts `agentPresets`, an uncategorized config option `id: "agent"` lists the roster (`standard` / `code` / `minimal` / `cordis`, plus user copies). Switching rebuilds the agent live with history preserved. Authoring (copy/rm) stays on the Web settings page; there is no `/preset` slash.
 - **Live model catalog** — providers × models from the running composition (third-party providers added in the Web UI appear immediately), plus reasoning-effort selection that follows your product default.
 - **Slash commands** — adapter built-ins (`/status`, `/model`) plus the harness command registry (`/compact`, `/goal`, `/permission`, `/plan`, …) executed without a model turn, plus **skills** (`/skill-name` — the harness's own invocation gesture). Login and logout are ACP methods, not chat commands.
 - **Plans & usage** — `todo_write` snapshots as ACP plans; token accounting as `usage_update` and per-turn usage.

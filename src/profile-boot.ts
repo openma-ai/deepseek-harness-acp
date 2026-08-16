@@ -22,7 +22,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import type { HarnessHost } from "./harness.ts";
@@ -95,6 +95,73 @@ function bundlePatchPath(packageJsonPath: string): string {
     return join(dirname(packageJsonPath), declared);
 }
 
+interface BundleManifest {
+    name?: string;
+    main?: string;
+    dsh?: { bundle?: { patch?: string } };
+}
+
+/** Resolve a named or filesystem bundle to its package manifest. */
+function resolveBundlePackageJson(specifier: string): string {
+    const candidate = resolve(specifier);
+    if (existsSync(candidate)) {
+        return candidate.endsWith("package.json") ? candidate : join(candidate, "package.json");
+    }
+    const req = createRequire(join(process.cwd(), "noop.js"));
+    try {
+        return req.resolve(`${specifier}/package.json`);
+    } catch (cause: unknown) {
+        throw new Error(`${BIN}: cannot resolve bundle ${JSON.stringify(specifier)}`, { cause });
+    }
+}
+
+/**
+ * Make every plugin named by a bundle resolve from that bundle's own npm
+ * dependency graph. The root Loader may belong to another profile, so bare
+ * names cannot safely be left relative to it.
+ */
+function rewriteBundleRows(
+    row: PatchEntry,
+    packageJsonPath: string,
+    manifest: BundleManifest,
+): void {
+    const name = row["name"];
+    if (typeof name === "string" && !name.startsWith("cordis:") && !isAbsolute(name)) {
+        const req = createRequire(packageJsonPath);
+        try {
+            row["name"] = req.resolve(name);
+        } catch (cause: unknown) {
+            if (name === manifest.name && manifest.main !== undefined) {
+                const entry = resolve(dirname(packageJsonPath), manifest.main);
+                if (existsSync(entry)) row["name"] = entry;
+                else throw new Error(`${BIN}: bundle entry does not exist: ${entry}`, { cause });
+            } else {
+                throw new Error(
+                    `${BIN}: bundle ${manifest.name ?? packageJsonPath} cannot resolve plugin ${JSON.stringify(name)}`,
+                    { cause },
+                );
+            }
+        }
+    }
+    const insert = row["insert"];
+    if (Array.isArray(insert)) {
+        for (const nested of insert) {
+            if (nested !== null && typeof nested === "object") {
+                rewriteBundleRows(nested as PatchEntry, packageJsonPath, manifest);
+            }
+        }
+    }
+}
+
+/** Load one additional bundle layer and bind its plugin names to its graph. */
+function loadBundleLayer(appBoot: AppBoot, specifier: string): PatchEntry[] {
+    const packageJsonPath = resolveBundlePackageJson(specifier);
+    const manifest = JSON.parse(readFileSync(packageJsonPath, "utf8")) as BundleManifest;
+    const patches = appBoot.loadOverlayPatches(BIN, bundlePatchPath(packageJsonPath));
+    for (const row of patches) rewriteBundleRows(row, packageJsonPath, manifest);
+    return patches;
+}
+
 /**
  * Boot the acp profile composition against `host` and return the root
  * context. The caller owns disposal.
@@ -106,6 +173,8 @@ export async function bootAcpProfile(
         model?: string;
         permissionMode?: string;
         maxTokens?: number;
+        /** Additional bundle layers, in the same order as profile bundles. */
+        bundles?: string[];
         /** Compose without the ACP stdio server (credential tooling etc.). */
         serve?: boolean;
     },
@@ -160,6 +229,10 @@ export async function bootAcpProfile(
             ...appBoot.loadOverlayPatches(BIN, ownPatch),
         ];
         logDebug(`profile: virtual (dsh-base + ${ownRoot()})`);
+    }
+    for (const bundle of overrides?.bundles ?? []) {
+        bundlePatches.push(...loadBundleLayer(appBoot, bundle));
+        logDebug(`profile: added bundle ${bundle}`);
     }
     for (const row of bundlePatches) rewriteBridgeRows(row, bridgeEntry);
 
