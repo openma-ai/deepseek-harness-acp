@@ -98,6 +98,7 @@ import { SessionProjection, turnEndToStopReason, type HarnessEvent, type Session
 import { AcpRpc, muxAcpStream } from "./rpc.ts";
 import { installTuiClientPlane, type TuiClientAdvertisement } from "./tui-client.ts";
 import { installAcpUserQuestionProvider } from "./user-questions.ts";
+import { presetDisplayName, type PresetRow } from "./presets.ts";
 export {
     answerFromElicitation,
     askUserQuestionsOverAcp,
@@ -826,7 +827,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
      * turn runs the two-tool fixed-prompt agent, exactly like the Web UI.
      */
     interface AgentPresetsService {
-        list(): Promise<{ id: string }[]>;
+        list(): Promise<PresetRow[]>;
         resolve(id?: string): Promise<{ id: string }>;
         mount(agentCtx: unknown, id: string): Promise<void>;
     }
@@ -860,8 +861,6 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         }
         return header?.agentPreset;
     };
-
-    const presetLabel = (id: string): string => id.charAt(0).toUpperCase() + id.slice(1);
 
     /** Sandbox confinement levels: the session-mode selector, always. */
     const modeState = (record: SessionRecord): SessionModeState => {
@@ -1136,7 +1135,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                         currentValue: record.preset,
                         options: roster.map((preset) => ({
                             value: preset.id,
-                            name: presetLabel(preset.id),
+                            name: presetDisplayName(preset),
                             description: `Agent preset “${preset.id}”`,
                         })),
                     });

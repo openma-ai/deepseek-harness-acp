@@ -46,6 +46,7 @@ export interface AgentConfigOption {
  * @returns chip / dropdown label.
  */
 export function presetDisplayName(preset: PresetRow): string {
+    if (preset.id === "cordis") return "Creator";
     const name = preset.name?.trim();
     return name !== undefined && name.length > 0 ? name : preset.id;
 }

@@ -22,8 +22,8 @@ const roster: PresetRow[] = [
 
 describe("agent config option copy", () => {
     it("uses the row name, broken reason, and groups system vs user", () => {
-        expect(presetDisplayName({ id: "cordis" })).toBe("cordis");
-        expect(presetDisplayName({ id: "cordis", name: "Cordis" })).toBe("Cordis");
+        expect(presetDisplayName({ id: "cordis" })).toBe("Creator");
+        expect(presetDisplayName({ id: "cordis", name: "Cordis" })).toBe("Creator");
         expect(presetDescription({ id: "x", description: "hello" })).toBe("hello");
         expect(presetDescription({ id: "x", broken: "no yaml", description: "hello" })).toBe(
             "Broken: no yaml",
@@ -46,6 +46,12 @@ describe("agent config option copy", () => {
             name: "Agent",
             currentValue: "cordis",
         });
+        const system = option?.options[0] as {
+            group: string;
+            options: Array<{ value: string; name: string }>;
+        };
+        expect(system.group).toBe("system");
+        expect(system.options[0]).toMatchObject({ value: "cordis", name: "Creator" });
         expect(option).not.toHaveProperty("category");
         expect(agentConfigOption([roster[0]!], "cordis")).toBeUndefined();
     });
