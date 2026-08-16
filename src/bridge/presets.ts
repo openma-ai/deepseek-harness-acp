@@ -47,6 +47,7 @@ export interface AgentConfigOption {
  */
 export function presetDisplayName(preset: PresetRow): string {
     if (preset.id === "cordis") return "Creator";
+    if (preset.id === "code") return "Code";
     const name = preset.name?.trim();
     return name !== undefined && name.length > 0 ? name : preset.id;
 }
