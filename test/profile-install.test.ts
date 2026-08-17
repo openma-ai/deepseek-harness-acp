@@ -94,6 +94,19 @@ afterAll(() => {
 }, 180_000);
 
 describe("ACP package installation", () => {
+    it("publishes only the ACP SDK plus one complete dsh host peer", () => {
+        const manifest = JSON.parse(readFileSync(join(import.meta.dirname, "../package.json"), "utf8")) as {
+            dependencies?: Record<string, string>;
+            peerDependencies?: Record<string, string>;
+        };
+        expect(manifest.dependencies).toEqual({
+            "@agentclientprotocol/sdk": "^1.3.0",
+        });
+        expect(manifest.peerDependencies).toEqual({
+            "@deepseek-ai/dsh": "^0.1.0-rc.6",
+        });
+    });
+
     it("serves standalone from one complete dsh peer host", async () => {
         const prefix = mkdtempSync(join(tmpdir(), "dsh-acp-standalone-prefix-"));
         const home = mkdtempSync(join(tmpdir(), "dsh-acp-standalone-home-"));
@@ -110,6 +123,15 @@ describe("ACP package installation", () => {
 
         expect(installed.status, `${installed.stdout}\n${installed.stderr}`).toBe(0);
         expect(existsSync(join(prefix, "node_modules/@deepseek-ai/dsh/package.json"))).toBe(true);
+        const hostVersion = JSON.parse(
+            readFileSync(join(prefix, "node_modules/@deepseek-ai/dsh/package.json"), "utf8"),
+        ).version as string;
+        for (const name of ["dsh-mcp-client", "dsh-attachment"]) {
+            const version = JSON.parse(
+                readFileSync(join(prefix, `node_modules/@deepseek-ai/${name}/package.json`), "utf8"),
+            ).version as string;
+            expect(version, `${name} must come from the standalone host release`).toBe(hostVersion);
+        }
         const response = await initializeAcp(
             join(prefix, "node_modules/@openma/deepseek-harness-acp/dist/index.js"),
             prefix,
@@ -149,6 +171,92 @@ describe("ACP package installation", () => {
             ? readdirSync(join(profileDir, "node_modules/@deepseek-ai")).filter((name) => name.startsWith("dsh-"))
             : [];
         expect(privateDshPackages).toEqual([]);
+    }, 120_000);
+
+    it("is idempotent when the same ACP bundle is added to a profile twice", () => {
+        const home = mkdtempSync(join(tmpdir(), "dsh-acp-profile-twice-"));
+        roots.push(home);
+        const dshBin = join(
+            import.meta.dirname,
+            "../node_modules/@deepseek-ai/dsh/lib/bin.js",
+        );
+
+        for (let index = 0; index < 2; index += 1) {
+            const installed = run(
+                process.execPath,
+                [dshBin, "plugin", "--profile", "acp", "add", `file:${tarball}`],
+                { DSH_HOME: home },
+            );
+            expect(installed.status, `${installed.stdout}\n${installed.stderr}`).toBe(0);
+        }
+
+        const manifest = JSON.parse(
+            readFileSync(join(home, "profiles/acp/package.json"), "utf8"),
+        ) as {
+            dependencies?: Record<string, string>;
+            dsh?: { profile?: { bundles?: string[] } };
+        };
+        expect(Object.keys(manifest.dependencies ?? {})).toEqual(["@openma/deepseek-harness-acp"]);
+        expect(
+            manifest.dsh?.profile?.bundles?.filter((name) => name === "@openma/deepseek-harness-acp"),
+        ).toHaveLength(1);
+    }, 120_000);
+
+    it("serves as a profile plugin on a coherent rc.7 host", async () => {
+        const prefix = mkdtempSync(join(tmpdir(), "dsh-acp-rc7-prefix-"));
+        const home = mkdtempSync(join(tmpdir(), "dsh-acp-rc7-home-"));
+        roots.push(prefix, home);
+        const hostInstalled = run("npm", [
+            "install",
+            "--prefix",
+            prefix,
+            "--ignore-scripts",
+            "--no-audit",
+            "--no-fund",
+            "@deepseek-ai/dsh@0.1.0-rc.7",
+        ]);
+        expect(hostInstalled.status, `${hostInstalled.stdout}\n${hostInstalled.stderr}`).toBe(0);
+        const dshBin = join(prefix, "node_modules/@deepseek-ai/dsh/lib/bin.js");
+        const pluginInstalled = run(
+            process.execPath,
+            [dshBin, "plugin", "--profile", "acp", "add", `file:${tarball}`],
+            { DSH_HOME: home },
+        );
+        expect(pluginInstalled.status, `${pluginInstalled.stdout}\n${pluginInstalled.stderr}`).toBe(0);
+        const profileDir = join(home, "profiles", "acp");
+        expect(existsSync(join(profileDir, "node_modules/@deepseek-ai/dsh"))).toBe(false);
+        const response = await initializeAcp(
+            dshBin,
+            prefix,
+            {
+                DSH_HOME: home,
+                DEEPSEEK_API_KEY: "sk-test-not-real",
+            },
+            ["--profile", "acp"],
+        );
+        expect(response).toMatchObject({
+            id: 1,
+            result: { agentInfo: { name: "dsh-acp" } },
+        });
+    }, 180_000);
+
+    it("rejects an explicitly incompatible standalone host under strict peer resolution", () => {
+        const prefix = mkdtempSync(join(tmpdir(), "dsh-acp-incompatible-prefix-"));
+        roots.push(prefix);
+        const installed = run("npm", [
+            "install",
+            "--prefix",
+            prefix,
+            "--ignore-scripts",
+            "--no-audit",
+            "--no-fund",
+            "--strict-peer-deps",
+            "@deepseek-ai/dsh@0.1.0-rc.3",
+            `file:${tarball}`,
+        ]);
+
+        expect(installed.status).not.toBe(0);
+        expect(`${installed.stdout}\n${installed.stderr}`).toMatch(/ERESOLVE|conflicting peer dependency/i);
     }, 120_000);
 
     it("serves ACP after installation into a dsh profile", async () => {
