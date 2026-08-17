@@ -29,7 +29,7 @@ config options, slash commands, skills, and MCP servers. Credentials never
 touch your editor config — it reuses the key you saved in the dsh Web UI, or
 `dsh-acp login` saves one to the same store.
 
-## Two ways to plug it in
+## Two entry points, one embeddable plugin
 
 | | **A · Standalone server** | **B · dsh profile plugin** |
 |---|---|---|
@@ -48,6 +48,11 @@ Other dsh surfaces can mount the transport-independent
 transport adapter. The TUI profile uses this path: it starts a separate TUI
 Client process and connects ACP over that process's standard stdin/stdout; it
 does not start `dsh-acp` or use an in-process Client stream.
+
+The package is therefore not only a CLI wrapper. It is also the ACP surface
+plugin used by other dsh applications: one Host composition can expose the
+same sessions, tools, presets, skills, and persistence through a transport
+chosen by the surface.
 
 ### A · Standalone server
 
@@ -93,6 +98,62 @@ This creates `$DSH_HOME/profiles/acp` and registers the package's
 product baseline as `dsh web`, with the module-reload watcher off. Extend the
 profile in `$DSH_HOME/profiles/acp/cordis.patch.yml` like any other dsh
 profile.
+
+## Plugin and extension model
+
+There are two independent ways to extend an ACP-backed surface.
+
+### Extend the Host composition
+
+The ACP adapter rides the Cordis tree that the profile already owns. Add dsh
+plugins to that profile to change the agent composition instead of forking the
+ACP server: providers and models join the live catalog, commands and skills
+join the advertised session surface, tools and subagents appear through
+standard `session/update`, and the same session persistence remains available
+to every surface.
+
+For applications embedding ACP, the public package entries are:
+
+| Export | Role |
+|---|---|
+| `@openma/deepseek-harness-acp/plugin` | Complete Host-side surface plugin. It fills the ACP-required Host services that Base leaves to a surface and provides `ctx.acpServer`. It does not claim a transport. |
+| `@openma/deepseek-harness-acp/server` | Lower-level transport-independent `acpServer` provider for a Host tree that already supplies the injected composition services. |
+| `@openma/deepseek-harness-acp/stdio` | Standard profile adapter: connects `ctx.acpServer` to process stdin/stdout. |
+| `@openma/deepseek-harness-acp/bridge` | Node stream adapter and compatibility entry for older profile patches. |
+
+`ctx.acpServer.connect(stream)` creates a connection-owned bridge fiber over
+the existing Host composition. The transport owner retains process, stream,
+and TTY lifecycle; the ACP plugin retains session and agent semantics. This is
+the shape used by
+[`@openma/deepseek-harness-tui`](https://github.com/openma-ai/deepseek-harness-tui):
+ACP stays on the Base Host tree while a separate TUI Client process owns its
+own Cordis tree.
+
+Adding a Cordis service does not automatically invent a wire method. Prefer a
+standard ACP capability or event projection whenever one exists; add an
+adapter only for behavior that must cross the client boundary.
+
+### Extend ACP without breaking ordinary clients
+
+Optional wire behavior follows ACP's extension conventions:
+
+1. Advertise support in `initialize` metadata, with a namespaced and versioned
+   capability such as `_meta.dsh.cordis.protocol`.
+2. Carry annotations on standard messages in namespaced `_meta` fields when no
+   new request is needed.
+3. Name custom JSON-RPC requests and notifications with a leading underscore,
+   and send them only after both peers negotiated the matching capability.
+4. Keep the standard ACP path complete. A client that does not advertise an
+   extension must still get normal sessions, prompts, updates, cancellation,
+   auth, and config options.
+
+The current package applies this pattern to the built-in `_dsh/cordis/*`
+family used by the TUI for Client capability discovery, dynamic Package
+lifecycle, and package-private Host/Client RPC. It is an explicit, versioned
+extension—not a synchronization of Cordis plugin ids, fibers, or `inject`
+across processes. The bridge's internal method registry is not currently a
+public arbitrary-extension API; new extension families should first define a
+stable capability, ownership, lifecycle, and fallback contract.
 
 ## Authentication
 
@@ -185,6 +246,18 @@ dsh-acp
    ▼
 your @deepseek-ai/dsh installation   (agent spine, llm, persistence, sandbox,
                                       tools, presets, skills, compaction, …)
+```
+
+When embedded by another surface, only the transport edge changes:
+
+```text
+dsh Base Host Cordis tree
+   ├─ product plugins (agents, tools, skills, persistence, …)
+   └─ @openma/deepseek-harness-acp/plugin
+         └─ acpServer.connect(Stream)
+                │ standard ACP + negotiated extensions
+                ▼
+          surface-owned Client process
 ```
 
 The bridge consumes the harness `session/event` firehose — the same
