@@ -9,6 +9,7 @@
 
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent } from "@deepseek-ai/dsh-agent";
+import { CORDIS_METHODS } from "./cordis-protocol.ts";
 import type { AcpRpc } from "./rpc.ts";
 
 /** Serializable inspect provider directory (mirrors cordis-host-runner). */
@@ -60,9 +61,9 @@ interface DynamicPluginInspection {
     [key: string]: unknown;
 }
 
-/** Mutable advertisement from `initialize` `_meta.tuiInspect`. */
+/** Negotiated Client support from `initialize` `_meta.dsh.cordis`. */
 export interface TuiClientAdvertisement {
-    /** True after a client advertised TUI inspect extras. */
+    /** True only when the Client advertised the matching Cordis protocol. */
     advertised: boolean;
 }
 
@@ -85,22 +86,21 @@ export function installTuiClientPlane(
 
     ctx.effect(
         () =>
-            rpc.registerMethod("tui/inspect-sync", (params) => {
+            rpc.registerMethod(CORDIS_METHODS.inspectSync, (params) => {
                 const inspect = optionalInspect(ctx);
                 if (inspect === undefined) {
                     throw new Error("this agent has no Cordis inspect registry");
                 }
                 const providers = readProviders(params);
                 inspect.syncClientManifest(providers);
-                advertisement.advertised = true;
                 return { ok: true };
             }),
-        "acp-bridge: tui/inspect-sync",
+        "acp-bridge: cordis/inspect-sync",
     );
 
     ctx.effect(
         () =>
-            rpc.registerMethod("tui/inspect-resolve", (params) => {
+            rpc.registerMethod(CORDIS_METHODS.inspectResolve, (params) => {
                 const inspect = optionalInspect(ctx);
                 if (inspect === undefined) {
                     throw new Error("this agent has no Cordis inspect registry");
@@ -110,12 +110,12 @@ export function installTuiClientPlane(
                 const requestId = readString(body, "requestId");
                 return inspect.resolveClientQuery(agent, requestId, body["resolution"]);
             }),
-        "acp-bridge: tui/inspect-resolve",
+        "acp-bridge: cordis/inspect-resolve",
     );
 
     ctx.effect(
         () =>
-            rpc.registerMethod("tui/run-host-half", async (params) => {
+            rpc.registerMethod(CORDIS_METHODS.runHost, async (params) => {
                 const runner = optionalRunner(ctx);
                 if (runner === undefined) {
                     throw new Error("this agent has no dynamic Cordis runner");
@@ -132,12 +132,12 @@ export function installTuiClientPlane(
                     body["approveFutureVersions"] === true,
                 );
             }),
-        "acp-bridge: tui/run-host-half",
+        "acp-bridge: cordis/run-host-half",
     );
 
     ctx.effect(
         () =>
-            rpc.registerMethod("tui/get-client-code", (params) => {
+            rpc.registerMethod(CORDIS_METHODS.getClientCode, (params) => {
                 const runner = optionalRunner(ctx);
                 if (runner === undefined) {
                     throw new Error("this agent has no dynamic Cordis runner");
@@ -150,12 +150,12 @@ export function installTuiClientPlane(
                     readString(body, "pluginRunId"),
                 );
             }),
-        "acp-bridge: tui/get-client-code",
+        "acp-bridge: cordis/get-client-code",
     );
 
     ctx.effect(
         () =>
-            rpc.registerMethod("tui/resolve-request-run", async (params) => {
+            rpc.registerMethod(CORDIS_METHODS.resolveRequestRun, async (params) => {
                 const runner = optionalRunner(ctx);
                 if (runner === undefined) {
                     throw new Error("this agent has no dynamic Cordis runner");
@@ -166,12 +166,12 @@ export function installTuiClientPlane(
                     body["resolution"],
                 );
             }),
-        "acp-bridge: tui/resolve-request-run",
+        "acp-bridge: cordis/resolve-request-run",
     );
 
     ctx.effect(
         () =>
-            rpc.registerMethod("tui/invoke", async (params) => {
+            rpc.registerMethod(CORDIS_METHODS.pluginInvoke, async (params) => {
                 const runner = optionalRunner(ctx);
                 if (runner === undefined) {
                     throw new Error("this agent has no dynamic Cordis runner");
@@ -185,34 +185,34 @@ export function installTuiClientPlane(
                     body["args"] ?? null,
                 );
             }),
-        "acp-bridge: tui/invoke",
+        "acp-bridge: cordis/invoke",
     );
 
     ctx.effect(
         () =>
-            rpc.registerMethod("tui/list-plugins", (params) => {
+            rpc.registerMethod(CORDIS_METHODS.pluginsList, (params) => {
                 const runner = requireRunnerMethod(ctx, "listPlugins");
                 const body = asObject(params);
                 const agent = requireAgent(findAgent, readString(body, "agentId"));
                 return runner.listPlugins(agent);
             }),
-        "acp-bridge: tui/list-plugins",
+        "acp-bridge: cordis/list-plugins",
     );
 
     ctx.effect(
         () =>
-            rpc.registerMethod("tui/stop-plugin", async (params) => {
+            rpc.registerMethod(CORDIS_METHODS.pluginStop, async (params) => {
                 const runner = requireRunnerMethod(ctx, "stopFromPanel");
                 const body = asObject(params);
                 const agent = requireAgent(findAgent, readString(body, "agentId"));
                 return await runner.stopFromPanel(agent, readString(body, "pluginId"));
             }),
-        "acp-bridge: tui/stop-plugin",
+        "acp-bridge: cordis/stop-plugin",
     );
 
     ctx.effect(
         () =>
-            rpc.registerMethod("tui/start-plugin", async (params) => {
+            rpc.registerMethod(CORDIS_METHODS.pluginStart, async (params) => {
                 const runner = requireRunnerMethod(ctx, "listPlugins");
                 const body = asObject(params);
                 const agentId = readString(body, "agentId");
@@ -240,7 +240,7 @@ export function installTuiClientPlane(
                 const pluginRunId = readString(started, "pluginRunId");
                 const startedHere = started["startedHere"] !== false;
                 if (pkg.hasClientHalf) {
-                    rpc.notify("tui/user-run", {
+                    rpc.notify(CORDIS_METHODS.userRun, {
                         agentId,
                         pluginId,
                         packageId,
@@ -252,12 +252,12 @@ export function installTuiClientPlane(
                 }
                 return { ok: true, status: "starting", pluginId, packageId, pluginRunId };
             }),
-        "acp-bridge: tui/start-plugin",
+        "acp-bridge: cordis/start-plugin",
     );
 
     ctx.effect(
         () =>
-            rpc.registerMethod("tui/settle-user-run", async (params) => {
+            rpc.registerMethod(CORDIS_METHODS.settleUserRun, async (params) => {
                 const runner = requireRunnerMethod(ctx, "settleUserRun");
                 const body = asObject(params);
                 const agent = requireAgent(findAgent, readString(body, "agentId"));
@@ -267,28 +267,28 @@ export function installTuiClientPlane(
                     body["resolution"],
                 );
             }),
-        "acp-bridge: tui/settle-user-run",
+        "acp-bridge: cordis/settle-user-run",
     );
 
     ctx.on("cordis/inspect-query", (request: { requestId?: unknown }) => {
         if (!advertisement.advertised) return;
-        rpc.notify("tui/inspect-query", request);
+        rpc.notify(CORDIS_METHODS.inspectQuery, request);
     });
     ctx.on("cordis/inspect-query-resolved", (resolved: { requestId?: unknown }) => {
         if (!advertisement.advertised) return;
-        rpc.notify("tui/inspect-query-resolved", resolved);
+        rpc.notify(CORDIS_METHODS.inspectQueryResolved, resolved);
     });
     ctx.on("cordis/request-run", (request: { requestId?: unknown }) => {
         if (!advertisement.advertised) return;
-        rpc.notify("tui/request-run", request);
+        rpc.notify(CORDIS_METHODS.requestRun, request);
     });
     ctx.on("cordis/request-run-resolved", (resolved: { requestId?: unknown }) => {
         if (!advertisement.advertised) return;
-        rpc.notify("tui/request-run-resolved", resolved);
+        rpc.notify(CORDIS_METHODS.requestRunResolved, resolved);
     });
     ctx.on("cordis/dynamic-retract", (retracted: { pluginId?: unknown }) => {
         if (!advertisement.advertised) return;
-        rpc.notify("tui/dynamic-retract", retracted);
+        rpc.notify(CORDIS_METHODS.pluginRetract, retracted);
     });
 }
 

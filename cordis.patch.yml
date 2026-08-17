@@ -97,22 +97,15 @@
   disabled: true
 
 - insert:
-    # Agent presets: per-session model-facing compositions (persona, tools,
-    # compaction). The dsh CLI injects its shipped root into any row with this
-    # id, so standard/code/minimal/creator are available and ACP session modes
-    # surface them (~/.dsh/agent-presets adds user-authored ones).
-    - id: agent-presets
-      name: '@deepseek-ai/dsh-agent-presets'
-      config:
-        default: standard
-
-    # Same host row the web-app bundle mounts. Without it, preset "cordis"
-    # never activates: tool-cordis waits for dynamicCordisRunner, cordisInspect.
-    - id: cordis-host-runner
-      name: '@deepseek-ai/dsh-cordis-host-runner'
-
-    - id: acp-bridge
-      name: '@openma/deepseek-harness-acp/bridge'
+    # The same complete Cordis plugin embedded by other surfaces. It owns the
+    # preset plane and transport-independent ACP server, but no transport.
+    - id: acp-plugin
+      name: '@openma/deepseek-harness-acp/plugin'
       config:
         model: !!js process.env.DSH_MODEL
         permissionMode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'
+
+    # The ordinary ACP profile owns stdio. Embedded surfaces replace only this
+    # adapter and reuse the exact same plugin contract above.
+    - id: acp-bridge
+      name: '@openma/deepseek-harness-acp/stdio'

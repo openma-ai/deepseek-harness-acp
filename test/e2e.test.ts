@@ -215,7 +215,10 @@ describe("dsh-acp server (e2e smoke)", () => {
     it("initializes with Agent Auth and logout", async () => {
         const result = (await client.request("initialize", {
             protocolVersion: 1,
-            clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+            clientCapabilities: {
+                fs: { readTextFile: false, writeTextFile: false },
+                _meta: { dsh: { cordis: { protocol: 0 } } },
+            },
         })) as Record<string, unknown>;
         expect(result["protocolVersion"]).toBe(1);
         expect(result["agentInfo"]).toMatchObject({ name: "dsh-acp" });
@@ -223,6 +226,7 @@ describe("dsh-acp server (e2e smoke)", () => {
         expect(capabilities["loadSession"]).toBe(true);
         expect(capabilities["promptCapabilities"]).toMatchObject({ embeddedContext: true, image: true });
         expect(capabilities["auth"]).toEqual({ logout: {} });
+        expect(capabilities["_meta"]).toMatchObject({ dsh: { cordis: { protocol: 0 } } });
         const methods = result["authMethods"] as Array<Record<string, unknown>>;
         expect(methods.length).toBeGreaterThanOrEqual(1);
         expect(methods.every((method) => method["type"] === undefined || method["type"] === "agent")).toBe(true);

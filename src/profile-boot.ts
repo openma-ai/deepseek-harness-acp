@@ -4,7 +4,7 @@
  * Instead of composing a hand-rolled agent spine, this engine drives the
  * harness's own profile machinery (`@deepseek-ai/dsh-app-boot`) against a
  * discovered installation — the user's `dsh` when present, this package's
- * vendored dependency as the fallback — so the resulting tree is the same
+ * npm-installed peer as the fallback — so the resulting tree is the same
  * product composition `dsh --profile acp` would build:
  *
  *   - the `@deepseek-ai/dsh-base` bundle patch (the full product baseline),
@@ -68,15 +68,24 @@ function ownRoot(): string {
 }
 
 const OWN_BRIDGE_SPECIFIER = "@openma/deepseek-harness-acp/bridge";
+const OWN_SERVER_SPECIFIER = "@openma/deepseek-harness-acp/server";
+const OWN_PLUGIN_SPECIFIER = "@openma/deepseek-harness-acp/plugin";
+const OWN_STDIO_SPECIFIER = "@openma/deepseek-harness-acp/stdio";
 
-/** Rewrite this package's bridge rows (incl. nested inserts) to an absolute entry. */
-function rewriteBridgeRows(row: PatchEntry, absoluteEntry: string): void {
-    if (row["name"] === OWN_BRIDGE_SPECIFIER) row["name"] = absoluteEntry;
+/** Rewrite this package's rows (incl. nested inserts) to absolute entries. */
+function rewriteOwnRows(
+    row: PatchEntry,
+    entries: { bridge: string; server: string; plugin: string; stdio: string },
+): void {
+    if (row["name"] === OWN_BRIDGE_SPECIFIER) row["name"] = entries.bridge;
+    if (row["name"] === OWN_SERVER_SPECIFIER) row["name"] = entries.server;
+    if (row["name"] === OWN_PLUGIN_SPECIFIER) row["name"] = entries.plugin;
+    if (row["name"] === OWN_STDIO_SPECIFIER) row["name"] = entries.stdio;
     const insert = row["insert"];
     if (Array.isArray(insert)) {
         for (const nested of insert) {
             if (nested !== null && typeof nested === "object") {
-                rewriteBridgeRows(nested as PatchEntry, absoluteEntry);
+                rewriteOwnRows(nested as PatchEntry, entries);
             }
         }
     }
@@ -207,6 +216,21 @@ export async function bootAcpProfile(
         import.meta.url.endsWith(".ts") || !existsSync(distBridge)
             ? join(ownRoot(), "src", "bundle.ts")
             : distBridge;
+    const distServer = join(ownRoot(), "dist", "server.js");
+    const serverEntry =
+        import.meta.url.endsWith(".ts") || !existsSync(distServer)
+            ? join(ownRoot(), "src", "server.ts")
+            : distServer;
+    const distPlugin = join(ownRoot(), "dist", "plugin.js");
+    const pluginEntry =
+        import.meta.url.endsWith(".ts") || !existsSync(distPlugin)
+            ? join(ownRoot(), "src", "plugin.ts")
+            : distPlugin;
+    const distStdio = join(ownRoot(), "dist", "stdio.js");
+    const stdioEntry =
+        import.meta.url.endsWith(".ts") || !existsSync(distStdio)
+            ? join(ownRoot(), "src", "stdio.ts")
+            : distStdio;
     const realProfileDir = join(home, "profiles", "acp");
     if (existsSync(join(realProfileDir, "package.json"))) {
         // Exactly the dsh CLI's path: the profile directory is the module
@@ -234,7 +258,14 @@ export async function bootAcpProfile(
         bundlePatches.push(...loadBundleLayer(appBoot, bundle));
         logDebug(`profile: added bundle ${bundle}`);
     }
-    for (const row of bundlePatches) rewriteBridgeRows(row, bridgeEntry);
+    for (const row of bundlePatches) {
+        rewriteOwnRows(row, {
+            bridge: bridgeEntry,
+            server: serverEntry,
+            plugin: pluginEntry,
+            stdio: stdioEntry,
+        });
+    }
 
     // ---- Home layer and CLI-equivalent overlays -------------------------
     const homePatchPath = join(home, "cordis.patch.yml");

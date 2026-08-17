@@ -11,7 +11,7 @@
  *      package directory, an npm prefix, or any directory whose
  *      `node_modules` carries the `@deepseek-ai` scope.
  *   2. This package's own tree (a development checkout with dev dependencies,
- *      or a co-installation that carries the harness packages).
+ *      or npm's automatically installed dsh peer).
  *   3. `./node_modules` of the invoking directory.
  *   4. `dsh` on PATH — the normal case after `npm install -g @deepseek-ai/dsh`.
  *   5. The global npm root (`npm root -g`).
@@ -175,13 +175,13 @@ export function resolveHost(explicit?: string): HarnessHost {
     const globalNpm = hostFromGlobalNpm();
     if (globalNpm !== undefined) return globalNpm;
     probed.push("npm root -g");
-    // Last: this package's own tree — the vendored @deepseek-ai/dsh
-    // dependency. A dsh the user installed always wins (their Web UI and
-    // this server then run the same code over the shared $DSH_HOME); the
-    // vendored copy makes a machine without dsh work out of the box.
-    const own = hostAt(dirname(fileURLToPath(import.meta.url)), "dsh-acp package tree (vendored)");
+    // Last: this package's own tree — npm installs the @deepseek-ai/dsh peer
+    // for the standalone command. A dsh the user installed always wins (their
+    // Web UI and this server then run the same code over the shared $DSH_HOME);
+    // the peer copy makes a machine without an existing dsh work out of the box.
+    const own = hostAt(dirname(fileURLToPath(import.meta.url)), "dsh-acp package tree (npm peer)");
     if (own !== undefined) return own;
-    probed.push("dsh-acp package tree (vendored)");
+    probed.push("dsh-acp package tree (npm peer)");
     throw new HarnessNotFoundError(probed);
 }
 

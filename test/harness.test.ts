@@ -67,7 +67,7 @@ describe("resolveHost", () => {
     it("auto-detects a harness from the checkout when no path is given", () => {
         // The dev checkout carries the harness (dependencies + devDependencies);
         // user-installation probes (cwd, PATH, npm -g) rank before the
-        // vendored fallback, and in this checkout the cwd probe hits first.
+        // npm-installed peer fallback, and in this checkout the cwd probe hits first.
         const host = resolveHost();
         expect(host.source).toMatch(/invoking directory|dsh-acp package tree/);
     });

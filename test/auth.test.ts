@@ -190,12 +190,6 @@ describe("ACP bridge credential wiring", () => {
         expect(bridge).not.toMatch(/id: "preset",\s*name: "Agent"/);
     });
 
-    it("mounts cordis-host-runner so the cordis agent preset can activate tool-cordis", () => {
-        const patch = readFileSync(join(import.meta.dirname, "../cordis.patch.yml"), "utf8");
-        expect(patch).toMatch(/id:\s*cordis-host-runner/);
-        expect(patch).toContain("@deepseek-ai/dsh-cordis-host-runner");
-    });
-
     it("logs in through ctx.credentials, not a host-module lookup", () => {
         const login = readFileSync(join(import.meta.dirname, "../src/login.ts"), "utf8");
         expect(login).toContain('from "@deepseek-ai/dsh-credentials"');

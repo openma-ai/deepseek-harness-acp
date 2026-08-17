@@ -26,6 +26,12 @@ function fakeCtx(services: Record<string, unknown> = {}) {
 }
 
 describe("TUI Client ACP extras", () => {
+    it("rejects custom methods outside ACP's underscore extension namespace", () => {
+        const rpc = new AcpRpc();
+
+        expect(() => rpc.registerMethod("tui/legacy", () => null)).toThrow(/start with "_"/);
+    });
+
     it("lists only the dynamic plugins owned by the requested agent", async () => {
         const listedFor: string[] = [];
         const agent = { id: "agent-1" } as Agent;
@@ -57,7 +63,7 @@ describe("TUI Client ACP extras", () => {
             advertisement: { advertised: true },
         });
 
-        await rpc.dispatch(8, "tui/list-plugins", { agentId: "agent-1" });
+        await rpc.dispatch(8, "_dsh/cordis/plugins/list", { agentId: "agent-1" });
 
         expect(listedFor).toEqual(["agent-1"]);
         expect(outbound).toContainEqual({ jsonrpc: "2.0", id: 8, result: plugins });
@@ -83,7 +89,7 @@ describe("TUI Client ACP extras", () => {
             advertisement: { advertised: true },
         });
 
-        await rpc.dispatch(9, "tui/stop-plugin", {
+        await rpc.dispatch(9, "_dsh/cordis/plugins/stop", {
             agentId: "agent-1",
             pluginId: "panel-1",
         });
@@ -155,7 +161,7 @@ describe("TUI Client ACP extras", () => {
             advertisement: { advertised: true },
         });
 
-        await rpc.dispatch(10, "tui/start-plugin", {
+        await rpc.dispatch(10, "_dsh/cordis/plugins/start", {
             agentId: "agent-1",
             pluginId: "panel-1",
             packageId: "pkg-old",
@@ -171,7 +177,7 @@ describe("TUI Client ACP extras", () => {
         }]);
         expect(outbound).toContainEqual({
             jsonrpc: "2.0",
-            method: "tui/user-run",
+            method: "_dsh/cordis/run/user",
             params: {
                 agentId: "agent-1",
                 pluginId: "panel-1",
@@ -215,7 +221,7 @@ describe("TUI Client ACP extras", () => {
             advertisement: { advertised: true },
         });
 
-        await rpc.dispatch(11, "tui/settle-user-run", {
+        await rpc.dispatch(11, "_dsh/cordis/run/settle", {
             agentId: "agent-1",
             pluginId: "panel-1",
             resolution: { ok: true, pluginRunId: "run-2", waitingFor: [] },
@@ -253,7 +259,7 @@ describe("TUI Client ACP extras", () => {
             advertisement: { advertised: true },
         });
 
-        await rpc.dispatch(7, "tui/invoke", {
+        await rpc.dispatch(7, "_dsh/cordis/plugin/invoke", {
             agentId: "agent-1",
             pluginId: "panel-1",
             pluginRunId: "run-1",
@@ -294,14 +300,14 @@ describe("TUI Client ACP extras", () => {
         rpc.attachWriter((value) => {
             outbound.push(value);
         });
-        const advertisement = { advertised: false };
+        const advertisement = { advertised: true };
         installTuiClientPlane(ctx as never, rpc, {
             findAgent: (id) => (id === "agent-1" ? agent : undefined),
             advertisement,
         });
 
-        expect(rpc.has("tui/inspect-sync")).toBe(true);
-        await rpc.dispatch(1, "tui/inspect-sync", {
+        expect(rpc.has("_dsh/cordis/inspect/sync")).toBe(true);
+        await rpc.dispatch(1, "_dsh/cordis/inspect/sync", {
             providers: [
                 {
                     id: "Theme",
@@ -322,7 +328,7 @@ describe("TUI Client ACP extras", () => {
         });
         expect(outbound).toContainEqual({
             jsonrpc: "2.0",
-            method: "tui/inspect-query",
+            method: "_dsh/cordis/inspect/query",
             params: {
                 requestId: "inspect-1",
                 agentId: "agent-1",
@@ -338,7 +344,7 @@ describe("TUI Client ACP extras", () => {
         });
         expect(outbound).toContainEqual({
             jsonrpc: "2.0",
-            method: "tui/request-run",
+            method: "_dsh/cordis/run/request",
             params: {
                 requestId: "approval-1",
                 agentId: "agent-1",
@@ -346,7 +352,7 @@ describe("TUI Client ACP extras", () => {
             },
         });
 
-        await rpc.dispatch(2, "tui/inspect-resolve", {
+        await rpc.dispatch(2, "_dsh/cordis/inspect/resolve", {
             agentId: "agent-1",
             requestId: "inspect-1",
             resolution: { ok: true, data: { tokens: [] } },
@@ -356,7 +362,7 @@ describe("TUI Client ACP extras", () => {
         ]);
     });
 
-    it("does not forward inspect queries until a TUI client advertised", () => {
+    it("does not let inspect sync replace initialize capability negotiation", async () => {
         const ctx = fakeCtx({
             cordisInspect: {
                 syncClientManifest() {},
@@ -370,11 +376,15 @@ describe("TUI Client ACP extras", () => {
         rpc.attachWriter((value) => {
             outbound.push(value);
         });
+        const advertisement = { advertised: false };
         installTuiClientPlane(ctx as never, rpc, {
             findAgent: () => undefined,
-            advertisement: { advertised: false },
+            advertisement,
         });
+        await rpc.dispatch(1, "_dsh/cordis/inspect/sync", { providers: [] });
+        expect(advertisement.advertised).toBe(false);
+        expect(outbound).toEqual([{ jsonrpc: "2.0", id: 1, result: { ok: true } }]);
         ctx.emit("cordis/inspect-query", { requestId: "inspect-1" });
-        expect(outbound).toEqual([]);
+        expect(outbound).toEqual([{ jsonrpc: "2.0", id: 1, result: { ok: true } }]);
     });
 });

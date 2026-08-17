@@ -27,11 +27,14 @@ export class AcpRpc {
 
     /**
      * Register a bridge-owned request method intercepted before the ACP SDK.
-     * @param method - JSON-RPC method name (e.g. `tui/refresh`).
+     * @param method - JSON-RPC extension method (e.g. `_dsh/cordis/inspect/sync`).
      * @param handler - implementation.
      * @returns disposer.
      */
     registerMethod(method: string, handler: AcpRpcHandler): () => void {
+        if (!method.startsWith("_")) {
+            throw new Error(`acpRpc: extension method ${JSON.stringify(method)} must start with "_"`);
+        }
         if (this.handlers.has(method)) {
             throw new Error(`acpRpc: method ${JSON.stringify(method)} is already registered`);
         }
@@ -69,11 +72,14 @@ export class AcpRpc {
     }
 
     /**
-     * Send a JSON-RPC notification on the ACP stream (e.g. `tui/snapshot`).
+     * Send a JSON-RPC extension notification on the ACP stream.
      * @param method - notification method.
      * @param params - payload.
      */
     notify(method: string, params?: unknown): void {
+        if (!method.startsWith("_")) {
+            throw new Error(`acpRpc: extension notification ${JSON.stringify(method)} must start with "_"`);
+        }
         const write = this.writeJson;
         if (write === undefined) return;
         write(params === undefined ? { jsonrpc: "2.0", method } : { jsonrpc: "2.0", method, params });

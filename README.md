@@ -36,12 +36,18 @@ touch your editor config — it reuses the key you saved in the dsh Web UI, or
 | Best for | Getting started in one command | Living inside your dsh setup |
 | Install | `npm i -g @openma/deepseek-harness-acp` | `dsh plugin --profile acp add -w @openma/deepseek-harness-acp` |
 | Zed runs | `dsh-acp` | `dsh --profile acp` |
-| Harness | Your installed dsh — or the vendored fallback when none exists | The dsh that owns the profile |
+| Harness | Your installed dsh — or the npm-installed peer when none exists | The dsh that owns the profile |
 | Composition | dsh-base + this bundle (profile machinery booted in-process) | dsh-base + this bundle + your profile's own patches |
 
 Both shapes share `$DSH_HOME`: the same credential store, settings, presets,
 and session logs as `dsh web` — conversations started in the Web UI can be
 listed and loaded from the editor.
+
+Other dsh surfaces can mount the transport-independent
+`@openma/deepseek-harness-acp/plugin` on their Base Host tree and own the
+transport adapter. The TUI profile uses this path: it starts a separate TUI
+Client process and connects ACP over that process's standard stdin/stdout; it
+does not start `dsh-acp` or use an in-process Client stream.
 
 ### A · Standalone server
 
@@ -61,7 +67,7 @@ dsh-acp login        # interactive; or save the key in the dsh Web UI
 
 Self-contained: it finds your DeepSeek Harness via `--dsh-path` / `DSH_PATH`,
 its own tree, `./node_modules`, `dsh` on PATH, or `npm root -g` — and ships a
-vendored harness runtime as the **last** candidate, so it works out of the box
+npm-installed harness peer as the **last** candidate, so it works out of the box
 and always prefers the dsh you installed. When a real
 `$DSH_HOME/profiles/acp` exists, that profile owns the composition.
 
@@ -169,7 +175,7 @@ ACP client (Zed, …)
 dsh-acp
    ├─ src/profile-boot.ts     boots the harness's own profile machinery
    │                          (dsh-base + this bundle + $DSH_HOME layers)
-   ├─ src/harness.ts          host discovery (DSH_PATH → cwd → PATH → npm -g → vendored)
+   ├─ src/harness.ts          host discovery (DSH_PATH → cwd → PATH → npm -g → npm peer)
    └─ src/bridge/             the ACP bridge (a cordis plugin)
         ├─ index.ts           sessions, prompts, cancel, modes, options,
         │                     commands, credentials, MCP mounts

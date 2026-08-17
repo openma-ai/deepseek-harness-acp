@@ -95,6 +95,7 @@ import {
     UnsupportedPromptContentError,
 } from "./prompt.ts";
 import { SessionProjection, turnEndToStopReason, type HarnessEvent, type SessionUpdate } from "./translate.ts";
+import { advertisesCordis, CORDIS_CAPABILITY } from "./cordis-protocol.ts";
 import { AcpRpc, muxAcpStream } from "./rpc.ts";
 import { installTuiClientPlane, type TuiClientAdvertisement } from "./tui-client.ts";
 import { installAcpUserQuestionProvider } from "./user-questions.ts";
@@ -1534,9 +1535,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 clientElicitationForm =
                     params.clientCapabilities?.elicitation?.form !== undefined &&
                     params.clientCapabilities.elicitation.form !== null;
-                if (capsMeta !== null && typeof capsMeta === "object" && capsMeta["tuiInspect"] === true) {
-                    tuiClient.advertised = true;
-                }
+                tuiClient.advertised = advertisesCordis(capsMeta);
                 const providers = await listProviderRoutes();
                 return {
                     protocolVersion:
@@ -1545,6 +1544,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                             : PROTOCOL_VERSION,
                     agentInfo: { name: "dsh-acp", title: "DeepSeek Harness", version: VERSION },
                     agentCapabilities: {
+                        _meta: { dsh: { cordis: { ...CORDIS_CAPABILITY } } },
                         loadSession: true,
                         promptCapabilities: {
                             image: attachmentIngestOf(ctx.get("attachments")) !== undefined,

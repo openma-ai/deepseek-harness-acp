@@ -182,4 +182,62 @@ describe("ACP user-question elicitation", () => {
             await fiber.dispose();
         }
     });
+
+    it("multiplexes concurrent ACP connections through the single user-questions provider", async () => {
+        const ctx = new Context();
+        const fiber = ctx.plugin(UserQuestionService);
+        await fiber;
+        let firstService: UserQuestionServiceType | undefined;
+        let secondService: UserQuestionServiceType | undefined;
+        const firstFiber = ctx.plugin({
+            name: "first-acp-connection",
+            inject: ["userQuestions"],
+            apply(child) {
+                firstService = child.userQuestions;
+            },
+        });
+        const secondFiber = ctx.plugin({
+            name: "second-acp-connection",
+            inject: ["userQuestions"],
+            apply(child) {
+                secondService = child.userQuestions;
+            },
+        });
+        await Promise.all([firstFiber, secondFiber]);
+        const first = subject.installAcpUserQuestionProvider?.(firstService!, {
+            formSupported: () => true,
+            sessionIdForRequest: (request) => request.questions[0]?.id === "first" ? "s-first" : undefined,
+            create: async () => ({ action: "accept", content: { question_0: "from-first" } }),
+        });
+        const second = subject.installAcpUserQuestionProvider?.(secondService!, {
+            formSupported: () => true,
+            sessionIdForRequest: (request) => request.questions[0]?.id === "second" ? "s-second" : undefined,
+            create: async () => ({ action: "accept", content: { question_0: "from-second" } }),
+        });
+
+        try {
+            await expect(ctx.userQuestions.ask({
+                questions: [{ id: "first", question: "First connection?" }],
+            })).resolves.toEqual({
+                answers: [{ id: "first", selected: [], custom: "from-first" }],
+            });
+            await expect(ctx.userQuestions.ask({
+                questions: [{ id: "second", question: "Second connection?" }],
+            })).resolves.toEqual({
+                answers: [{ id: "second", selected: [], custom: "from-second" }],
+            });
+
+            first?.();
+            await expect(ctx.userQuestions.ask({
+                questions: [{ id: "second", question: "Still connected?" }],
+            })).resolves.toEqual({
+                answers: [{ id: "second", selected: [], custom: "from-second" }],
+            });
+        } finally {
+            first?.();
+            second?.();
+            await Promise.all([firstFiber.dispose(), secondFiber.dispose()]);
+            await fiber.dispose();
+        }
+    });
 });

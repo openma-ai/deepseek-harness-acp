@@ -4,6 +4,7 @@ import type {
     ElicitationContentValue,
     ElicitationPropertySchema,
 } from "@agentclientprotocol/sdk";
+import { Service } from "@deepseek-ai/cordis";
 import {
     UserQuestionError,
     type AskUserQuestionAnswer,
@@ -162,26 +163,57 @@ export interface AcpUserQuestionProviderOptions {
     create: (request: CreateElicitationRequest) => Promise<CreateElicitationResponse>;
 }
 
+interface AcpUserQuestionRouter {
+    routes: AcpUserQuestionProviderOptions[];
+    disposeProvider: () => void;
+}
+
+const ROUTERS_KEY = Symbol.for("@openma/deepseek-harness-acp/user-question-routers");
+const routers = ((globalThis as Record<PropertyKey, unknown>)[ROUTERS_KEY] ??=
+    new WeakMap<object, AcpUserQuestionRouter>()) as WeakMap<object, AcpUserQuestionRouter>;
+
 export function installAcpUserQuestionProvider(
     service: UserQuestionService,
     options: AcpUserQuestionProviderOptions,
 ): () => void {
-    return service.registerProvider({
-        async ask(request) {
-            if (!options.formSupported()) {
-                throw new UserQuestionError(
-                    "the ACP client does not support form elicitation",
-                    "CLIENT_UNSUPPORTED",
-                );
-            }
-            const sessionId = options.sessionIdForRequest(request);
-            if (sessionId === undefined) {
+    const tracked = (service as unknown as Record<PropertyKey, unknown>)[Service.tracker];
+    const owner = typeof tracked === "object" && tracked !== null ? tracked : service;
+    let router = routers.get(owner);
+    if (router === undefined) {
+        const routes: AcpUserQuestionProviderOptions[] = [];
+        const disposeProvider = service.registerProvider({
+            async ask(request) {
+                for (let index = routes.length - 1; index >= 0; index -= 1) {
+                    const route = routes[index];
+                    const sessionId = route?.sessionIdForRequest(request);
+                    if (route === undefined || sessionId === undefined) continue;
+                    if (!route.formSupported()) {
+                        throw new UserQuestionError(
+                            "the ACP client does not support form elicitation",
+                            "CLIENT_UNSUPPORTED",
+                        );
+                    }
+                    return askUserQuestionsOverAcp(request, sessionId, route.create);
+                }
                 throw new UserQuestionError(
                     "ACP user interaction requires a live root session",
                     "ASK_MISSING_AGENT",
                 );
-            }
-            return askUserQuestionsOverAcp(request, sessionId, options.create);
-        },
-    });
+            },
+        });
+        router = { routes, disposeProvider };
+        routers.set(owner, router);
+    }
+
+    router.routes.push(options);
+    let active = true;
+    return () => {
+        if (!active) return;
+        active = false;
+        const index = router.routes.indexOf(options);
+        if (index >= 0) router.routes.splice(index, 1);
+        if (router.routes.length !== 0) return;
+        routers.delete(owner);
+        router.disposeProvider();
+    };
 }
