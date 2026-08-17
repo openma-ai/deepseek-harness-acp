@@ -34,6 +34,7 @@
     "prepublishOnly": "npm run build",
     "build": "node build.mjs",
     "start": "node --import tsx src/index.ts",
+    "pretest": "npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
