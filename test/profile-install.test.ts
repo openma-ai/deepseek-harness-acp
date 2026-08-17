@@ -73,27 +73,7 @@ async function initializeAcp(
     return response;
 }
 
-beforeAll(() => {
-    toolBin = mkdtempSync(join(tmpdir(), "dsh-acp-profile-tools-"));
-    roots.push(toolBin);
-    writeFileSync(
-        join(toolBin, "pnpm"),
-        '#!/bin/sh\nexec npx --yes pnpm@10.34.5 "$@"\n',
-        { mode: 0o755 },
-    );
-    const packDir = mkdtempSync(join(tmpdir(), "dsh-acp-profile-pack-"));
-    roots.push(packDir);
-    const packed = run("npm", ["pack", "--ignore-scripts", "--pack-destination", packDir]);
-    expect(packed.status, packed.stderr).toBe(0);
-    tarball = join(packDir, packed.stdout.trim().split(/\r?\n/).at(-1)!);
-    expect(existsSync(tarball)).toBe(true);
-});
-
-afterAll(() => {
-    for (const root of roots) rmSync(root, { recursive: true, force: true });
-}, 180_000);
-
-describe("ACP package installation", () => {
+describe("ACP package manifest", () => {
     it("publishes only the ACP SDK plus one complete dsh host peer", () => {
         const manifest = JSON.parse(readFileSync(join(import.meta.dirname, "../package.json"), "utf8")) as {
             dependencies?: Record<string, string>;
@@ -106,6 +86,28 @@ describe("ACP package installation", () => {
             "@deepseek-ai/dsh": "^0.1.0-rc.6",
         });
     });
+});
+
+describe.skipIf(process.platform === "win32")("ACP package installation", () => {
+    beforeAll(() => {
+        toolBin = mkdtempSync(join(tmpdir(), "dsh-acp-profile-tools-"));
+        roots.push(toolBin);
+        writeFileSync(
+            join(toolBin, "pnpm"),
+            '#!/bin/sh\nexec npx --yes pnpm@10.34.5 "$@"\n',
+            { mode: 0o755 },
+        );
+        const packDir = mkdtempSync(join(tmpdir(), "dsh-acp-profile-pack-"));
+        roots.push(packDir);
+        const packed = run("npm", ["pack", "--ignore-scripts", "--pack-destination", packDir]);
+        expect(packed.status, packed.stderr).toBe(0);
+        tarball = join(packDir, packed.stdout.trim().split(/\r?\n/).at(-1)!);
+        expect(existsSync(tarball)).toBe(true);
+    });
+
+    afterAll(() => {
+        for (const root of roots) rmSync(root, { recursive: true, force: true });
+    }, 180_000);
 
     it("serves standalone from one complete dsh peer host", async () => {
         const prefix = mkdtempSync(join(tmpdir(), "dsh-acp-standalone-prefix-"));
@@ -146,9 +148,13 @@ describe("ACP package installation", () => {
         });
     }, 180_000);
 
-    it("installs into a dsh profile without installing a second dsh runtime", () => {
+    it("keeps an rc.6 profile coherent instead of mixing rc.7 internals", () => {
         const home = mkdtempSync(join(tmpdir(), "dsh-acp-profile-home-"));
         roots.push(home);
+        const hostManifest = JSON.parse(
+            readFileSync(join(import.meta.dirname, "../node_modules/@deepseek-ai/dsh/package.json"), "utf8"),
+        ) as { version: string };
+        expect(hostManifest.version).toBe("0.1.0-rc.6");
         const dshBin = join(
             import.meta.dirname,
             "../node_modules/@deepseek-ai/dsh/lib/bin.js",
@@ -167,6 +173,8 @@ describe("ACP package installation", () => {
         };
         expect(manifest.dsh?.profile?.bundles).toContain("@openma/deepseek-harness-acp");
         expect(existsSync(join(profileDir, "node_modules/@deepseek-ai/dsh"))).toBe(false);
+        expect(existsSync(join(profileDir, "node_modules/@deepseek-ai/dsh-mcp-client"))).toBe(false);
+        expect(existsSync(join(profileDir, "node_modules/@deepseek-ai/dsh-attachment"))).toBe(false);
         const privateDshPackages = existsSync(join(profileDir, "node_modules/@deepseek-ai"))
             ? readdirSync(join(profileDir, "node_modules/@deepseek-ai")).filter((name) => name.startsWith("dsh-"))
             : [];
