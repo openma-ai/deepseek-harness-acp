@@ -3,7 +3,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "version": "0.4.11",
+  "version": "0.4.12",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/openma-ai/deepseek-harness-acp.git"
@@ -35,7 +35,8 @@
     "build": "node build.mjs",
     "start": "node --import tsx src/index.ts",
     "pretest": "npm run build",
-    "test": "vitest run",
+    "test": "vitest run --exclude test/profile-install.test.ts",
+    "test:install": "vitest run test/profile-install.test.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "pack:local": "npm run build && npm pack"
