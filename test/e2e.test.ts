@@ -350,6 +350,15 @@ describe("dsh-acp server (e2e smoke)", () => {
                 },
             },
         });
+        expect(commands?.find((command) => command["name"] === "plan-view")).toMatchObject({
+            description: "Open the current ACP plan",
+            _meta: {
+                commandAction: {
+                    kind: "clientCommand",
+                    presentation: "view",
+                },
+            },
+        });
     }, 60_000);
 
     it("switches plan mode through the standard collaboration config option", async () => {

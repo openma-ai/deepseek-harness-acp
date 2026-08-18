@@ -97,8 +97,9 @@ import {
 import { SessionProjection, turnEndToStopReason, type HarnessEvent, type SessionUpdate } from "./translate.ts";
 import { advertisesCordis, CORDIS_CAPABILITY } from "./cordis-protocol.ts";
 import { AcpRpc, muxAcpStream } from "./rpc.ts";
-import { installTuiClientPlane, type TuiClientAdvertisement } from "./tui-client.ts";
-import { installAcpUserQuestionProvider } from "./user-questions.ts";
+import type { TuiClientAdvertisement } from "./tui-client.ts";
+import * as tuiClientPlugin from "./tui-client-plugin.ts";
+import * as userQuestionsPlugin from "./user-questions-plugin.ts";
 import { presetDisplayName, type PresetRow } from "./presets.ts";
 export {
     answerFromElicitation,
@@ -244,7 +245,6 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     const agentPresets = ctx.agentPresets;
     const skillRegistry = ctx.skills;
     const subagents = ctx.subagents;
-    const userQuestions = ctx.userQuestions;
     const harness = config.harness ?? (await import("./self-harness.ts")).selfHarness();
     const { createUserMessage, errorChain, sessionId: SessionId, foldSessionTitle, setSandboxMode } = harness;
     const SANDBOX_MODES = harness.sandboxModes;
@@ -278,7 +278,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         }
         return undefined;
     };
-    installTuiClientPlane(ctx, rpc, { findAgent, advertisement: tuiClient });
+    await ctx.plugin(tuiClientPlugin, { rpc, findAgent, advertisement: tuiClient });
 
     const modelCandidates = (): string[] => {
         const seen = new Set<string>();
@@ -1176,7 +1176,24 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             _meta?: Record<string, unknown>;
         }[]
     > => {
-        const list = [...BUILTIN_COMMANDS];
+        const list: {
+            name: string;
+            description: string;
+            input?: { hint: string };
+            _meta?: Record<string, unknown>;
+        }[] = [...BUILTIN_COMMANDS];
+        if (tuiClient.advertised) {
+            list.push({
+                name: "plan-view",
+                description: "Open the current ACP plan",
+                _meta: {
+                    commandAction: {
+                        kind: "clientCommand",
+                        presentation: "view",
+                    },
+                },
+            });
+        }
         const seen = new Set(list.map((command) => command.name));
         try {
             for (const descriptor of commandRuntime.list(record.agent)) {
@@ -2085,7 +2102,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         );
     const stream = muxAcpStream(raw, rpc);
     conn = new AgentSideConnection(makeAgent, stream);
-    const disposeUserQuestions = installAcpUserQuestionProvider(userQuestions, {
+    await ctx.plugin(userQuestionsPlugin, {
         formSupported: () => clientElicitationForm,
         sessionIdForRequest: (request) => {
             if (request.agent === undefined) return undefined;
@@ -2140,5 +2157,4 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         });
 
     ctx.effect(() => quiesce, "acp-bridge.connection");
-    ctx.effect(() => disposeUserQuestions, "acp-bridge.user-questions");
 }
