@@ -16,7 +16,8 @@ jobs:
       fail-fast: false
       matrix:
         # windows is exercised in ci.yml but does not gate releases yet.
-        os: [ubuntu-latest, macos-latest]
+        # Gate publication on the same native Linux ARM64 target as main CI.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
         # node:zlib zstd APIs (used by the harness session store) need >= 22.15
         node: [22, 24]
     steps:

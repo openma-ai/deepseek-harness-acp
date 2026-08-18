@@ -12,7 +12,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Native Linux ARM64 is a supported target, not an emulated smoke test.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
         # node:zlib zstd APIs (used by the harness session store) need >= 22.15
         node: [22, 24]
     steps:
