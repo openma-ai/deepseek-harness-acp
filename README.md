@@ -31,13 +31,13 @@ touch your editor config — it reuses the key you saved in the dsh Web UI, or
 
 ## Two entry points, one embeddable plugin
 
-| | **A · Standalone server** | **B · dsh profile plugin** |
+| | **A · dsh profile plugin (recommended)** | **B · Standalone server** |
 |---|---|---|
-| Best for | Getting started in one command | Living inside your dsh setup |
-| Install | `npm i -g @openma/deepseek-harness-acp` | `dsh plugin --profile acp add -w @openma/deepseek-harness-acp` |
-| Zed runs | `dsh-acp` | `dsh --profile acp` |
-| Harness | Your installed dsh — or the npm-installed peer when none exists | The dsh that owns the profile |
-| Composition | dsh-base + this bundle (profile machinery booted in-process) | dsh-base + this bundle + your profile's own patches |
+| Best for | Normal installation and upgrades | Connecting an ACP client without managing a dsh profile |
+| Install | `dsh plugin --profile acp add @openma/deepseek-harness-acp@latest` | `npm i -g @openma/deepseek-harness-acp` |
+| Zed runs | `dsh --profile acp` | `dsh-acp` |
+| Harness | The dsh that owns the profile | Your installed dsh — or the npm-installed peer when none exists |
+| Composition | dsh-base + this bundle + your profile's own patches | dsh-base + this bundle (profile machinery booted in-process) |
 
 Both shapes share `$DSH_HOME`: the same credential store, settings, presets,
 and session logs as `dsh web` — conversations started in the Web UI can be
@@ -54,7 +54,31 @@ plugin used by other dsh applications: one Host composition can expose the
 same sessions, tools, presets, skills, and persistence through a transport
 chosen by the surface.
 
-### A · Standalone server
+### A · dsh profile plugin (recommended)
+
+```bash
+npm install -g @deepseek-ai/dsh
+dsh web                                                    # save your API key once
+dsh plugin --profile acp add @openma/deepseek-harness-acp@latest
+```
+
+```jsonc
+// Zed settings.json
+{
+  "agent_servers": {
+    "DeepSeek Harness": { "command": "dsh", "args": ["--profile", "acp"] }
+  }
+}
+```
+
+The plugin command creates `$DSH_HOME/profiles/acp`, installs or upgrades the
+adapter, and registers its `dsh.bundle` patch. The bridge mounts over
+`@deepseek-ai/dsh-base` — the same product baseline as `dsh web`, with the
+module-reload watcher off. Extend the profile in
+`$DSH_HOME/profiles/acp/cordis.patch.yml` like any other dsh profile. A global
+`dsh-acp` installation is not required for this path.
+
+### B · Standalone server
 
 ```bash
 npm install -g @openma/deepseek-harness-acp
@@ -70,34 +94,11 @@ dsh-acp login        # interactive; or save the key in the dsh Web UI
 }
 ```
 
-Self-contained: it finds your DeepSeek Harness via `--dsh-path` / `DSH_PATH`,
-its own tree, `./node_modules`, `dsh` on PATH, or `npm root -g` — and ships a
-npm-installed harness peer as the **last** candidate, so it works out of the box
-and always prefers the dsh you installed. When a real
-`$DSH_HOME/profiles/acp` exists, that profile owns the composition.
-
-### B · dsh profile plugin
-
-```bash
-npm install -g @deepseek-ai/dsh
-dsh web                                                  # save your API key once
-dsh plugin --profile acp add -w @openma/deepseek-harness-acp
-```
-
-```jsonc
-// Zed settings.json
-{
-  "agent_servers": {
-    "DeepSeek Harness": { "command": "dsh", "args": ["--profile", "acp"] }
-  }
-}
-```
-
-This creates `$DSH_HOME/profiles/acp` and registers the package's
-`dsh.bundle` patch: the bridge mounts over `@deepseek-ai/dsh-base` — the same
-product baseline as `dsh web`, with the module-reload watcher off. Extend the
-profile in `$DSH_HOME/profiles/acp/cordis.patch.yml` like any other dsh
-profile.
+The standalone binary finds DeepSeek Harness via `--dsh-path` / `DSH_PATH`,
+its own tree, `./node_modules`, `dsh` on PATH, or `npm root -g`. It ships an
+npm-installed harness peer as the **last** candidate, so it still prefers the
+dsh you installed. When a real `$DSH_HOME/profiles/acp` exists, that profile
+owns the composition.
 
 ## Plugin and extension model
 
