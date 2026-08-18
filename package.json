@@ -3,7 +3,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "version": "0.4.10",
+  "version": "0.4.11",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/openma-ai/deepseek-harness-acp.git"
@@ -112,7 +112,8 @@
     "vitest": "^4.1.10"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "^1.3.0"
+    "@agentclientprotocol/sdk": "^1.3.0",
+    "zod": "^4.4.3"
   },
   "peerDependencies": {
     "@deepseek-ai/dsh": "^0.1.0-rc.6"
