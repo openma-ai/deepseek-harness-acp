@@ -104,6 +104,21 @@ owns the composition.
 
 There are two independent ways to extend an ACP-backed surface.
 
+To use portable Agent Plugins, Codex plugins, Claude Code plugins, or Pi
+packages through an ACP client, add the
+[Agent Plugins Bridge](https://github.com/openma-ai/dsh-agents-plugins) to the
+same profile:
+
+```sh
+dsh plugin --profile acp add @openma/dsh-agents-plugins-bridge@latest
+```
+
+The Bridge contributes ordinary Host rows. Imported commands, skills, tools,
+hooks, MCP connections, agents, and Pi extensions therefore reach ACP through
+this adapter's existing projections; there is no ACP-specific plugin import
+runtime. The Bridge's Web management panel and MCP Apps HTML renderer remain
+Web surfaces and are not sent over ACP.
+
 ### Extend the Host composition
 
 The ACP adapter rides the Cordis tree that the profile already owns. Add dsh
