@@ -24,6 +24,7 @@ afterAll(() => {
 describe("resolveHost", () => {
     it("accepts a directory whose node_modules carries the harness", () => {
         const root = makeTree();
+        writePackage(join(root, "node_modules", "@deepseek-ai", "dsh"), "@deepseek-ai/dsh");
         writePackage(join(root, "node_modules", "@deepseek-ai", "dsh-agent"), "@deepseek-ai/dsh-agent");
         const host = resolveHost(root);
         expect(host.base).toBe(root);
@@ -33,6 +34,10 @@ describe("resolveHost", () => {
 
     it("accepts an npm prefix (lib/node_modules layout)", () => {
         const root = makeTree();
+        writePackage(
+            join(root, "lib", "node_modules", "@deepseek-ai", "dsh"),
+            "@deepseek-ai/dsh",
+        );
         writePackage(
             join(root, "lib", "node_modules", "@deepseek-ai", "dsh-agent"),
             "@deepseek-ai/dsh-agent",
@@ -62,6 +67,12 @@ describe("resolveHost", () => {
         const root = makeTree();
         expect(() => resolveHost(root)).toThrow(HarnessNotFoundError);
         expect(() => resolveHost(root)).toThrow(/npm install -g @deepseek-ai\/dsh/);
+    });
+
+    it("rejects a partial module tree that has dsh-agent but not the dsh profile launcher", () => {
+        const root = makeTree();
+        writePackage(join(root, "node_modules", "@deepseek-ai", "dsh-agent"), "@deepseek-ai/dsh-agent");
+        expect(() => resolveHost(root)).toThrow(HarnessNotFoundError);
     });
 
     it("auto-detects a harness from the checkout when no path is given", () => {

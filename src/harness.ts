@@ -60,8 +60,10 @@ export class HarnessNotFoundError extends Error {
     }
 }
 
-/** The package whose presence marks a usable harness tree. */
+/** The runtime package whose version describes the resolved harness tree. */
 const ANCHOR = "@deepseek-ai/dsh-agent";
+/** Profile boot requires the launcher package in the same resolvable tree. */
+const PROFILE_LAUNCHER = "@deepseek-ai/dsh";
 
 function packageDirFrom(base: string, name: string): string | undefined {
     // Node's ascending node_modules walk, starting at `base`.
@@ -91,7 +93,8 @@ function versionOf(packageDir: string): string | undefined {
 
 function hostAt(base: string, source: string): HarnessHost | undefined {
     const anchor = packageDirFrom(base, ANCHOR);
-    if (anchor === undefined) return undefined;
+    const launcher = packageDirFrom(base, PROFILE_LAUNCHER);
+    if (anchor === undefined || launcher === undefined) return undefined;
     return { base: resolve(base), version: versionOf(anchor), source };
 }
 

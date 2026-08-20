@@ -87,6 +87,12 @@ import {
 import { openLocalAuthPage, startLocalAuthPage } from "../auth-page.ts";
 import { logDebug, logWarn } from "../log.ts";
 import { buildReplay } from "./history.ts";
+import { LatestPublication } from "./latest-publication.ts";
+import {
+    interactionModeFromClientMeta,
+    type AcpInteractionMode,
+    withInteractionMode,
+} from "./interaction-mode.ts";
 import {
     attachmentIngestOf,
     convertPrompt,
@@ -251,6 +257,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     const { createUserMessage, errorChain, sessionId: SessionId, foldSessionTitle, setSandboxMode } = harness;
     const SANDBOX_MODES = harness.sandboxModes;
     const sessions = new Map<string, SessionRecord>();
+    const commandPublications = new LatestPublication();
     interface LiveSubagent {
         rootSessionId: string;
         childSessionId: string;
@@ -270,6 +277,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     let clientSubagentTranscript = false;
     /** Whether the client can render standard ACP form elicitation. */
     let clientElicitationForm = false;
+    /** Explicit interaction semantics negotiated from ACP client `_meta`. */
+    let clientInteractionMode: AcpInteractionMode | undefined;
     const tuiClient: TuiClientAdvertisement = { advertised: false };
     const rpc = new AcpRpc();
     const findAgent = (agentId: string): Agent | undefined => {
@@ -609,15 +618,16 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     const agentOptionsFor = (
         model: string | undefined,
         provider?: string,
-    ): { provider?: string; model?: string; maxTokens?: number } => ({
-        ...(provider !== undefined
-            ? { provider }
-            : config.provider !== undefined
-              ? { provider: config.provider }
-              : {}),
-        ...(model !== undefined ? { model } : {}),
-        ...(config.maxTokens !== undefined ? { maxTokens: config.maxTokens } : {}),
-    });
+    ): { provider?: string; model?: string; maxTokens?: number; interactionMode?: AcpInteractionMode } =>
+        withInteractionMode({
+            ...(provider !== undefined
+                ? { provider }
+                : config.provider !== undefined
+                  ? { provider: config.provider }
+                  : {}),
+            ...(model !== undefined ? { model } : {}),
+            ...(config.maxTokens !== undefined ? { maxTokens: config.maxTokens } : {}),
+        }, clientInteractionMode);
 
     /** Return the bridge-owned record for an agent, rejecting same-id impostors. */
     const ownedRecord = (agent: Agent): SessionRecord | undefined => {
@@ -1256,14 +1266,23 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     const publishCommands = (sessionId: string, record?: SessionRecord): void => {
         const target = record ?? sessions.get(sessionId);
         if (target === undefined) return;
-        void availableCommandsFor(target)
-            .then((availableCommands) => {
+        void commandPublications
+            .run(sessionId, () => availableCommandsFor(target), (availableCommands) => {
+                if (sessions.get(sessionId) !== target) return;
+                logDebug(
+                    `available commands ${sessionId}: ${availableCommands.map((command) => command.name).join(", ")}`,
+                );
                 notify(sessionId, { sessionUpdate: "available_commands_update", availableCommands });
             })
             .catch((error: unknown) => {
                 logWarn(`publishing commands failed: ${String(error)}`);
             });
     };
+
+    ctx.on("commands/change", () => {
+        logDebug(`commands/change: ${sessions.size} live ACP session(s)`);
+        for (const [sessionId, record] of sessions) publishCommands(sessionId, record);
+    });
 
     /** Push the current config-option surface (Zed re-renders its selectors). */
     const publishConfigOptions = (sessionId: string, record: SessionRecord): void => {
@@ -1559,6 +1578,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     capsMeta !== null && typeof capsMeta === "object"
                         ? capsMeta["subagent-transcript"] === true
                         : false;
+                clientInteractionMode = interactionModeFromClientMeta(capsMeta);
                 clientElicitationForm =
                     params.clientCapabilities?.elicitation?.form !== undefined &&
                     params.clientCapabilities.elicitation.form !== null;
