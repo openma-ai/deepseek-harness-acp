@@ -193,6 +193,93 @@ describe("dsh-acp bundle overlays", () => {
     }, 90_000);
 });
 
+describe("dsh-acp live command catalogue", () => {
+    let client: AcpTestClient;
+    const roots: string[] = [];
+
+    afterAll(async () => {
+        await client?.close();
+        for (const root of roots) rmSync(root, { recursive: true, force: true });
+    });
+
+    it("republishes commands registered after session creation", async () => {
+        const sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-command-change-sessions-"));
+        const workspace = mkdtempSync(join(tmpdir(), "dsh-acp-command-change-workspace-"));
+        const bundle = mkdtempSync(join(tmpdir(), "dsh-acp-command-change-bundle-"));
+        const trigger = join(bundle, "register-late-command");
+        roots.push(sessionRoot, workspace, bundle);
+        writeFileSync(join(bundle, "package.json"), JSON.stringify({
+            name: "dsh-acp-test-command-change",
+            type: "module",
+            main: "./index.js",
+            dsh: { bundle: { patch: "./cordis.patch.yml" } },
+        }));
+        writeFileSync(join(bundle, "cordis.patch.yml"), JSON.stringify([{
+            insert: [{
+                id: "dsh-acp-test-command-change",
+                name: "dsh-acp-test-command-change",
+                config: { trigger },
+            }],
+        }]));
+        writeFileSync(join(bundle, "index.js"), [
+            "import { existsSync } from 'node:fs'",
+            "export const inject = ['agents']",
+            "export function apply(ctx, config) {",
+            "  const timers = new Set()",
+            "  ctx.on('agent/created', ({ agent }) => {",
+            "    const timer = setInterval(() => {",
+            "      if (!existsSync(config.trigger)) return",
+            "      clearInterval(timer)",
+            "      timers.delete(timer)",
+            "      agent.ctx.inject(['commands'], commandCtx => commandCtx.commands.register({",
+            "        name: 'late-fixture-command',",
+            "        description: 'Registered after the ACP session snapshot',",
+            "        handler: () => ({ kind: 'success', text: 'late command ready' }),",
+            "      }))",
+            "    }, 20)",
+            "    timers.add(timer)",
+            "  })",
+            "  ctx.effect(() => () => { for (const timer of timers) clearInterval(timer) })",
+            "}",
+        ].join("\n"));
+
+        client = new AcpTestClient(
+            sessionRoot,
+            workspace,
+            undefined,
+            undefined,
+            ["--bundle", bundle],
+        );
+        await client.request("initialize", { protocolVersion: 1 }, 60_000);
+        const created = await client.request("session/new", { cwd: workspace, mcpServers: [] }) as {
+            sessionId: string;
+        };
+
+        let initialNames: string[] = [];
+        for (let attempt = 0; attempt < 80; attempt += 1) {
+            const update = [...client.updatesFor(created.sessionId)]
+                .reverse()
+                .find((entry) => entry["sessionUpdate"] === "available_commands_update");
+            initialNames = ((update?.["availableCommands"] ?? []) as Array<{ name: string }>).map(({ name }) => name);
+            if (initialNames.length > 0) break;
+            await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        expect(initialNames).not.toContain("late-fixture-command");
+
+        writeFileSync(trigger, "register");
+        let liveNames = initialNames;
+        for (let attempt = 0; attempt < 120; attempt += 1) {
+            const update = [...client.updatesFor(created.sessionId)]
+                .reverse()
+                .find((entry) => entry["sessionUpdate"] === "available_commands_update");
+            liveNames = ((update?.["availableCommands"] ?? []) as Array<{ name: string }>).map(({ name }) => name);
+            if (liveNames.includes("late-fixture-command")) break;
+            await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        expect(liveNames).toContain("late-fixture-command");
+    }, 90_000);
+});
+
 describe("dsh-acp server (e2e smoke)", () => {
     let client: AcpTestClient;
     let sessionRoot: string;
