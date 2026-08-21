@@ -13,7 +13,7 @@ describe("ACP package manifest", () => {
             zod: "^4.4.3",
         });
         expect(manifest.peerDependencies).toEqual({
-            "@deepseek-ai/dsh": "^0.1.0-rc.6",
+            "@deepseek-ai/dsh": "^0.1.0-rc.6 || ^0.1.1-rc.1",
         });
     });
 });
