@@ -199,6 +199,8 @@ interface SessionRecord {
     preset?: string;
     cancelled: boolean;
     inflight: Inflight | undefined;
+    /** Serializes agent rebuilds requested concurrently by ACP clients. */
+    mutationTail: Promise<void>;
 }
 
 function invalidParams(detail: string): RequestError {
@@ -555,6 +557,13 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         }
         // Approval policy is agent-scoped state; re-apply it to the new agent.
         setApprovalPolicy(record, record.approvals);
+    };
+
+    /** Run one agent-rebuilding mutation after earlier mutations for this session. */
+    const mutateSession = (record: SessionRecord, mutation: () => Promise<void>): Promise<void> => {
+        const run = record.mutationTail.then(mutation);
+        record.mutationTail = run.catch(() => undefined);
+        return run;
     };
 
     /**
@@ -1395,7 +1404,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         }
         const target = matches[0] as { value: string; label: string };
         if (target.value === currentValue) return `already on ${target.label}`;
-        await switchModel(record, acpSessionId, target.value);
+        await mutateSession(record, () => switchModel(record, acpSessionId, target.value));
         publishCommands(acpSessionId, record);
         publishConfigOptions(acpSessionId, record);
         return `model → ${target.label}`;
@@ -1446,6 +1455,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             approvals: modeId === "danger-full-access" ? "never" : "ask",
             cancelled: false,
             inflight: undefined,
+            mutationTail: Promise.resolve(),
         };
         sessions.set(sessionId, record);
         watchSubagentParent(agent);
@@ -1899,7 +1909,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     }
                     case "agent":
                     case "preset": {
-                        await switchPreset(record, params.sessionId, value);
+                        await mutateSession(record, () => switchPreset(record, params.sessionId, value));
                         break;
                     }
                     case "effort": {
@@ -1940,7 +1950,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                         break;
                     }
                     case "model": {
-                        await switchModel(record, params.sessionId, value);
+                        await mutateSession(record, () => switchModel(record, params.sessionId, value));
                         break;
                     }
                     default:

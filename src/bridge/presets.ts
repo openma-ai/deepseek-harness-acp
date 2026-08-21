@@ -40,14 +40,21 @@ export interface AgentConfigOption {
     options: PresetSelectChoice[] | PresetSelectGroup[];
 }
 
+const BUILT_IN_PRESET_NAMES: Readonly<Record<string, string>> = {
+    standard: "Standard",
+    code: "Code",
+    minimal: "Minimal",
+    cordis: "Creator",
+};
+
 /**
  * Display name for one roster row: the row's own name, else the id.
  * @param preset - roster row.
  * @returns chip / dropdown label.
  */
 export function presetDisplayName(preset: PresetRow): string {
-    if (preset.id === "cordis") return "Creator";
-    if (preset.id === "code") return "Code";
+    const builtInName = BUILT_IN_PRESET_NAMES[preset.id];
+    if (builtInName !== undefined) return builtInName;
     const name = preset.name?.trim();
     return name !== undefined && name.length > 0 ? name : preset.id;
 }
