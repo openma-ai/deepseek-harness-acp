@@ -21,21 +21,32 @@ const roster: PresetRow[] = [
 ];
 
 describe("agent config option copy", () => {
-    it("advertises the code preset as locale-neutral Code instead of the internal PTC name", () => {
+    it("advertises the four built-in presets with their fixed English product names", () => {
         const option = agentConfigOption(
             [
                 { id: "standard", name: "标准模式" },
                 { id: "code", name: "PTC 模式" },
+                { id: "minimal", name: "极简模式" },
+                { id: "cordis", name: "Cordis" },
             ],
             "code",
         );
 
-        expect(option?.options[1]).toEqual({ value: "code", name: "Code" });
+        expect(option?.options).toEqual([
+            { value: "standard", name: "Standard" },
+            { value: "code", name: "Code" },
+            { value: "minimal", name: "Minimal" },
+            { value: "cordis", name: "Creator" },
+        ]);
     });
 
     it("uses the row name, broken reason, and groups system vs user", () => {
         expect(presetDisplayName({ id: "cordis" })).toBe("Creator");
-        expect(presetDisplayName({ id: "cordis", name: "Cordis" })).toBe("Creator");
+        expect(presetDisplayName({ id: "cordis", name: "创造模式" })).toBe("Creator");
+        expect(presetDisplayName({ id: "reviewer", name: "Code Reviewer", trust: "user" })).toBe(
+            "Code Reviewer",
+        );
+        expect(presetDisplayName({ id: "reviewer", name: "  ", trust: "user" })).toBe("reviewer");
         expect(presetDescription({ id: "x", description: "hello" })).toBe("hello");
         expect(presetDescription({ id: "x", broken: "no yaml", description: "hello" })).toBe(
             "Broken: no yaml",

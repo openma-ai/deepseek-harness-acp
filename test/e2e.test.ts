@@ -279,6 +279,40 @@ describe("dsh-acp server (e2e smoke)", () => {
         );
     }, 60_000);
 
+    it("keeps a new session registered while Zed applies config defaults concurrently", async () => {
+        const created = (await client.request("session/new", {
+            cwd: workspace,
+            mcpServers: [],
+        })) as Record<string, unknown>;
+        const createdSessionId = created["sessionId"];
+
+        const defaults = Promise.all([
+            client.request("session/set_config_option", {
+                sessionId: createdSessionId,
+                configId: "agent",
+                value: "code",
+            }),
+            client.request("session/set_config_option", {
+                sessionId: createdSessionId,
+                configId: "model",
+                value: "deepseek-v4-pro",
+            }),
+        ]);
+
+        await expect(defaults).resolves.toEqual([expect.any(Object), expect.any(Object)]);
+        await expect(client.request("session/prompt", {
+            sessionId: createdSessionId,
+            prompt: [{ type: "text", text: "/status" }],
+        })).resolves.toMatchObject({ stopReason: "end_turn" });
+        const status = client.updatesFor(String(createdSessionId)).find(
+            (update) =>
+                update["sessionUpdate"] === "agent_message_chunk" &&
+                (update["content"] as { text?: string } | undefined)?.text?.includes("**dsh-acp**"),
+        );
+        expect((status?.["content"] as { text: string }).text).toContain("| Preset | code |");
+        expect((status?.["content"] as { text: string }).text).toContain("| Model | deepseek-v4-pro |");
+    }, 60_000);
+
     it("accepts mcpServers, tolerating dead servers and unknown transports", async () => {
         // failOnStartupError is off: a server that cannot start must not take
         // the session down, and an unsupported transport is skipped. The name
