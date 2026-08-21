@@ -256,6 +256,24 @@ describe.skipIf(process.platform === "win32")("ACP package installation", () => 
         expect(`${installed.stdout}\n${installed.stderr}`).toMatch(/ERESOLVE|conflicting peer dependency/i);
     }, INSTALL_TIMEOUT_MS);
 
+    it("accepts the current 0.1.1 prerelease host under strict peer resolution", () => {
+        const prefix = mkdtempSync(join(tmpdir(), "dsh-acp-current-prefix-"));
+        roots.push(prefix);
+        const installed = run("npm", [
+            "install",
+            "--prefix",
+            prefix,
+            "--ignore-scripts",
+            "--no-audit",
+            "--no-fund",
+            "--strict-peer-deps",
+            "@deepseek-ai/dsh@0.1.1-rc.2",
+            `file:${tarball}`,
+        ]);
+
+        expect(installed.status, `${installed.stdout}\n${installed.stderr}`).toBe(0);
+    }, INSTALL_TIMEOUT_MS);
+
     it("serves ACP after installation into a dsh profile", async () => {
         const home = mkdtempSync(join(tmpdir(), "dsh-acp-profile-runtime-"));
         roots.push(home);
