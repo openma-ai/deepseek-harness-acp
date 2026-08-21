@@ -9,7 +9,20 @@ on:
     tags: ["v*"]
 
 jobs:
+  verify-tag:
+    name: verify tag is on main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Fetch main
+        run: git fetch --no-tags origin main:refs/remotes/origin/main
+      - name: Verify release tag commit is on main
+        run: bash scripts/verify-release-tag.sh "$GITHUB_SHA" origin/main
+
   test:
+    needs: verify-tag
     name: test (${{ matrix.os }}, node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
     strategy:
