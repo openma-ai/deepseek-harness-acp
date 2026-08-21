@@ -4,19 +4,17 @@ import { parse } from "yaml";
 import { describe, expect, it } from "vitest";
 
 interface Workflow {
-    jobs?: {
-        "verify-tag"?: {
-            steps?: Array<{ run?: string }>;
-        };
-        test?: {
-            needs?: unknown;
-            strategy?: {
-                matrix?: {
-                    os?: unknown;
-                };
+    jobs?: Record<string, {
+        needs?: unknown;
+        "timeout-minutes"?: number;
+        strategy?: {
+            matrix?: {
+                os?: unknown;
+                include?: Array<{ id?: string; pattern?: string }>;
             };
         };
-    };
+        steps?: Array<{ run?: string }>;
+    }>;
 }
 
 function readWorkflow(workflow: string): Workflow {
@@ -25,7 +23,7 @@ function readWorkflow(workflow: string): Workflow {
 }
 
 function testRunners(workflow: string): unknown {
-    return readWorkflow(workflow).jobs?.test?.strategy?.matrix?.os;
+    return readWorkflow(workflow).jobs?.["test"]?.strategy?.matrix?.os;
 }
 
 describe("supported CI architectures", () => {
@@ -34,12 +32,42 @@ describe("supported CI architectures", () => {
     });
 });
 
+describe("package installation gates", () => {
+    it.each(["ci.yml", "release.yml"])(
+        "runs %s package boundaries as independent timeout shards",
+        (workflow) => {
+            const jobs = readWorkflow(workflow).jobs;
+            const install = jobs?.["package-install"];
+            const cases = install?.strategy?.matrix?.include;
+            const commands = install?.steps?.flatMap((step) => step.run ?? []);
+            const regularTestCommands = jobs?.["test"]?.steps?.flatMap((step) => step.run ?? []);
+
+            expect(install?.["timeout-minutes"]).toBe(25);
+            expect(cases?.map((entry) => entry.id)).toEqual([
+                "standalone",
+                "rc7-profile",
+                "current-prerelease",
+                "remaining",
+            ]);
+            expect(commands).toContain('npm run test:install -- -t "${{ matrix.pattern }}"');
+            expect(regularTestCommands).not.toContain("npm run test:install");
+        },
+    );
+
+    it("keeps every release package shard ahead of publish", () => {
+        const jobs = readWorkflow("release.yml").jobs;
+
+        expect(jobs?.["package-install"]?.needs).toBe("verify-tag");
+        expect(jobs?.["publish"]?.needs).toContain("package-install");
+    });
+});
+
 describe("release provenance", () => {
     it("gates release tests on verifying that the tag commit belongs to main", () => {
         const jobs = readWorkflow("release.yml").jobs;
         const guardCommands = jobs?.["verify-tag"]?.steps?.flatMap((step) => step.run ?? []);
 
-        expect(jobs?.test?.needs).toBe("verify-tag");
+        expect(jobs?.["test"]?.needs).toBe("verify-tag");
         expect(guardCommands).toContain(
             'bash scripts/verify-release-tag.sh "$GITHUB_SHA" origin/main',
         );

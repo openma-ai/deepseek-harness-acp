@@ -10,7 +10,7 @@ let toolBin = "";
 // npm 11 can spend several minutes resolving the older dsh peer graph on a
 // cold runner. Keep a finite ceiling, but do not turn resolver speed into a
 // package-compatibility failure.
-const INSTALL_TIMEOUT_MS = 900_000;
+const INSTALL_TIMEOUT_MS = 1_200_000;
 
 function run(command: string, args: string[], env?: NodeJS.ProcessEnv, input?: string) {
     return spawnSync(command, args, {

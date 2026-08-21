@@ -42,9 +42,33 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+
+  package-install:
+    needs: verify-tag
+    name: package install (${{ matrix.id }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: standalone
+            pattern: serves standalone from one complete dsh peer host
+          - id: rc7-profile
+            pattern: serves as a profile plugin on a coherent rc[.]7 host
+          - id: current-prerelease
+            pattern: accepts the current 0[.]1[.]1 prerelease host under strict peer resolution
+          - id: remaining
+            pattern: keeps an rc[.]6 profile coherent|is idempotent when the same ACP bundle is added to a profile twice|rejects an explicitly incompatible standalone host under strict peer resolution|serves ACP after installation into a dsh profile
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
       - name: Test package and profile installation
-        if: matrix.os == 'ubuntu-latest' && matrix.node == 24
-        run: npm run test:install
+        run: npm run test:install -- -t "${{ matrix.pattern }}"
 
   dsh-compatibility:
     needs: verify-tag
@@ -70,7 +94,7 @@ jobs:
           DSH_ACP_TEST_HOST: ${{ runner.temp }}/dsh-host
 
   publish:
-    needs: [test, dsh-compatibility]
+    needs: [test, package-install, dsh-compatibility]
     runs-on: ubuntu-latest
     permissions:
       id-token: write # npm OIDC trusted publishing
