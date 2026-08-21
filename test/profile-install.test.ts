@@ -86,6 +86,8 @@ describe.skipIf(process.platform === "win32")("ACP package installation", () => 
             '#!/bin/sh\nexec npx --yes pnpm@10.34.5 "$@"\n',
             { mode: 0o755 },
         );
+        const built = run("npm", ["run", "build"]);
+        expect(built.status, `${built.stdout}\n${built.stderr}`).toBe(0);
         const packDir = mkdtempSync(join(tmpdir(), "dsh-acp-profile-pack-"));
         roots.push(packDir);
         const packed = run("npm", ["pack", "--ignore-scripts", "--pack-destination", packDir]);
