@@ -44,7 +44,7 @@ const BUILT_IN_PRESET_NAMES: Readonly<Record<string, string>> = {
     standard: "Standard",
     code: "Code",
     minimal: "Minimal",
-    cordis: "Creator",
+    cordis: "Cordis",
 };
 
 /**
