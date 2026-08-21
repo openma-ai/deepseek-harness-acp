@@ -42,9 +42,35 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - name: Test package and profile installation
+        if: matrix.os == 'ubuntu-latest' && matrix.node == 24
+        run: npm run test:install
+
+  dsh-compatibility:
+    needs: verify-tag
+    name: dsh compatibility (${{ matrix.dsh }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dsh: [0.1.1-rc.1, latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Install dsh compatibility host
+        run: npm install --prefix "${{ runner.temp }}/dsh-host" --ignore-scripts --no-audit --no-fund "@deepseek-ai/dsh@${{ matrix.dsh }}"
+      - name: Exercise session controls through the host
+        run: npm run test:host
+        env:
+          DSH_ACP_TEST_HOST: ${{ runner.temp }}/dsh-host
 
   publish:
-    needs: test
+    needs: [test, dsh-compatibility]
     runs-on: ubuntu-latest
     permissions:
       id-token: write # npm OIDC trusted publishing

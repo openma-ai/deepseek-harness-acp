@@ -97,8 +97,21 @@
   disabled: true
 
 - insert:
-    # The same complete Cordis plugin embedded by other surfaces. It owns the
-    # preset plane and transport-independent ACP server, but no transport.
+    # Host-plane services must be loaded by the profile include so they come
+    # from the same dsh installation as AgentLoop and dsh-scope.  Loading
+    # either one from the ACP package's development dependency tree would mix
+    # scope identities when --dsh-path points at a newer standalone host.
+    - id: agent-presets
+      name: '@deepseek-ai/dsh-agent-presets'
+      config:
+        default: standard
+
+    - id: cordis-host-runner
+      name: '@deepseek-ai/dsh-cordis-host-runner'
+
+    # ACP's surface service owns its bridge/session server, but no transport.
+    # The host-service rows above close this profile without borrowing another
+    # profile or relying on a development node_modules tree.
     - id: acp-plugin
       name: '@openma/deepseek-harness-acp/plugin'
       config:

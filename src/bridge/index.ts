@@ -289,6 +289,18 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         }
         return undefined;
     };
+    const executeCommand = (
+        agent: Agent,
+        line: string,
+        signal: AbortSignal,
+    ): ReturnType<typeof commandRuntime.execute> => {
+        const execute = commandRuntime.execute as unknown as (...args: unknown[]) => ReturnType<
+            typeof commandRuntime.execute
+        >;
+        return execute.length >= 4
+            ? execute.call(commandRuntime, agent, line, [], signal)
+            : execute.call(commandRuntime, agent, line, signal);
+    };
     await ctx.plugin(tuiClientPlugin, { rpc, findAgent, advertisement: tuiClient });
 
     const modelCandidates = (): string[] => {
@@ -994,7 +1006,12 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         names: string[];
         resolve(name: string): { sandbox: SandboxMode; approval: ApprovalPolicy; name: string; description: string };
         current(events: readonly unknown[]): string | undefined;
-        apply(session: unknown, name: string, setApproval: (policy: ApprovalPolicy) => void): void;
+        apply(
+            session: unknown,
+            name: string,
+            setApproval: (policy: ApprovalPolicy) => void,
+            origin?: string,
+        ): void;
     }
 
     const permissionService = (): PermissionPresetsService =>
@@ -1007,9 +1024,14 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             // fact, applies the sandbox, and writes the bundled approval
             // policy through the live agent.
             let bundledApproval: ApprovalPolicy = record.approvals;
-            permission.apply(record.agent.session, modeId, (policy) => {
-                bundledApproval = policy;
-            });
+            permission.apply(
+                record.agent.session,
+                modeId,
+                (policy) => {
+                    bundledApproval = policy;
+                },
+                "selection",
+            );
             setApprovalPolicy(record, bundledApproval);
             record.modeId = permission.resolve(modeId).sandbox;
             notify(sessionId, { sessionUpdate: "current_mode_update", currentModeId: modeId });
@@ -1818,7 +1840,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     // and is claimed inside the agent's next step.
                     let execution;
                     try {
-                        execution = await commandRuntime.execute(
+                        execution = await executeCommand(
                             record.agent,
                             trimmed,
                             new AbortController().signal,
@@ -1956,7 +1978,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                         if (value !== "default" && value !== "plan") {
                             throw invalidParams(`unknown collaboration mode: ${value}`);
                         }
-                        const execution = await commandRuntime.execute(
+                        const execution = await executeCommand(
                             record.agent,
                             value === "plan" ? "/plan" : "/plan off",
                             new AbortController().signal,

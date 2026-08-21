@@ -670,16 +670,47 @@ describe.skipIf(HOST_TREE === undefined)("dsh-acp against a standalone host inst
         rmSync(workspace, { recursive: true, force: true });
     });
 
-    it("boots from the host tree and serves a session", async () => {
+    it("serves session controls through the host tree", async () => {
         const init = (await client.request("initialize", { protocolVersion: 1 })) as Record<string, unknown>;
         expect(init["agentInfo"]).toMatchObject({ name: "dsh-acp" });
         const created = (await client.request("session/new", { cwd: workspace, mcpServers: [] })) as Record<
             string,
             unknown
         >;
-        expect(created["sessionId"]).toBeTruthy();
+        const hostSessionId = created["sessionId"] as string;
+        expect(hostSessionId).toBeTruthy();
+
+        await expect(
+            client.request("session/set_mode", { sessionId: hostSessionId, modeId: "read-only" }),
+        ).resolves.toEqual({});
+
+        const plan = (await client.request("session/set_config_option", {
+            sessionId: hostSessionId,
+            configId: "collaboration_mode",
+            value: "plan",
+        })) as Record<string, unknown>;
+        const planById = new Map(
+            (plan["configOptions"] as Array<Record<string, unknown>>).map((option) => [option["id"], option]),
+        );
+        expect(planById.get("collaboration_mode")).toMatchObject({ currentValue: "plan" });
+
+        const updateStart = client.updatesFor(hostSessionId).length;
+        const compact = (await client.request("session/prompt", {
+            sessionId: hostSessionId,
+            prompt: [{ type: "text", text: "/compact" }],
+        })) as Record<string, unknown>;
+        expect(compact["stopReason"]).toBe("end_turn");
+        const compactText = client
+            .updatesFor(hostSessionId)
+            .slice(updateStart)
+            .filter((update) => update["sessionUpdate"] === "agent_message_chunk")
+            .map((update) => (update["content"] as { text?: string } | undefined)?.text ?? "")
+            .join("");
+        expect(compactText).toMatch(/No compactable history|compact/i);
+        expect(compactText).not.toContain("failed:");
+
         const status = (await client.request("session/prompt", {
-            sessionId: created["sessionId"],
+            sessionId: hostSessionId,
             prompt: [{ type: "text", text: "/status" }],
         })) as Record<string, unknown>;
         expect(status["stopReason"]).toBe("end_turn");

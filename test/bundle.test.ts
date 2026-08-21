@@ -13,15 +13,25 @@ describe('profile bridge transport', () => {
             .toBe(join(import.meta.dirname, '../dist/server.js'))
     })
 
-    it('composes the complete ACP plugin before the stdio transport adapter', () => {
+    it('closes the ACP profile host services before its surface and transport', () => {
         const patch = loadOverlayPatches(
             'dsh-acp-test',
             join(import.meta.dirname, '../cordis.patch.yml'),
         )
         const rows = composeEntries([patch])
+        const agentPresets = rows.find((row) => row.id === 'agent-presets')
+        const hostRunner = rows.find((row) => row.id === 'cordis-host-runner')
         const server = rows.find((row) => row.id === 'acp-plugin')
         const stdio = rows.find((row) => row.id === 'acp-bridge')
 
+        expect(agentPresets).toMatchObject({
+            id: 'agent-presets',
+            name: '@deepseek-ai/dsh-agent-presets',
+        })
+        expect(hostRunner).toMatchObject({
+            id: 'cordis-host-runner',
+            name: '@deepseek-ai/dsh-cordis-host-runner',
+        })
         expect(server).toMatchObject({
             id: 'acp-plugin',
             name: '@openma/deepseek-harness-acp/plugin',
@@ -30,6 +40,8 @@ describe('profile bridge transport', () => {
             id: 'acp-bridge',
             name: '@openma/deepseek-harness-acp/stdio',
         })
+        expect(rows.indexOf(agentPresets as never)).toBeLessThan(rows.indexOf(server as never))
+        expect(rows.indexOf(hostRunner as never)).toBeLessThan(rows.indexOf(server as never))
         expect(rows.indexOf(server as never)).toBeLessThan(rows.indexOf(stdio as never))
     })
 

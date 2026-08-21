@@ -7,6 +7,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 const roots: string[] = [];
 let tarball = "";
 let toolBin = "";
+// npm 11 can spend several minutes resolving the older dsh peer graph on a
+// cold runner. Keep a finite ceiling, but do not turn resolver speed into a
+// package-compatibility failure.
+const INSTALL_TIMEOUT_MS = 900_000;
 
 function run(command: string, args: string[], env?: NodeJS.ProcessEnv, input?: string) {
     return spawnSync(command, args, {
@@ -22,7 +26,7 @@ function run(command: string, args: string[], env?: NodeJS.ProcessEnv, input?: s
         },
         input,
         encoding: "utf8",
-        timeout: 180_000,
+        timeout: INSTALL_TIMEOUT_MS,
     });
 }
 
@@ -92,7 +96,7 @@ describe.skipIf(process.platform === "win32")("ACP package installation", () => 
 
     afterAll(() => {
         for (const root of roots) rmSync(root, { recursive: true, force: true });
-    }, 180_000);
+    }, INSTALL_TIMEOUT_MS);
 
     it("serves standalone from one complete dsh peer host", async () => {
         const prefix = mkdtempSync(join(tmpdir(), "dsh-acp-standalone-prefix-"));
@@ -131,7 +135,7 @@ describe.skipIf(process.platform === "win32")("ACP package installation", () => 
             id: 1,
             result: { agentInfo: { name: "dsh-acp" } },
         });
-    }, 180_000);
+    }, INSTALL_TIMEOUT_MS);
 
     it("keeps an rc.6 profile coherent instead of mixing rc.7 internals", () => {
         const home = mkdtempSync(join(tmpdir(), "dsh-acp-profile-home-"));
@@ -164,7 +168,7 @@ describe.skipIf(process.platform === "win32")("ACP package installation", () => 
             ? readdirSync(join(profileDir, "node_modules/@deepseek-ai")).filter((name) => name.startsWith("dsh-"))
             : [];
         expect(privateDshPackages).toEqual([]);
-    }, 120_000);
+    }, INSTALL_TIMEOUT_MS);
 
     it("is idempotent when the same ACP bundle is added to a profile twice", () => {
         const home = mkdtempSync(join(tmpdir(), "dsh-acp-profile-twice-"));
@@ -193,7 +197,7 @@ describe.skipIf(process.platform === "win32")("ACP package installation", () => 
         expect(
             manifest.dsh?.profile?.bundles?.filter((name) => name === "@openma/deepseek-harness-acp"),
         ).toHaveLength(1);
-    }, 120_000);
+    }, INSTALL_TIMEOUT_MS);
 
     it("serves as a profile plugin on a coherent rc.7 host", async () => {
         const prefix = mkdtempSync(join(tmpdir(), "dsh-acp-rc7-prefix-"));
@@ -231,7 +235,7 @@ describe.skipIf(process.platform === "win32")("ACP package installation", () => 
             id: 1,
             result: { agentInfo: { name: "dsh-acp" } },
         });
-    }, 180_000);
+    }, INSTALL_TIMEOUT_MS);
 
     it("rejects an explicitly incompatible standalone host under strict peer resolution", () => {
         const prefix = mkdtempSync(join(tmpdir(), "dsh-acp-incompatible-prefix-"));
@@ -250,7 +254,7 @@ describe.skipIf(process.platform === "win32")("ACP package installation", () => 
 
         expect(installed.status).not.toBe(0);
         expect(`${installed.stdout}\n${installed.stderr}`).toMatch(/ERESOLVE|conflicting peer dependency/i);
-    }, 120_000);
+    }, INSTALL_TIMEOUT_MS);
 
     it("serves ACP after installation into a dsh profile", async () => {
         const home = mkdtempSync(join(tmpdir(), "dsh-acp-profile-runtime-"));
@@ -279,5 +283,5 @@ describe.skipIf(process.platform === "win32")("ACP package installation", () => 
             id: 1,
             result: { agentInfo: { name: "dsh-acp" } },
         });
-    }, 120_000);
+    }, INSTALL_TIMEOUT_MS);
 });

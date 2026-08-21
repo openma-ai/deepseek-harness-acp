@@ -36,6 +36,7 @@
     "start": "node --import tsx src/index.ts",
     "pretest": "npm run build",
     "test": "vitest run --exclude test/profile-install.test.ts",
+    "test:host": "vitest run test/e2e.test.ts -t \"serves session controls through the host tree\"",
     "test:install": "vitest run test/profile-install.test.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
