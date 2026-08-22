@@ -12,6 +12,7 @@
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import type { Context } from "@deepseek-ai/cordis";
 
@@ -21,6 +22,18 @@ import type { Config } from "./server.ts";
 
 export const name = "dsh-acp-plugin";
 export const inject = [...new Set([...bridge.inject.filter((service) => service !== "agentPresets"), "loader"])];
+
+function resolvedHostModule(ctx: Context, specifier: string): string {
+    const anchors = [ctx.baseUrl, import.meta.url].filter((value): value is string => typeof value === "string");
+    for (const anchor of anchors) {
+        try {
+            return pathToFileURL(createRequire(anchor).resolve(specifier)).href;
+        } catch {
+            // Try the next resolution anchor.
+        }
+    }
+    return specifier;
+}
 
 function shippedPresetRoot(ctx: Context): string {
     const anchors = [ctx.baseUrl, import.meta.url].filter((value): value is string => typeof value === "string");
@@ -43,7 +56,7 @@ async function mountService(
     config?: unknown,
 ): Promise<void> {
     if (ctx.get(service) !== undefined) return;
-    const exports = await ctx.loader.import(specifier);
+    const exports = await ctx.loader.import(resolvedHostModule(ctx, specifier));
     const plugin = ctx.loader.unwrapExports(exports);
     await ctx.plugin(plugin, config);
     if (ctx.get(service) === undefined) {

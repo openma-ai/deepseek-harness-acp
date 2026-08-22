@@ -30,6 +30,10 @@ describe("supported CI architectures", () => {
     it.each(["ci.yml", "release.yml"])("runs %s tests on native Linux ARM64", (workflow) => {
         expect(testRunners(workflow)).toContain("ubuntu-24.04-arm");
     });
+
+    it.each(["ci.yml", "release.yml"])("runs %s tests on Windows", (workflow) => {
+        expect(testRunners(workflow)).toContain("windows-latest");
+    });
 });
 
 describe("package installation gates", () => {
