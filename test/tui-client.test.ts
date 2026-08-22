@@ -69,6 +69,62 @@ describe("TUI Client ACP extras", () => {
         expect(outbound).toContainEqual({ jsonrpc: "2.0", id: 8, result: plugins });
     });
 
+    it("projects the Loader inventory with the same read-only shape as Web", async () => {
+        const ctx = fakeCtx({
+            loader: {
+                *entries() {
+                    yield {
+                        id: "root/include",
+                        options: { name: "include" },
+                        disabled: false,
+                        fiber: { state: 2 },
+                    };
+                    yield {
+                        id: "root/group",
+                        options: { name: "group", group: true },
+                        disabled: false,
+                    };
+                    yield {
+                        id: "root/hmr",
+                        options: { name: "hmr" },
+                        disabled: true,
+                        fiber: undefined,
+                    };
+                },
+            },
+        });
+        const rpc = new AcpRpc();
+        const outbound: unknown[] = [];
+        rpc.attachWriter((value) => outbound.push(value));
+        installTuiClientPlane(ctx as never, rpc, {
+            findAgent: () => undefined,
+            advertisement: { advertised: true },
+        });
+
+        await rpc.dispatch(81, "_dsh/plugins/list", {});
+
+        expect(outbound).toContainEqual({
+            jsonrpc: "2.0",
+            id: 81,
+            result: {
+                entries: [
+                    {
+                        entryId: "root/include",
+                        moduleName: "include",
+                        enabled: true,
+                        fiberPhase: "active",
+                    },
+                    {
+                        entryId: "root/hmr",
+                        moduleName: "hmr",
+                        enabled: false,
+                        fiberPhase: null,
+                    },
+                ],
+            },
+        });
+    });
+
     it("stops a dynamic plugin through the Host panel lifecycle", async () => {
         const stopped: unknown[] = [];
         const agent = { id: "agent-1" } as Agent;

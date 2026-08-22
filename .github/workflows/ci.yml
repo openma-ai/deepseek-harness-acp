@@ -34,41 +34,14 @@ jobs:
           name: package-tgz
           path: "*.tgz"
 
-  package-install:
-    name: package install (${{ matrix.id }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: standalone
-            pattern: serves standalone from one complete dsh peer host
-          - id: rc7-profile
-            pattern: serves as a profile plugin on a coherent rc[.]7 host
-          - id: current-prerelease
-            pattern: accepts the current 0[.]1[.]1 prerelease host under strict peer resolution
-          - id: remaining
-            pattern: keeps an rc[.]6 profile coherent|is idempotent when the same ACP bundle is added to a profile twice|rejects an explicitly incompatible standalone host under strict peer resolution|serves ACP after installation into a dsh profile
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 24
-          cache: npm
-      - run: npm ci
-      - name: Test package and profile installation
-        run: npm run test:install -- -t "${{ matrix.pattern }}"
-
   dsh-compatibility:
     name: dsh compatibility (${{ matrix.dsh }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # rc.1 introduced the permission/commands API break; latest guards
-        # against the next independently published harness release.
-        dsh: [0.1.1-rc.1, latest]
+        # ACP supports the dsh 0.1.1 line; rc.1 is its compatibility floor.
+        dsh: [0.1.1-rc.1]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5

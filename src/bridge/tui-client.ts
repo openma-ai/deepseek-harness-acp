@@ -61,6 +61,19 @@ interface DynamicPluginInspection {
     [key: string]: unknown;
 }
 
+interface LoaderEntry {
+    id: string;
+    options: { name: string; group?: unknown };
+    disabled: boolean;
+    fiber?: { state: number };
+}
+
+interface PluginLoader {
+    entries(): Iterable<LoaderEntry>;
+}
+
+const FIBER_PHASE = ["pending", "loading", "active", "failed", null, "unloading"] as const;
+
 /** Negotiated Client support from `initialize` `_meta.dsh.cordis`. */
 export interface TuiClientAdvertisement {
     /** True only when the Client advertised the matching Cordis protocol. */
@@ -83,6 +96,28 @@ export function installTuiClientPlane(
     },
 ): void {
     const { findAgent, advertisement } = opts;
+
+    ctx.effect(
+        () =>
+            rpc.registerMethod(CORDIS_METHODS.pluginsStaticList, () => {
+                const loader = optionalLoader(ctx);
+                if (loader === undefined) throw new Error("this agent has no plugin Loader");
+                const entries = [];
+                for (const entry of loader.entries()) {
+                    if (entry.options.group) continue;
+                    entries.push({
+                        entryId: entry.id,
+                        moduleName: entry.options.name,
+                        enabled: !entry.disabled,
+                        fiberPhase: entry.fiber === undefined
+                            ? null
+                            : (FIBER_PHASE[entry.fiber.state] ?? null),
+                    });
+                }
+                return { entries };
+            }),
+        "acp-bridge: list-static-plugins",
+    );
 
     ctx.effect(
         () =>
@@ -300,6 +335,15 @@ function optionalInspect(ctx: Context): InspectRegistry | undefined {
             : undefined;
     } catch {
         // Optional: compositions without cordis-host-runner have no Client directory.
+        return undefined;
+    }
+}
+
+function optionalLoader(ctx: Context): PluginLoader | undefined {
+    try {
+        const value = ctx.get("loader") as PluginLoader | undefined;
+        return value !== undefined && typeof value.entries === "function" ? value : undefined;
+    } catch {
         return undefined;
     }
 }

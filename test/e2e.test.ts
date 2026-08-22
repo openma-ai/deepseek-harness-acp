@@ -9,7 +9,7 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -43,6 +43,9 @@ class AcpTestClient {
             DSH_SESSION_ROOT: sessionRoot,
             DSH_HOME: join(sessionRoot, "home"),
             DSH_ACP_WORKSPACE: workspace,
+            // Host-default tests must not inherit the developer shell's
+            // explicit per-process override.
+            DSH_PERMISSION_MODE: undefined,
             ...(dshPath !== undefined ? { DSH_PATH: dshPath } : {}),
             ...(envPatch ?? {}),
         };
@@ -280,6 +283,95 @@ describe("dsh-acp live command catalogue", () => {
     }, 90_000);
 });
 
+describe("dsh-acp Host-owned defaults", () => {
+    const roots: string[] = [];
+    const clients: AcpTestClient[] = [];
+
+    afterAll(async () => {
+        await Promise.all(clients.map((entry) => entry.close()));
+        for (const root of roots) rmSync(root, { recursive: true, force: true });
+    });
+
+    it("saves the selected model and effort as the default for later sessions", async () => {
+        const sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-default-model-sessions-"));
+        const workspace = mkdtempSync(join(tmpdir(), "dsh-acp-default-model-workspace-"));
+        roots.push(sessionRoot, workspace);
+        const client = new AcpTestClient(sessionRoot, workspace);
+        clients.push(client);
+
+        await client.request("initialize", { protocolVersion: 1 }, 60_000);
+        const first = (await client.request("session/new", {
+            cwd: workspace,
+            mcpServers: [],
+        })) as { sessionId: string };
+        await client.request("session/set_config_option", {
+            sessionId: first.sessionId,
+            configId: "model",
+            value: "deepseek-v4-pro",
+        });
+        await client.request("session/set_config_option", {
+            sessionId: first.sessionId,
+            configId: "effort",
+            value: "max",
+        });
+
+        const later = (await client.request("session/new", {
+            cwd: workspace,
+            mcpServers: [],
+        })) as { configOptions: Array<Record<string, unknown>> };
+        const options = new Map(later.configOptions.map((option) => [option["id"], option]));
+        expect(options.get("model")).toMatchObject({ currentValue: "deepseek-v4-pro" });
+        expect(options.get("effort")).toMatchObject({ currentValue: "max" });
+    }, 90_000);
+
+    it("starts a new session from the Host permission default", async () => {
+        const sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-default-permission-sessions-"));
+        const workspace = mkdtempSync(join(tmpdir(), "dsh-acp-default-permission-workspace-"));
+        roots.push(sessionRoot, workspace);
+        const harnessHome = join(sessionRoot, "home");
+        mkdirSync(harnessHome, { recursive: true });
+        writeFileSync(join(harnessHome, "settings.yaml"), "permission:\n  defaultPreset: read-only\n");
+        const client = new AcpTestClient(sessionRoot, workspace);
+        clients.push(client);
+
+        await client.request("initialize", { protocolVersion: 1 }, 60_000);
+        const created = (await client.request("session/new", {
+            cwd: workspace,
+            mcpServers: [],
+        })) as Record<string, unknown>;
+        expect(created["modes"]).toMatchObject({ currentModeId: "read-only" });
+        const options = new Map(
+            (created["configOptions"] as Array<Record<string, unknown>>)
+                .map((option) => [option["id"], option]),
+        );
+        expect(options.get("mode")).toMatchObject({ currentValue: "read-only" });
+    }, 90_000);
+
+    it("lets an explicit CLI permission override the Host default", async () => {
+        const sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-explicit-permission-sessions-"));
+        const workspace = mkdtempSync(join(tmpdir(), "dsh-acp-explicit-permission-workspace-"));
+        roots.push(sessionRoot, workspace);
+        const harnessHome = join(sessionRoot, "home");
+        mkdirSync(harnessHome, { recursive: true });
+        writeFileSync(join(harnessHome, "settings.yaml"), "permission:\n  defaultPreset: read-only\n");
+        const client = new AcpTestClient(
+            sessionRoot,
+            workspace,
+            undefined,
+            undefined,
+            ["--permission-mode", "danger-full-access"],
+        );
+        clients.push(client);
+
+        await client.request("initialize", { protocolVersion: 1 }, 60_000);
+        const created = (await client.request("session/new", {
+            cwd: workspace,
+            mcpServers: [],
+        })) as Record<string, unknown>;
+        expect(created["modes"]).toMatchObject({ currentModeId: "danger-full-access" });
+    }, 90_000);
+});
+
 describe("dsh-acp server (e2e smoke)", () => {
     let client: AcpTestClient;
     let sessionRoot: string;
@@ -430,7 +522,9 @@ describe("dsh-acp server (e2e smoke)", () => {
         expect(status).toBeDefined();
         const content = (status as { content: { text: string } }).content;
         expect(content.text).toContain("dsh-acp");
-        expect(content.text).toContain("deepseek-v4-flash");
+        // This session has no logged model request, so it follows the live
+        // product default saved by the earlier model selection, matching Web.
+        expect(content.text).toContain("deepseek-v4-pro");
         expect(content.text).toContain("workspace-write");
     }, 60_000);
 

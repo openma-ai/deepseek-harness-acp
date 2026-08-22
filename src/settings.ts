@@ -20,7 +20,7 @@ export interface Settings {
     /** Selectable model candidates (session config option). */
     models: string[];
     maxTokens: number | undefined;
-    permissionMode: SandboxMode;
+    permissionMode: SandboxMode | undefined;
     sessionRoot: string;
     persona: string;
     thinking: boolean;
@@ -118,10 +118,11 @@ export function resolveSettings(argv: string[]): Settings {
         .map((entry) => entry.trim())
         .filter((entry) => entry.length > 0);
 
-    const permissionModeRaw =
-        stringFlag(parsed, "permission-mode") ?? envString("DSH_PERMISSION_MODE") ?? "workspace-write";
-    const permissionMode = PERMISSION_MODES.find((candidate) => candidate === permissionModeRaw);
-    if (permissionMode === undefined) {
+    const permissionModeRaw = stringFlag(parsed, "permission-mode") ?? envString("DSH_PERMISSION_MODE");
+    const permissionMode = permissionModeRaw === undefined
+        ? undefined
+        : PERMISSION_MODES.find((candidate) => candidate === permissionModeRaw);
+    if (permissionModeRaw !== undefined && permissionMode === undefined) {
         throw new SettingsError(
             `invalid --permission-mode: ${permissionModeRaw} (expected ${PERMISSION_MODES.join(" | ")})`,
         );
@@ -186,7 +187,7 @@ Options:
                               (DSH_ACP_MODELS, default deepseek-v4-flash,deepseek-v4-pro)
   --max-tokens <n>            Per-request output-token cap (DSH_MAX_TOKENS)
   --permission-mode <mode>    read-only | workspace-write | danger-full-access
-                              (DSH_PERMISSION_MODE, default workspace-write)
+                              (DSH_PERMISSION_MODE; otherwise use the Host default)
   --session-root <dir>        JSONL session store (DSH_SESSION_ROOT, default ~/.dsh-acp/sessions)
   --persona <text>            System-prompt persona (DSH_SYSTEM_PROMPT)
   --reasoning-effort <level>  off | high | max (DSH_REASONING_EFFORT, default high)

@@ -5,6 +5,7 @@ export const CORDIS_PROTOCOL = 0;
 export const CORDIS_CAPABILITY = Object.freeze({ protocol: CORDIS_PROTOCOL });
 
 export const CORDIS_METHODS = Object.freeze({
+    pluginsStaticList: "_dsh/plugins/list",
     inspectSync: "_dsh/cordis/inspect/sync",
     inspectResolve: "_dsh/cordis/inspect/resolve",
     inspectQuery: "_dsh/cordis/inspect/query",

@@ -293,19 +293,24 @@ export async function bootAcpProfile(
 
     // The CLI-argument layer: an overlay over the acp-bridge row, the same
     // id-targeted override a user patch would express.
-    const bridgeRow = rows.get("acp-bridge");
-    if (overrides?.serve === false && bridgeRow !== undefined) {
+    const transportRow = rows.get("acp-bridge");
+    if (overrides?.serve === false && transportRow !== undefined) {
         // Tooling boots (login) need the composition without the stdio server.
         overlays.push({ id: "acp-bridge", disabled: true });
     }
-    if (overrides !== undefined && bridgeRow !== undefined) {
+    // Current profiles put runtime configuration on the Host plugin; older
+    // profiles mounted only the transport/bridge row, which remains the
+    // compatibility fallback.
+    const configRowId = rows.has("acp-plugin") ? "acp-plugin" : "acp-bridge";
+    const configRow = rows.get(configRowId);
+    if (overrides !== undefined && configRow !== undefined) {
         const patch: Record<string, unknown> = {};
         if (overrides.provider !== undefined) patch["provider"] = overrides.provider;
         if (overrides.model !== undefined) patch["model"] = overrides.model;
         if (overrides.permissionMode !== undefined) patch["permissionMode"] = overrides.permissionMode;
         if (overrides.maxTokens !== undefined) patch["maxTokens"] = overrides.maxTokens;
         if (Object.keys(patch).length > 0) {
-            overlays.push({ id: "acp-bridge", config: { ...(bridgeRow.config ?? {}), ...patch } });
+            overlays.push({ id: configRowId, config: { ...(configRow.config ?? {}), ...patch } });
         }
     }
 

@@ -36,7 +36,7 @@ describe("resolveSettings", () => {
         expect(settings.provider).toBeUndefined();
         expect(settings.model).toBeUndefined();
         expect(settings.models).toEqual(["deepseek-v4-flash", "deepseek-v4-pro"]);
-        expect(settings.permissionMode).toBe("workspace-write");
+        expect(settings.permissionMode).toBeUndefined();
         expect(settings.thinking).toBe(true);
         expect(settings.reasoningEffort).toBe("high");
         expect(settings.sessionRoot).toContain(".dsh-acp");

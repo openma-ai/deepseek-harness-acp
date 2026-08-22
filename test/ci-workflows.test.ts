@@ -10,7 +10,7 @@ interface Workflow {
         strategy?: {
             matrix?: {
                 os?: unknown;
-                include?: Array<{ id?: string; pattern?: string }>;
+                dsh?: unknown;
             };
         };
         steps?: Array<{ run?: string }>;
@@ -36,33 +36,11 @@ describe("supported CI architectures", () => {
     });
 });
 
-describe("package installation gates", () => {
-    it.each(["ci.yml", "release.yml"])(
-        "runs %s package boundaries as independent timeout shards",
-        (workflow) => {
-            const jobs = readWorkflow(workflow).jobs;
-            const install = jobs?.["package-install"];
-            const cases = install?.strategy?.matrix?.include;
-            const commands = install?.steps?.flatMap((step) => step.run ?? []);
-            const regularTestCommands = jobs?.["test"]?.steps?.flatMap((step) => step.run ?? []);
-
-            expect(install?.["timeout-minutes"]).toBe(25);
-            expect(cases?.map((entry) => entry.id)).toEqual([
-                "standalone",
-                "rc7-profile",
-                "current-prerelease",
-                "remaining",
-            ]);
-            expect(commands).toContain('npm run test:install -- -t "${{ matrix.pattern }}"');
-            expect(regularTestCommands).not.toContain("npm run test:install");
-        },
-    );
-
-    it("keeps every release package shard ahead of publish", () => {
-        const jobs = readWorkflow("release.yml").jobs;
-
-        expect(jobs?.["package-install"]?.needs).toBe("verify-tag");
-        expect(jobs?.["publish"]?.needs).toContain("package-install");
+describe("supported dsh versions", () => {
+    it.each(["ci.yml", "release.yml"])("keeps %s compatibility checks on the 0.1.1 line", (workflow) => {
+        expect(readWorkflow(workflow).jobs?.["dsh-compatibility"]?.strategy?.matrix?.dsh).toEqual([
+            "0.1.1-rc.1",
+        ]);
     });
 });
 

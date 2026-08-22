@@ -116,7 +116,7 @@
       name: '@openma/deepseek-harness-acp/plugin'
       config:
         model: !!js process.env.DSH_MODEL
-        permissionMode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'
+        permissionMode: !!js process.env.DSH_PERMISSION_MODE
 
     # The ordinary ACP profile owns stdio. Embedded surfaces replace only this
     # adapter and reuse the exact same plugin contract above.

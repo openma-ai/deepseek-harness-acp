@@ -54,7 +54,7 @@ import {
 import type { Context } from "@deepseek-ai/cordis";
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
 import type { Agent } from "@deepseek-ai/dsh-agent";
-import type { createUserMessage, errorChain } from "@deepseek-ai/dsh-llm";
+import { ReasoningEffortId, type createUserMessage, type errorChain } from "@deepseek-ai/dsh-llm";
 import type { SessionId, SessionEvent } from "@deepseek-ai/dsh-session";
 import type { foldSessionTitle } from "@deepseek-ai/dsh-session-title";
 import type { setSandboxMode } from "@deepseek-ai/dsh-sandbox-policy";
@@ -337,6 +337,25 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         }
     };
 
+    /** Match Web: a successful session selection also becomes the live product default. */
+    const saveDefaultSelection = async (record: SessionRecord): Promise<void> => {
+        const selected = ensureSelection(record)?.current;
+        if (selected === undefined) return;
+        try {
+            await agentDefaultModel.saveSelection({
+                provider: selected.provider,
+                model: selected.model,
+                ...(selected.reasoningEffort === undefined
+                    ? {}
+                    : { reasoningEffort: ReasoningEffortId(selected.reasoningEffort) }),
+            });
+        } catch (error: unknown) {
+            // The current-session switch remains valid when settings are
+            // read-only or no settings provider is mounted.
+            logWarn(`model switch applied to the session but was not saved as the default: ${String(error)}`);
+        }
+    };
+
     const defaultProvider = (): string | undefined => config.provider ?? defaultSelection().provider;
 
     const encodeChoice = (provider: string | undefined, model: string): string =>
@@ -553,29 +572,23 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         // The old selection ref died with the disposed agent's scope; reinstall
         // immediately so the default reasoning effort keeps applying.
         delete record.selection;
-        ensureSelection(record);
-        if (record.effort !== undefined) {
-            const route = routeOf(record);
-            const catalog = await effortCatalog(route.provider, route.model);
-            if (
-                catalog?.efforts.some((effort) => effort.id === record.effort) === true &&
-                route.provider !== undefined &&
-                route.model !== undefined
-            ) {
-                const selection = ensureSelection(record);
-                if (selection !== undefined) {
-                    selection.current = {
-                        provider: route.provider,
-                        model: route.model,
-                        reasoningEffort: record.effort,
-                    };
-                }
-            } else {
-                // The new route does not offer the picked effort; fall back to
-                // its default instead of failing every request.
-                delete record.effort;
-            }
+        const route = routeOf(record);
+        const catalog = await effortCatalog(route.provider, route.model);
+        if (record.effort !== undefined && catalog?.efforts.some((effort) => effort.id === record.effort) !== true) {
+            // The new route does not offer the picked effort; fall back to
+            // its adapter-owned default instead of failing every request.
+            delete record.effort;
         }
+        const effort = record.effort ?? catalog?.defaultEffort;
+        const selection = ensureSelection(record);
+        if (selection !== undefined && route.provider !== undefined && route.model !== undefined) {
+            selection.current = {
+                provider: route.provider,
+                model: route.model,
+                ...(effort !== undefined ? { reasoningEffort: effort } : {}),
+            };
+        }
+        await saveDefaultSelection(record);
         // Approval policy is agent-scoped state; re-apply it to the new agent.
         setApprovalPolicy(record, record.approvals);
     };
@@ -1004,6 +1017,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
      */
     interface PermissionPresetsService {
         names: string[];
+        defaultPreset: string;
         resolve(name: string): { sandbox: SandboxMode; approval: ApprovalPolicy; name: string; description: string };
         current(events: readonly unknown[]): string | undefined;
         apply(
@@ -1712,9 +1726,17 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     handle.agent,
                     () => handle.dispose(),
                     config.model,
-                    config.permissionMode ?? "workspace-write",
+                    config.permissionMode ?? (permissionService().defaultPreset as SandboxMode),
                 );
                 if (presetId !== undefined) record.preset = presetId;
+                if (config.permissionMode !== undefined) {
+                    applyMode(record, String(sessionId), config.permissionMode);
+                } else {
+                    // session/created pins the Host's permission default into
+                    // durable facts; advertise that fact instead of a client
+                    // or adapter fallback.
+                    syncPermissionState(record, String(sessionId));
+                }
                 ensureSelection(record);
                 queueMicrotask(() => publishCommands(String(sessionId)));
                 const options = await configOptions(record);
@@ -1972,6 +1994,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                             reasoningEffort: value,
                         };
                         record.effort = value;
+                        await saveDefaultSelection(record);
                         break;
                     }
                     case "collaboration_mode": {
