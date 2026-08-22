@@ -78,16 +78,17 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME != package.json $PKG"
             exit 1
           fi
-      - name: Publish to npm (OIDC)
+      - name: Pack and publish the same artifact to npm (OIDC)
         run: |
           case "$GITHUB_REF_NAME" in
             *-alpha.*|*-beta.*|*-rc.*) DIST_TAG=beta ;;
             *) DIST_TAG=latest ;;
           esac
           echo "publishing with dist-tag: $DIST_TAG"
-          npm publish --tag "$DIST_TAG"
-      - name: Pack release asset
-        run: npm pack --ignore-scripts
+          npm pack
+          TARBALL=$(find . -maxdepth 1 -name '*.tgz' -print -quit)
+          test -n "$TARBALL"
+          npm publish "$TARBALL" --tag "$DIST_TAG"
       - name: GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
