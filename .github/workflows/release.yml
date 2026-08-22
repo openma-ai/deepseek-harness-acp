@@ -87,7 +87,7 @@ jobs:
           echo "publishing with dist-tag: $DIST_TAG"
           npm publish --tag "$DIST_TAG"
       - name: Pack release asset
-        run: npm pack
+        run: npm pack --ignore-scripts
       - name: GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

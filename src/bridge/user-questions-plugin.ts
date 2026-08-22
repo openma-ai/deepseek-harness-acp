@@ -4,9 +4,12 @@ import type { Context } from "@deepseek-ai/cordis";
 import type { UserQuestionService } from "@deepseek-ai/dsh-user-questions";
 
 import {
+    createElicitation,
     installAcpUserQuestionProvider,
     type AcpUserQuestionProviderOptions,
 } from "./user-questions.ts";
+
+export { createElicitation };
 
 export const name = "acp-user-questions";
 export const inject = ["userQuestions"];

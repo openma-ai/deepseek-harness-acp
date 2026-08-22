@@ -458,6 +458,17 @@ describe("dsh-acp server (e2e smoke)", () => {
         );
     }, 60_000);
 
+    it("rejects non-empty additional directories instead of silently narrowing the workspace", async () => {
+        await expect(client.request("session/new", {
+            cwd: workspace,
+            additionalDirectories: [join(workspace, "other-root")],
+            mcpServers: [],
+        })).rejects.toMatchObject({
+            code: -32602,
+            message: expect.stringContaining("additionalDirectories is not supported"),
+        });
+    }, 60_000);
+
     it("keeps a new session registered while Zed applies config defaults concurrently", async () => {
         const created = (await client.request("session/new", {
             cwd: workspace,
@@ -695,6 +706,22 @@ describe("dsh-acp server (e2e smoke)", () => {
         await expect(
             client.request("session/prompt", { sessionId: "nope", prompt: [{ type: "text", text: "hi" }] }),
         ).rejects.toThrow(/unknown session/);
+    }, 60_000);
+
+    it("rejects additional directories when loading a session", async () => {
+        const created = await client.request("session/new", {
+            cwd: workspace,
+            mcpServers: [],
+        }) as { sessionId: string };
+        await expect(client.request("session/load", {
+            sessionId: created.sessionId,
+            cwd: workspace,
+            additionalDirectories: [join(workspace, "other-root")],
+            mcpServers: [],
+        })).rejects.toMatchObject({
+            code: -32602,
+            message: expect.stringContaining("additionalDirectories is not supported"),
+        });
     }, 60_000);
 
     it("loads a persisted session from a fresh server process", async () => {

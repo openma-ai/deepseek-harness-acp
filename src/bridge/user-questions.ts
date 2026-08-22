@@ -157,6 +157,15 @@ export async function askUserQuestionsOverAcp(
     return answer;
 }
 
+export function createElicitation(
+    connection: {
+        createElicitation(request: CreateElicitationRequest): Promise<CreateElicitationResponse>;
+    },
+    request: CreateElicitationRequest,
+): Promise<CreateElicitationResponse> {
+    return connection.createElicitation(request);
+}
+
 export interface AcpUserQuestionProviderOptions {
     formSupported: () => boolean;
     sessionIdForRequest: (request: AskUserQuestionRequest) => string | undefined;

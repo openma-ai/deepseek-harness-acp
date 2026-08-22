@@ -9,10 +9,12 @@ const source = (name: string): string => readFileSync(
 
 describe("standalone and plugin entrypoint boundary", () => {
     it("keeps host discovery and profile self-boot in the standalone bin", () => {
+        const bootstrap = source("bin.ts");
         const standalone = source("index.ts");
-        expect(standalone).toMatch(/from "\.\/harness\.ts"/);
+        expect(bootstrap).toMatch(/from "\.\/harness\.ts"/);
+        expect(bootstrap).toMatch(/resolveHost\(/);
+        expect(bootstrap).toMatch(/registerHooks\(/);
         expect(standalone).toMatch(/from "\.\/profile-boot\.ts"/);
-        expect(standalone).toMatch(/resolveHost\(/);
         expect(standalone).toMatch(/bootAcpProfile\(/);
     });
 
@@ -22,7 +24,14 @@ describe("standalone and plugin entrypoint boundary", () => {
         expect(plugin).not.toMatch(/from "\.\/profile-boot\.ts"/);
         expect(plugin).not.toMatch(/resolveHost\(/);
         expect(plugin).not.toMatch(/bootAcpProfile\(/);
+        expect(plugin).not.toMatch(/from "\.\/runtime\.ts"/);
         expect(plugin).toMatch(/ctx\.plugin\(server, config\)/);
+    });
+
+    it("makes the private runtime a standalone-only fallback", () => {
+        const harness = source("harness.ts");
+        expect(harness).toMatch(/resolveVendoredRuntime\(/);
+        expect(harness).toMatch(/bundled standalone runtime/);
     });
 
     it("keeps transport ownership outside the embeddable plugin", () => {

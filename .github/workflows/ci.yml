@@ -27,6 +27,7 @@ jobs:
       - run: npm test
       - run: npm run build
       - run: npm pack
+        if: matrix.os == 'ubuntu-latest' && matrix.node == 24
       - name: Upload tarball
         if: matrix.os == 'ubuntu-latest' && matrix.node == 24
         uses: actions/upload-artifact@v4

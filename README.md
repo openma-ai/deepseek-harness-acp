@@ -29,14 +29,14 @@ config options, slash commands, skills, and MCP servers. Credentials never
 touch your editor config — it reuses the key you saved in the dsh Web UI, or
 `dsh-acp login` saves one to the same store.
 
-## Two entry points, one embeddable plugin
+## One package, standalone or plugin
 
 | | **A · dsh profile plugin (recommended)** | **B · Standalone server** |
 |---|---|---|
 | Best for | Normal installation and upgrades | Connecting an ACP client without managing a dsh profile |
 | Install | `dsh plugin --profile acp add @openma/deepseek-harness-acp@latest` | `npm i -g @openma/deepseek-harness-acp` |
 | Zed runs | `dsh --profile acp` | `dsh-acp` |
-| Harness | The dsh that owns the profile | Your installed dsh — or the npm-installed peer when none exists |
+| Harness | The dsh that owns the profile | Your installed dsh, then the package's locked private runtime |
 | Composition | dsh-base + this bundle + your profile's own patches | dsh-base + this bundle (profile machinery booted in-process) |
 
 Both shapes share `$DSH_HOME`: the same credential store, settings, presets,
@@ -95,10 +95,11 @@ dsh-acp login        # interactive; or save the key in the dsh Web UI
 ```
 
 The standalone binary finds DeepSeek Harness via `--dsh-path` / `DSH_PATH`,
-its own tree, `./node_modules`, `dsh` on PATH, or `npm root -g`. It ships an
-npm-installed harness peer as the **last** candidate, so it still prefers the
-dsh you installed. When a real `$DSH_HOME/profiles/acp` exists, that profile
-owns the composition.
+`./node_modules`, `dsh` on PATH, or `npm root -g`, then falls back to the exact
+runtime archived inside this package. DSH is only a wildcard optional peer for
+Host integration, never an npm-installed dependency: plugin mode uses the
+Host's tree, while standalone maps the same imports to the private runtime.
+When a real `$DSH_HOME/profiles/acp` exists, that profile owns the composition.
 
 ## Plugin and extension model
 
@@ -216,7 +217,7 @@ another provider.
 - **Live model catalog** — providers × models from the running composition (third-party providers added in the Web UI appear immediately), plus reasoning-effort selection that follows your product default.
 - **Slash commands** — adapter built-ins (`/status`, `/model`) plus the harness command registry (`/compact`, `/goal`, `/permission`, `/plan`, …) executed without a model turn, plus **skills** (`/skill-name` — the harness's own invocation gesture). Login and logout are ACP methods, not chat commands.
 - **Plans & usage** — `todo_write` snapshots as ACP plans; token accounting as `usage_update` and per-turn usage.
-- **Sessions** — `session/load` with full history replay, `session/list`, silent restore when a client prompts an old session after an agent restart, titles as `session_info_update`.
+- **Sessions** — `session/load` with full history replay, `session/list`, silent restore when a client prompts an old session after an agent restart, titles as `session_info_update`. Multi-root sessions are not advertised: non-empty `additionalDirectories` on `session/new` or `session/load` return `Invalid params` until [dsh supports multiple workspace roots](https://github.com/deepseek-ai/deepseek-harness/discussions/2474).
 - **MCP servers** — per-session `mcpServers` mount `@deepseek-ai/dsh-mcp-client` instances (stdio + streamable HTTP); tools join as `mcp__<server>__<tool>`; a failing server never takes the session down.
 - **Real cancellation** — `session/cancel` interrupts the live turn through the harness agent.
 
@@ -257,9 +258,10 @@ ACP client (Zed, …)
    │  ACP JSON-RPC over stdio
    ▼
 dsh-acp
+   ├─ src/bin.ts              selects one DSH tree before Host imports evaluate
    ├─ src/profile-boot.ts     boots the harness's own profile machinery
    │                          (dsh-base + this bundle + $DSH_HOME layers)
-   ├─ src/harness.ts          host discovery (DSH_PATH → cwd → PATH → npm -g → npm peer)
+   ├─ src/harness.ts          host discovery (DSH_PATH → cwd → PATH → npm -g → bundled runtime)
    └─ src/bridge/             the ACP bridge (a cordis plugin)
         ├─ index.ts           sessions, prompts, cancel, modes, options,
         │                     commands, credentials, MCP mounts
@@ -267,8 +269,8 @@ dsh-acp
         ├─ history.ts         stored-log replay for session/load (pure)
         └─ prompt.ts          ACP prompt blocks → harness content blocks (pure)
    ▼
-your @deepseek-ai/dsh installation   (agent spine, llm, persistence, sandbox,
-                                      tools, presets, skills, compaction, …)
+external or package-bundled dsh     (agent spine, llm, persistence, sandbox,
+                                     tools, presets, skills, compaction, …)
 ```
 
 When embedded by another surface, only the transport edge changes:
