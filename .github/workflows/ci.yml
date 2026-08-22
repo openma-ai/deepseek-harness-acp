@@ -35,13 +35,8 @@ jobs:
           path: "*.tgz"
 
   dsh-compatibility:
-    name: dsh compatibility (${{ matrix.dsh }})
+    name: dsh compatibility (locked 0.1.1)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # ACP supports the dsh 0.1.1 line; rc.1 is its compatibility floor.
-        dsh: [0.1.1-rc.1]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -50,9 +45,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      - name: Install dsh compatibility host
-        run: npm install --prefix "${{ runner.temp }}/dsh-host" --ignore-scripts --no-audit --no-fund "@deepseek-ai/dsh@${{ matrix.dsh }}"
       - name: Exercise session controls through the host
         run: npm run test:host
         env:
-          DSH_ACP_TEST_HOST: ${{ runner.temp }}/dsh-host
+          DSH_ACP_TEST_HOST: ${{ github.workspace }}

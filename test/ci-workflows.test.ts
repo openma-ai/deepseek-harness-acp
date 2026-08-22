@@ -13,7 +13,11 @@ interface Workflow {
                 dsh?: unknown;
             };
         };
-        steps?: Array<{ run?: string }>;
+        steps?: Array<{
+            name?: string;
+            run?: string;
+            env?: Record<string, unknown>;
+        }>;
     }>;
 }
 
@@ -36,11 +40,14 @@ describe("supported CI architectures", () => {
     });
 });
 
-describe("supported dsh versions", () => {
-    it.each(["ci.yml", "release.yml"])("keeps %s compatibility checks on the 0.1.1 line", (workflow) => {
-        expect(readWorkflow(workflow).jobs?.["dsh-compatibility"]?.strategy?.matrix?.dsh).toEqual([
-            "0.1.1-rc.1",
-        ]);
+describe("dsh compatibility host", () => {
+    it.each(["ci.yml", "release.yml"])("reuses %s's locked 0.1.1 host without a second install", (workflow) => {
+        const steps = readWorkflow(workflow).jobs?.["dsh-compatibility"]?.steps ?? [];
+        const commands = steps.flatMap((step) => step.run ?? []);
+        const exercise = steps.find((step) => step.name === "Exercise session controls through the host");
+
+        expect(commands.some((command) => command.includes("npm install"))).toBe(false);
+        expect(exercise?.env?.["DSH_ACP_TEST_HOST"]).toBe("${{ github.workspace }}");
     });
 });
 
