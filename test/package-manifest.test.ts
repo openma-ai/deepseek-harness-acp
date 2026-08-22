@@ -13,9 +13,9 @@ describe("ACP package manifest", () => {
             "@agentclientprotocol/sdk": "^1.3.0",
             zod: "^4.4.3",
         });
-        expect(manifest.peerDependencies).toEqual({
-            "@deepseek-ai/dsh": "^0.1.0-rc.6 || ^0.1.1-rc.1",
-        });
+    expect(manifest.peerDependencies).toEqual({
+      "@deepseek-ai/dsh": "0.1.1-rc.2",
+    });
 
         const dshDevelopmentRanges = Object.entries(manifest.devDependencies ?? {})
             .filter(([name]) => name === "@deepseek-ai/dsh" || name.startsWith("@deepseek-ai/dsh-"))
