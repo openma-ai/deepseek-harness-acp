@@ -3,7 +3,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "version": "0.4.25",
+  "version": "0.4.26",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/openma-ai/deepseek-harness-acp.git"
