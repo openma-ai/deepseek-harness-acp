@@ -197,15 +197,16 @@ export async function bootAcpProfile(
     };
     const home = homePaths.resolveDshHome();
 
-    // ---- Profile layers -------------------------------------------------
-    // A real $DSH_HOME/profiles/acp owns the composition when present (its
-    // bundles and user patch layer); otherwise compose the virtual profile:
-    // dsh-base + this package, with no per-profile user layer.
-    let bundlePatches: PatchEntry[];
-    let profilePatches: PatchEntry[] = [];
-    let profilePatchPath: string | undefined;
-    let rootConfigPath = join(ownRoot(), "profile-root.cordis.yml");
-    let bareModuleBaseUrl: string | undefined = pathToFileURL(dshDir + sep).href;
+    // ---- Standalone layers ----------------------------------------------
+    // This function is the standalone dsh-acp entrypoint. A dsh-managed
+    // profile runs the embeddable plugin on the profile's existing tree and
+    // never calls this function. Reusing $DSH_HOME/profiles/acp here would
+    // let an arbitrarily old profile dependency graph override the current
+    // standalone package (the exact failure npx clients hit after upgrading).
+    // Compose the selected Host's current dsh-base + this running package,
+    // then layer the shared home patch and explicit --bundle additions.
+    const rootConfigPath = join(ownRoot(), "profile-root.cordis.yml");
+    const bareModuleBaseUrl = pathToFileURL(dshDir + sep).href;
     // The bridge ships with THIS binary: whatever composition source names
     // it (the virtual bundle list or a real profile's), the row must load
     // the running package's entry, never an older copy installed elsewhere.
@@ -231,29 +232,13 @@ export async function bootAcpProfile(
         import.meta.url.endsWith(".ts") || !existsSync(distStdio)
             ? join(ownRoot(), "src", "stdio.ts")
             : distStdio;
-    const realProfileDir = join(home, "profiles", "acp");
-    if (existsSync(join(realProfileDir, "package.json"))) {
-        // Exactly the dsh CLI's path: the profile directory is the module
-        // base (its node_modules carries out-of-tree bundles), with the
-        // shared fallback link healing dsh-system resolution.
-        appBoot.healProfilesModuleFallback(dshPkgPath);
-        const profile = appBoot.loadProfile(BIN, "acp", dshPkgPath);
-        bundlePatches = profile.layers.flatMap((layer) => layer.patches);
-        profilePatches = profile.patches;
-        profilePatchPath = join(profile.dir, "cordis.patch.yml");
-        const realRoot = join(profile.dir, "cordis.yml");
-        if (existsSync(realRoot)) rootConfigPath = realRoot;
-        bareModuleBaseUrl = undefined;
-        logDebug(`profile: real (${profile.dir})`);
-    } else {
-        const basePatch = bundlePatchPath(req.resolve("@deepseek-ai/dsh-base/package.json"));
-        const ownPatch = bundlePatchPath(join(ownRoot(), "package.json"));
-        bundlePatches = [
-            ...appBoot.loadOverlayPatches(BIN, basePatch),
-            ...appBoot.loadOverlayPatches(BIN, ownPatch),
-        ];
-        logDebug(`profile: virtual (dsh-base + ${ownRoot()})`);
-    }
+    const basePatch = bundlePatchPath(req.resolve("@deepseek-ai/dsh-base/package.json"));
+    const ownPatch = bundlePatchPath(join(ownRoot(), "package.json"));
+    const bundlePatches: PatchEntry[] = [
+        ...appBoot.loadOverlayPatches(BIN, basePatch),
+        ...appBoot.loadOverlayPatches(BIN, ownPatch),
+    ];
+    logDebug(`profile: standalone (dsh-base + ${ownRoot()})`);
     for (const bundle of overrides?.bundles ?? []) {
         bundlePatches.push(...loadBundleLayer(appBoot, bundle));
         logDebug(`profile: added bundle ${bundle}`);
@@ -271,7 +256,7 @@ export async function bootAcpProfile(
     const homePatchPath = join(home, "cordis.patch.yml");
     const homePatches = appBoot.loadOptionalPatches(BIN, homePatchPath) ?? [];
     const rows = new Map<string, PatchEntry>();
-    for (const row of appBoot.composeEntries([bundlePatches, profilePatches, homePatches])) {
+    for (const row of appBoot.composeEntries([bundlePatches, homePatches])) {
         if (typeof row.id === "string") rows.set(row.id, row);
     }
     const overlays: PatchEntry[] = [];
@@ -314,7 +299,7 @@ export async function bootAcpProfile(
         }
     }
 
-    const allPatches = [...bundlePatches, ...profilePatches, ...homePatches, ...overlays];
+    const allPatches = [...bundlePatches, ...homePatches, ...overlays];
 
     // ---- Boot ------------------------------------------------------------
     const launchEnvironment = appBoot.loadLayeredEnv("dsh");
@@ -338,9 +323,6 @@ export async function bootAcpProfile(
     } catch (error: unknown) {
         await ctx.fiber.dispose().catch(() => {});
         throw error;
-    }
-    if (profilePatchPath !== undefined) {
-        logDebug(`user patch layers are read at boot; edit ${profilePatchPath} and restart to apply`);
     }
     return ctx;
 }

@@ -61,6 +61,15 @@ class AcpTestClient {
         this.child.stderr.on("data", (chunk: string) => {
             this.stderr += chunk;
         });
+        this.child.on("exit", (code, signal) => {
+            if (this.pending.size === 0) return;
+            const error = new Error(
+                `dsh-acp exited before replying (code ${String(code)}, signal ${String(signal)})\n`
+                    + `stderr:\n${this.stderr.slice(-2000)}`,
+            );
+            for (const pending of this.pending.values()) pending.reject(error);
+            this.pending.clear();
+        });
         this.child.stdout.on("data", (chunk: string) => {
             this.buffer += chunk;
             let index = this.buffer.indexOf("\n");
@@ -444,6 +453,40 @@ describe("dsh-acp Host-owned defaults", () => {
                 .map((option) => [option["id"], option]),
         );
         expect(options.get("mode")).toMatchObject({ currentValue: "read-only" });
+    }, 90_000);
+
+    it("does not let a stale installed ACP profile override the standalone Host defaults", async () => {
+        const sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-stale-profile-sessions-"));
+        const workspace = mkdtempSync(join(tmpdir(), "dsh-acp-stale-profile-workspace-"));
+        roots.push(sessionRoot, workspace);
+        const harnessHome = join(sessionRoot, "home");
+        const staleProfile = join(harnessHome, "profiles", "acp");
+        mkdirSync(staleProfile, { recursive: true });
+        writeFileSync(
+            join(staleProfile, "package.json"),
+            JSON.stringify({
+                name: "stale-acp-profile",
+                private: true,
+                dependencies: { "@openma/deepseek-harness-acp": "0.0.1" },
+                dsh: { profile: { bundles: ["definitely-missing-stale-acp-bundle"] } },
+            }),
+        );
+        writeFileSync(join(staleProfile, "cordis.yml"), "[]\n");
+        writeFileSync(join(staleProfile, "cordis.patch.yml"), "[]\n");
+        writeFileSync(
+            join(harnessHome, "settings.yaml"),
+            "permission:\n  defaultPreset: danger-full-access\n",
+        );
+
+        const client = new AcpTestClient(sessionRoot, workspace);
+        clients.push(client);
+        await client.request("initialize", { protocolVersion: 1 }, 60_000);
+        const created = (await client.request("session/new", {
+            cwd: workspace,
+            mcpServers: [],
+        })) as Record<string, unknown>;
+
+        expect(created["modes"]).toMatchObject({ currentModeId: "danger-full-access" });
     }, 90_000);
 
     it("lets an explicit CLI permission override the Host default", async () => {
