@@ -9,7 +9,7 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -291,6 +291,60 @@ describe("dsh-acp Host-owned defaults", () => {
         await Promise.all(clients.map((entry) => entry.close()));
         for (const root of roots) rmSync(root, { recursive: true, force: true });
     });
+
+    it("materializes the Host default route on the parent agent for subagent inheritance", async () => {
+        const sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-inherited-model-sessions-"));
+        const workspace = mkdtempSync(join(tmpdir(), "dsh-acp-inherited-model-workspace-"));
+        const bundle = mkdtempSync(join(tmpdir(), "dsh-acp-inherited-model-bundle-"));
+        const marker = join(bundle, "agent-options.json");
+        roots.push(sessionRoot, workspace, bundle);
+
+        const harnessHome = join(sessionRoot, "home");
+        mkdirSync(harnessHome, { recursive: true });
+        writeFileSync(
+            join(harnessHome, "settings.yaml"),
+            "agent-default-model:\n  provider: deepseek-official\n  model: deepseek-v4-pro\n",
+        );
+        writeFileSync(join(bundle, "package.json"), JSON.stringify({
+            name: "dsh-acp-test-agent-options",
+            type: "module",
+            main: "./index.js",
+            dsh: { bundle: { patch: "./cordis.patch.yml" } },
+        }));
+        writeFileSync(join(bundle, "cordis.patch.yml"), JSON.stringify([{
+            insert: [{
+                id: "dsh-acp-test-agent-options",
+                name: "dsh-acp-test-agent-options",
+                config: { marker },
+            }],
+        }]));
+        writeFileSync(join(bundle, "index.js"), [
+            "import { writeFileSync } from 'node:fs'",
+            "export const inject = ['agents']",
+            "export function apply(ctx, config) {",
+            "  ctx.on('agent/created', ({ agent }) => {",
+            "    if (agent.session.header.parentSession === undefined) {",
+            "      writeFileSync(config.marker, JSON.stringify(agent.options))",
+            "    }",
+            "  })",
+            "}",
+        ].join("\n"));
+
+        const client = new AcpTestClient(
+            sessionRoot,
+            workspace,
+            undefined,
+            undefined,
+            ["--bundle", bundle],
+        );
+        clients.push(client);
+
+        await client.request("initialize", { protocolVersion: 1 }, 60_000);
+        await client.request("session/new", { cwd: workspace, mcpServers: [] });
+
+        expect(JSON.parse(readFileSync(marker, "utf8")))
+            .toMatchObject({ provider: "deepseek-official", model: "deepseek-v4-pro" });
+    }, 90_000);
 
     it("saves the selected model and effort as the default for later sessions", async () => {
         const sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-default-model-sessions-"));

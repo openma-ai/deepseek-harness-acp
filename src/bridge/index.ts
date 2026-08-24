@@ -643,16 +643,16 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     const agentOptionsFor = (
         model: string | undefined,
         provider?: string,
-    ): { provider?: string; model?: string; maxTokens?: number; interactionMode?: AcpInteractionMode } =>
-        withInteractionMode({
-            ...(provider !== undefined
-                ? { provider }
-                : config.provider !== undefined
-                  ? { provider: config.provider }
-                  : {}),
-            ...(model !== undefined ? { model } : {}),
+    ): { provider?: string; model?: string; maxTokens?: number; interactionMode?: AcpInteractionMode } => {
+        const defaults = defaultSelection();
+        const resolvedProvider = provider ?? config.provider ?? defaults.provider;
+        const resolvedModel = model ?? config.model ?? defaults.model;
+        return withInteractionMode({
+            ...(resolvedProvider !== undefined ? { provider: resolvedProvider } : {}),
+            ...(resolvedModel !== undefined ? { model: resolvedModel } : {}),
             ...(config.maxTokens !== undefined ? { maxTokens: config.maxTokens } : {}),
         }, clientInteractionMode);
+    };
 
     /** Return the bridge-owned record for an agent, rejecting same-id impostors. */
     const ownedRecord = (agent: Agent): SessionRecord | undefined => {
