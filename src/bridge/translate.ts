@@ -65,6 +65,14 @@ export interface ToolCallFacts {
     rawInput: unknown;
 }
 
+interface ProjectedToolCall {
+    callId: string;
+    name: string;
+    arguments: string;
+    facts: ToolCallFacts;
+    status: "pending" | "in_progress";
+}
+
 function firstLine(text: string, limit = MAX_TITLE_LENGTH): string {
     const line = text.split("\n", 1)[0] ?? "";
     return line.length > limit ? `${line.slice(0, limit - 1)}…` : line;
@@ -397,7 +405,10 @@ export class SessionProjection {
 
     private streamedText = new Set<string>();
     private streamedReasoning = new Set<string>();
-    private toolCalls = new Map<string, ToolCallFacts>();
+    /** One authoritative state per open ACP tool call. Block indexes only
+     * route streaming fragments to that state; they never own lifecycle. */
+    private toolCalls = new Map<string, ProjectedToolCall>();
+    private toolCallBlocks = new Map<string, string>();
     private window: PromptWindow = emptyWindow();
     private lastContextUse: number | undefined;
     /** Client renders `_meta.terminal_output` display terminals (Zed extension). */
@@ -426,6 +437,7 @@ export class SessionProjection {
     /** Reset per-prompt accumulators; call when a new `session/prompt` starts. */
     beginPrompt(): void {
         this.window = emptyWindow();
+        this.toolCallBlocks.clear();
     }
 
     /** The captured ending for a specific turn, when it already ended. */
@@ -473,6 +485,8 @@ export class SessionProjection {
         switch (event.type) {
             case "assistant/chunk":
                 return this.onChunk(data);
+            case "tool-call-chunks":
+                return this.onToolCallChunks(data);
             case "assistant/message":
                 return this.onAssistantMessage(data);
             case "tool/call":
@@ -577,20 +591,9 @@ export class SessionProjection {
     private onSubagentStart(data: Record<string, unknown>): SessionUpdate[] {
         const subagent = this.subagentMeta(data, "started");
         if (subagent === undefined) return [];
-        const runId = subagent["runId"] as string;
-        const childSessionId = subagent["childSessionId"] as string;
         return [{
-            sessionUpdate: "tool_call",
-            toolCallId: `subagent:${runId}`,
-            title: `Start subagent ${childSessionId}`,
-            kind: "other",
-            status: "in_progress",
-            rawInput: {
-                childSessionId,
-                provider: subagent["provider"],
-                local: subagent["local"],
-            },
-            _meta: { dsh: { subagent } },
+            sessionUpdate: "session_info_update",
+            _meta: { dsh: { event: "subagent/lifecycle", subagent } },
         } as unknown as SessionUpdate];
     }
 
@@ -598,16 +601,14 @@ export class SessionProjection {
         const subagent = this.subagentMeta(data, "finished");
         if (subagent === undefined) return [];
         const stopReason = asString(data["stopReason"]) ?? "error";
-        const lastAssistantMessage = data["lastAssistantMessage"];
         return [{
-            sessionUpdate: "tool_call_update",
-            toolCallId: `subagent:${String(subagent["runId"])}`,
-            status: stopReason === "completed" ? "completed" : "failed",
-            rawOutput: {
-                stopReason,
-                ...(Array.isArray(lastAssistantMessage) ? { lastAssistantMessage } : {}),
+            sessionUpdate: "session_info_update",
+            _meta: {
+                dsh: {
+                    event: "subagent/lifecycle",
+                    subagent: { ...subagent, stopReason },
+                },
             },
-            _meta: { dsh: { subagent } },
         } as unknown as SessionUpdate];
     }
 
@@ -615,6 +616,8 @@ export class SessionProjection {
         const chunk = data["chunk"];
         if (chunk === null || typeof chunk === "undefined" || typeof chunk !== "object") return [];
         const c = chunk as Record<string, unknown>;
+        if (c["type"] === "block-end") return this.onToolCallBlockEnd(data, c);
+        if (c["type"] === "tool-call-delta") return this.onToolCallDelta(data, c);
         const text = c["text"];
         if (typeof text !== "string" || text.length === 0) return [];
         const messageId = this.stepKey(data);
@@ -627,6 +630,126 @@ export class SessionProjection {
             return [{ sessionUpdate: "agent_thought_chunk", content: { type: "text", text }, messageId }];
         }
         return [];
+    }
+
+    private toolBlockKey(data: Record<string, unknown>, index: number): string {
+        return `${this.stepKey(data)}:${index}`;
+    }
+
+    private onToolCallDelta(
+        data: Record<string, unknown>,
+        chunk: Record<string, unknown>,
+    ): SessionUpdate[] {
+        const callId = asString(chunk["id"]);
+        const index = chunk["index"];
+        const argumentsDelta = chunk["argumentsDelta"];
+        if (
+            callId === undefined ||
+            typeof index !== "number" ||
+            !Number.isInteger(index) ||
+            typeof argumentsDelta !== "string"
+        ) {
+            return [];
+        }
+        const current = this.toolCalls.get(callId);
+        const name = asString(chunk["name"]) ?? current?.name;
+        if (name === undefined) return [];
+        const rawArguments = `${current?.arguments ?? ""}${argumentsDelta}`;
+        const state: ProjectedToolCall = {
+            callId,
+            name,
+            arguments: rawArguments,
+            facts: this.toolCallFacts(name, rawArguments),
+            status: current?.status ?? "pending",
+        };
+        this.toolCalls.set(callId, state);
+        this.toolCallBlocks.set(this.toolBlockKey(data, index), callId);
+        if (current === undefined) return [this.toolCallCreated(state)];
+        return [{
+            sessionUpdate: "tool_call_update",
+            toolCallId: callId,
+            title: state.facts.title,
+            name,
+            kind: state.facts.kind,
+            status: "pending",
+            rawInput: state.facts.rawInput,
+            ...(state.facts.locations.length > 0 ? { locations: state.facts.locations } : {}),
+        } as SessionUpdate];
+    }
+
+    private onToolCallChunks(data: Record<string, unknown>): SessionUpdate[] {
+        const callId = asString(data["id"]);
+        const name = asString(data["name"]);
+        const index = data["index"];
+        const args = data["args"];
+        if (
+            callId === undefined ||
+            name === undefined ||
+            typeof index !== "number" ||
+            !Number.isInteger(index) ||
+            !Array.isArray(args)
+        ) {
+            return [];
+        }
+        const key = this.toolBlockKey(data, index);
+        const current = this.toolCalls.get(callId);
+        const fragments = args.filter((fragment): fragment is string => typeof fragment === "string").join("");
+        const rawArguments = `${current?.arguments ?? ""}${fragments}`;
+        const state: ProjectedToolCall = {
+            callId,
+            name,
+            arguments: rawArguments,
+            facts: this.toolCallFacts(name, rawArguments),
+            status: current?.status ?? "pending",
+        };
+        this.toolCalls.set(callId, state);
+        this.toolCallBlocks.set(key, callId);
+        // ACP `pending` explicitly covers input that is still streaming. The
+        // first fragment is the earliest event carrying a stable call id/name,
+        // so create the row now instead of waiting for the whole batch.
+        return current === undefined ? [this.toolCallCreated(state)] : [];
+    }
+
+    private onToolCallBlockEnd(
+        data: Record<string, unknown>,
+        chunk: Record<string, unknown>,
+    ): SessionUpdate[] {
+        const index = chunk["index"];
+        if (typeof index !== "number" || !Number.isInteger(index)) return [];
+        const key = this.toolBlockKey(data, index);
+        const callId = this.toolCallBlocks.get(key);
+        this.toolCallBlocks.delete(key);
+        const block = chunk["block"];
+        const complete = block !== null && typeof block === "object"
+            ? (block as Record<string, unknown>)
+            : undefined;
+        const completeCallId = complete?.["type"] === "tool-call" ? asString(complete["id"]) : undefined;
+        const resolvedCallId = callId ?? completeCallId;
+        if (resolvedCallId === undefined) return [];
+        const current = this.toolCalls.get(resolvedCallId);
+        const name = (complete?.["type"] === "tool-call" ? asString(complete["name"]) : undefined) ?? current?.name;
+        if (name === undefined) return [];
+        const rawArguments =
+            (complete?.["type"] === "tool-call" && typeof complete["arguments"] === "string"
+                ? complete["arguments"]
+                : undefined) ?? current?.arguments ?? "{}";
+        const state: ProjectedToolCall = {
+            callId: resolvedCallId,
+            name,
+            arguments: rawArguments,
+            facts: this.toolCallFacts(name, rawArguments),
+            status: current?.status ?? "pending",
+        };
+        this.toolCalls.set(resolvedCallId, state);
+        if (current === undefined) return [this.toolCallCreated(state)];
+        return [{
+            sessionUpdate: "tool_call_update",
+            toolCallId: resolvedCallId,
+            title: state.facts.title,
+            kind: state.facts.kind,
+            rawInput: state.facts.rawInput,
+            locations: state.facts.locations,
+        } as SessionUpdate];
     }
 
     private onAssistantMessage(data: Record<string, unknown>): SessionUpdate[] {
@@ -708,11 +831,7 @@ export class SessionProjection {
         return updates;
     }
 
-    private onToolCall(data: Record<string, unknown>): SessionUpdate[] {
-        const callId = asString(data["callId"]);
-        const name = asString(data["name"]) ?? "tool";
-        if (callId === undefined) return [];
-        const rawArguments = typeof data["arguments"] === "string" ? (data["arguments"] as string) : "{}";
+    private toolCallFacts(name: string, rawArguments: string): ToolCallFacts {
         let parsedArgs: unknown = {};
         try {
             parsedArgs = JSON.parse(rawArguments);
@@ -720,38 +839,58 @@ export class SessionProjection {
             parsedArgs = { arguments: rawArguments };
         }
         const presented = this.presentCall?.(name, parsedArgs);
-        const facts =
-            presented !== undefined
-                ? factsFromPresentCall(name, rawArguments, presented)
-                : classifyToolCall(name, rawArguments);
-        this.toolCalls.set(callId, facts);
-        // Command tools embed a display-only terminal when the client supports
-        // one (the codex-acp `_meta` contract Zed renders): content carries the
-        // terminal reference, `terminal_info` announces it.
+        return presented !== undefined
+            ? factsFromPresentCall(name, rawArguments, presented)
+            : classifyToolCall(name, rawArguments);
+    }
+
+    private toolCallCreated(state: ProjectedToolCall): SessionUpdate {
+        const { callId, name, facts, status } = state;
         const displayTerminal = this.terminalOutput && facts.kind === "execute";
-        return [
-            {
-                sessionUpdate: "tool_call",
-                toolCallId: callId,
-                title: facts.title,
-                name,
-                kind: facts.kind,
-                status: "in_progress",
-                rawInput: facts.rawInput,
-                ...(facts.locations.length > 0 ? { locations: facts.locations } : {}),
-                ...(displayTerminal
-                    ? {
-                          content: [{ type: "terminal", terminalId: callId }],
-                          _meta: {
-                              terminal_info: {
-                                  terminal_id: callId,
-                                  ...(this.cwd !== undefined ? { cwd: this.cwd } : {}),
-                              },
+        return {
+            sessionUpdate: "tool_call",
+            toolCallId: callId,
+            title: facts.title,
+            name,
+            kind: facts.kind,
+            status,
+            rawInput: facts.rawInput,
+            ...(facts.locations.length > 0 ? { locations: facts.locations } : {}),
+            ...(displayTerminal
+                ? {
+                      content: [{ type: "terminal", terminalId: callId }],
+                      _meta: {
+                          terminal_info: {
+                              terminal_id: callId,
+                              ...(this.cwd !== undefined ? { cwd: this.cwd } : {}),
                           },
-                      }
-                    : {}),
-            } as unknown as SessionUpdate,
-        ];
+                      },
+                  }
+                : {}),
+        } as unknown as SessionUpdate;
+    }
+
+    private onToolCall(data: Record<string, unknown>): SessionUpdate[] {
+        const callId = asString(data["callId"]);
+        const name = asString(data["name"]) ?? "tool";
+        if (callId === undefined) return [];
+        const rawArguments = typeof data["arguments"] === "string" ? (data["arguments"] as string) : "{}";
+        const facts = this.toolCallFacts(name, rawArguments);
+        const current = this.toolCalls.get(callId);
+        const state: ProjectedToolCall = { callId, name, arguments: rawArguments, facts, status: "in_progress" };
+        this.toolCalls.set(callId, state);
+        if (current === undefined) return [this.toolCallCreated(state)];
+        if (current.status === "in_progress" && current.arguments === rawArguments && current.name === name) return [];
+        return [{
+            sessionUpdate: "tool_call_update",
+            toolCallId: callId,
+            title: facts.title,
+            name,
+            kind: facts.kind,
+            status: "in_progress",
+            rawInput: facts.rawInput,
+            locations: facts.locations,
+        } as SessionUpdate];
     }
 
     private onToolResult(data: Record<string, unknown>): SessionUpdate[] {
@@ -771,7 +910,8 @@ export class SessionProjection {
                     : undefined,
             ) ?? asString(data["callId"]);
         if (callId === undefined) return [];
-        const facts = this.toolCalls.get(callId);
+        const state = this.toolCalls.get(callId);
+        const facts = state?.facts;
         const { failed, text, diffs } = extractToolResult(data);
         const content: ToolCallContent[] = diffs.map((diff) => ({
             type: "diff",
@@ -785,6 +925,9 @@ export class SessionProjection {
             // embedded terminal, then close it with the exit status. Content
             // stays empty — the terminal is the presentation.
             this.toolCalls.delete(callId);
+            for (const [key, value] of this.toolCallBlocks) {
+                if (value === callId) this.toolCallBlocks.delete(key);
+            }
             return [
                 ...(text.length > 0
                     ? [
@@ -816,6 +959,9 @@ export class SessionProjection {
             content.push({ type: "content", content: block });
         }
         this.toolCalls.delete(callId);
+        for (const [key, value] of this.toolCallBlocks) {
+            if (value === callId) this.toolCallBlocks.delete(key);
+        }
         return [
             {
                 sessionUpdate: "tool_call_update",
@@ -838,6 +984,11 @@ export class SessionProjection {
                 this.window.error = { message: r.error?.message ?? "model turn failed" };
             }
         }
+        this.toolCallBlocks.clear();
+        this.toolCalls.clear();
+        // A stopped prompt turn owns presentation settlement for any orphaned
+        // calls. Do not rewrite `pending`/`in_progress` into a fabricated ACP
+        // failure; clients already have the authoritative prompt boundary.
         return [];
     }
 }

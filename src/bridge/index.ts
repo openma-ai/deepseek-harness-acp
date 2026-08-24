@@ -65,7 +65,7 @@ import type {} from "@deepseek-ai/dsh-session-persistence";
 import type {} from "@deepseek-ai/dsh-commands";
 import type {} from "@deepseek-ai/dsh-skill";
 import type {} from "@deepseek-ai/dsh-agent-default-model";
-import type {} from "@deepseek-ai/dsh-permission-presets";
+import { PERMISSION_SETTINGS_NAMESPACE } from "@deepseek-ai/dsh-permission-presets";
 import type {} from "@deepseek-ai/dsh-agent-presets";
 import type { SubagentRunEndInfo, SubagentRunInfo } from "@deepseek-ai/dsh-subagent";
 
@@ -914,8 +914,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             return {
                 currentModeId: record.modeId,
                 availableModes: permission.names.map((name) => {
-                    const spec = permission.resolve(name);
-                    return { id: name, name: spec.name, description: spec.description };
+                    const presentation = permissionPresentation(name);
+                    return { id: name, ...presentation };
                 }),
             };
         }
@@ -1031,6 +1031,34 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     const permissionService = (): PermissionPresetsService =>
         permissionPresets as unknown as PermissionPresetsService;
 
+    /** ACP requires labels even when a deployment configures only preset behavior. */
+    const permissionPresentation = (id: string): { name: string; description: string } => {
+        const spec = permissionService().resolve(id);
+        const stock = MODE_LABELS[id as SandboxMode];
+        const fallbackName = stock?.name
+            ?? id.split("-").map((part) => part.length > 0 ? `${part[0]!.toUpperCase()}${part.slice(1)}` : part).join(" ");
+        return {
+            name: typeof spec.name === "string" && spec.name.trim().length > 0 ? spec.name : fallbackName,
+            description: typeof spec.description === "string"
+                ? spec.description
+                : (stock?.description ?? ""),
+        };
+    };
+
+    /** Match model selection: a successful preset switch becomes the default for future sessions. */
+    const saveDefaultPermission = async (modeId: string): Promise<void> => {
+        if (!permissionService().names.includes(modeId)) return;
+        try {
+            await ctx.get("settings")?.update(PERMISSION_SETTINGS_NAMESPACE, {
+                defaultPreset: modeId,
+            });
+        } catch (error: unknown) {
+            // The current-session switch remains valid when settings are
+            // read-only or no settings provider is mounted.
+            logWarn(`permission switch applied to the session but was not saved as the default: ${String(error)}`);
+        }
+    };
+
     const applyMode = (record: SessionRecord, sessionId: string, modeId: string): void => {
         const permission = permissionService();
         if (permission.names.includes(modeId)) {
@@ -1102,8 +1130,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             const levels =
                 permission.names.length > 0
                     ? permission.names.map((name) => {
-                          const spec = permission.resolve(name);
-                          return { value: name, name: spec.name, description: spec.description };
+                          const presentation = permissionPresentation(name);
+                          return { value: name, ...presentation };
                       })
                     : SANDBOX_MODES.map((mode) => {
                           const label = MODE_LABELS[mode] ?? { name: mode, description: "" };
@@ -1952,6 +1980,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
                 const record = await requireOrRestoreSession(params.sessionId);
                 applyMode(record, params.sessionId, params.modeId);
+                await saveDefaultPermission(params.modeId);
                 notify(params.sessionId, {
                     sessionUpdate: "config_option_update",
                     configOptions: await configOptions(record),
@@ -1969,6 +1998,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 switch (params.configId) {
                     case "mode": {
                         applyMode(record, params.sessionId, value);
+                        await saveDefaultPermission(value);
                         break;
                     }
                     case "agent":

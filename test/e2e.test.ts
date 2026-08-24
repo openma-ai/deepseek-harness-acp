@@ -28,6 +28,7 @@ class AcpTestClient {
     readonly notifications: Array<{ method: string; params: Record<string, unknown> }> = [];
     private buffer = "";
     private stderr = "";
+    private closePromise?: Promise<void>;
 
     constructor(
         sessionRoot: string,
@@ -129,8 +130,9 @@ class AcpTestClient {
     }
 
     async close(): Promise<void> {
+        if (this.closePromise !== undefined) return this.closePromise;
         this.child.stdin.end();
-        await new Promise<void>((resolve) => {
+        this.closePromise = new Promise<void>((resolve) => {
             const timer = setTimeout(() => {
                 this.child.kill("SIGKILL");
                 resolve();
@@ -140,6 +142,7 @@ class AcpTestClient {
                 resolve();
             });
         });
+        return this.closePromise;
     }
 }
 
@@ -376,6 +379,48 @@ describe("dsh-acp Host-owned defaults", () => {
         const options = new Map(later.configOptions.map((option) => [option["id"], option]));
         expect(options.get("model")).toMatchObject({ currentValue: "deepseek-v4-pro" });
         expect(options.get("effort")).toMatchObject({ currentValue: "max" });
+    }, 90_000);
+
+    it("restores the selected permission after the ACP Host restarts", async () => {
+        const sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-default-permission-switch-sessions-"));
+        const workspace = mkdtempSync(join(tmpdir(), "dsh-acp-default-permission-switch-workspace-"));
+        roots.push(sessionRoot, workspace);
+        const client = new AcpTestClient(sessionRoot, workspace);
+        clients.push(client);
+
+        await client.request("initialize", { protocolVersion: 1 }, 60_000);
+        const first = (await client.request("session/new", {
+            cwd: workspace,
+            mcpServers: [],
+        })) as { sessionId: string };
+        await client.request("session/set_mode", {
+            sessionId: first.sessionId,
+            modeId: "danger-full-access",
+        });
+        await client.close();
+
+        const restarted = new AcpTestClient(sessionRoot, workspace);
+        clients.push(restarted);
+        await restarted.request("initialize", { protocolVersion: 1 }, 60_000);
+        const later = (await restarted.request("session/new", {
+            cwd: workspace,
+            mcpServers: [],
+        })) as Record<string, unknown>;
+        expect(later["modes"]).toMatchObject({ currentModeId: "danger-full-access" });
+        const options = new Map(
+            (later["configOptions"] as Array<Record<string, unknown>>)
+                .map((option) => [option["id"], option]),
+        );
+        expect(options.get("mode")).toMatchObject({ currentValue: "danger-full-access" });
+        const availableModes = (later["modes"] as { availableModes: Array<Record<string, unknown>> })
+            .availableModes;
+        expect(availableModes.every((mode) =>
+            typeof mode["name"] === "string" && mode["name"].length > 0,
+        )).toBe(true);
+        const modeChoices = (options.get("mode")?.["options"] ?? []) as Array<Record<string, unknown>>;
+        expect(modeChoices.every((choice) =>
+            typeof choice["name"] === "string" && choice["name"].length > 0,
+        )).toBe(true);
     }, 90_000);
 
     it("starts a new session from the Host permission default", async () => {

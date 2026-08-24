@@ -53,7 +53,7 @@ describe("classifyToolCall", () => {
 });
 
 describe("SessionProjection streaming", () => {
-    it("maps a subagent lifecycle to a standard ACP tool call pair", () => {
+    it("projects subagent lifecycle as metadata-only session updates", () => {
         const p = new SessionProjection();
 
         expect(
@@ -68,14 +68,10 @@ describe("SessionProjection streaming", () => {
             ),
         ).toEqual([
             {
-                sessionUpdate: "tool_call",
-                toolCallId: "subagent:run-1",
-                title: "Start subagent child-1",
-                kind: "other",
-                status: "in_progress",
-                rawInput: { childSessionId: "child-1", provider: "local", local: true },
+                sessionUpdate: "session_info_update",
                 _meta: {
                     dsh: {
+                        event: "subagent/lifecycle",
                         subagent: {
                             state: "started",
                             runId: "run-1",
@@ -103,15 +99,10 @@ describe("SessionProjection streaming", () => {
             ),
         ).toEqual([
             {
-                sessionUpdate: "tool_call_update",
-                toolCallId: "subagent:run-1",
-                status: "completed",
-                rawOutput: {
-                    stopReason: "completed",
-                    lastAssistantMessage: [{ type: "text", text: "done" }],
-                },
+                sessionUpdate: "session_info_update",
                 _meta: {
                     dsh: {
+                        event: "subagent/lifecycle",
                         subagent: {
                             state: "finished",
                             runId: "run-1",
@@ -119,6 +110,7 @@ describe("SessionProjection streaming", () => {
                             provider: "local",
                             local: true,
                             parentToolCallId: "subagent:parent-run",
+                            stopReason: "completed",
                         },
                     },
                 },
@@ -273,6 +265,231 @@ describe("SessionProjection streaming", () => {
 });
 
 describe("SessionProjection tool calls", () => {
+    it("publishes a live tool request and streams later input into the same row", () => {
+        const p = new SessionProjection();
+
+        expect(
+            p.onEvent(
+                event("assistant/chunk", {
+                    turn: 1,
+                    step: 0,
+                    chunk: {
+                        type: "tool-call-delta",
+                        index: 1,
+                        id: "c-live",
+                        name: "subagent",
+                        argumentsDelta: "",
+                    },
+                }),
+            ),
+        ).toEqual([
+            expect.objectContaining({
+                sessionUpdate: "tool_call",
+                toolCallId: "c-live",
+                name: "subagent",
+                status: "pending",
+            }),
+        ]);
+
+        expect(
+            p.onEvent(
+                event("assistant/chunk", {
+                    turn: 1,
+                    step: 0,
+                    chunk: {
+                        type: "tool-call-delta",
+                        index: 1,
+                        id: "c-live",
+                        argumentsDelta: '{"description":"first","prompt":"one"}',
+                    },
+                }),
+            ),
+        ).toEqual([
+            expect.objectContaining({
+                sessionUpdate: "tool_call_update",
+                toolCallId: "c-live",
+                status: "pending",
+                rawInput: { description: "first", prompt: "one" },
+            }),
+        ]);
+
+        expect(
+            p.onEvent(
+                event("assistant/chunk", {
+                    turn: 1,
+                    step: 0,
+                    chunk: {
+                        type: "block-end",
+                        index: 1,
+                        block: {
+                            type: "tool-call",
+                            id: "c-live",
+                            name: "subagent",
+                            arguments: '{"description":"first","prompt":"one"}',
+                        },
+                    },
+                }),
+            ),
+        ).toEqual([
+            expect.objectContaining({
+                sessionUpdate: "tool_call_update",
+                toolCallId: "c-live",
+                rawInput: { description: "first", prompt: "one" },
+            }),
+        ]);
+    });
+
+    it("publishes each tool request while its own input is streaming", () => {
+        const p = new SessionProjection();
+
+        expect(
+            p.onEvent(
+                event("tool-call-chunks", {
+                    turn: 1,
+                    step: 0,
+                    index: 1,
+                    id: "c1",
+                    name: "subagent",
+                    args: ['{"description":"first",', '"prompt":"one"}'],
+                }),
+            ),
+        ).toEqual([
+            expect.objectContaining({
+                sessionUpdate: "tool_call",
+                toolCallId: "c1",
+                name: "subagent",
+                status: "pending",
+            }),
+        ]);
+        const first = p.onEvent(
+            event("assistant/chunk", {
+                turn: 1,
+                step: 0,
+                chunk: { type: "block-end", index: 1 },
+            }),
+        );
+        expect(first).toHaveLength(1);
+        expect(first[0]).toMatchObject({
+            sessionUpdate: "tool_call_update",
+            toolCallId: "c1",
+            rawInput: { description: "first", prompt: "one" },
+        });
+
+        expect(p.onEvent(
+            event("tool-call-chunks", {
+                turn: 1,
+                step: 0,
+                index: 2,
+                id: "c2",
+                name: "subagent",
+                args: ['{"description":"second","prompt":"two"}'],
+            }),
+        )).toEqual([
+            expect.objectContaining({
+                sessionUpdate: "tool_call",
+                toolCallId: "c2",
+                status: "pending",
+            }),
+        ]);
+        const second = p.onEvent(
+            event("assistant/chunk", {
+                turn: 1,
+                step: 0,
+                chunk: { type: "block-end", index: 2 },
+            }),
+        );
+        expect(second).toHaveLength(1);
+        expect(second[0]).toMatchObject({
+            sessionUpdate: "tool_call_update",
+            toolCallId: "c2",
+            rawInput: { description: "second", prompt: "two" },
+        });
+
+        expect(
+            p.onEvent(
+                event("tool/call", {
+                    turn: 1,
+                    step: 0,
+                    callId: "c1",
+                    name: "subagent",
+                    arguments: '{"description":"first","prompt":"one"}',
+                }),
+            ),
+        ).toEqual([
+            expect.objectContaining({
+                sessionUpdate: "tool_call_update",
+                toolCallId: "c1",
+                status: "in_progress",
+            }),
+        ]);
+        expect(
+            p.onEvent(
+                event("tool/call", {
+                    turn: 1,
+                    step: 0,
+                    callId: "c2",
+                    name: "subagent",
+                    arguments: '{"description":"second","prompt":"two"}',
+                }),
+            ),
+        ).toEqual([
+            expect.objectContaining({
+                sessionUpdate: "tool_call_update",
+                toolCallId: "c2",
+                status: "in_progress",
+            }),
+        ]);
+
+        expect(
+            p.onEvent(
+                event("tool/result", {
+                    callId: "c1",
+                    message: {
+                        content: [
+                            { type: "tool-result", toolCallId: "c1", content: [{ type: "text", text: "done" }] },
+                        ],
+                    },
+                }),
+            ),
+        ).toEqual([
+            expect.objectContaining({
+                sessionUpdate: "tool_call_update",
+                toolCallId: "c1",
+                status: "completed",
+            }),
+        ]);
+    });
+
+    it("drops projection state without fabricating a failed tool event when a turn ends", () => {
+        const p = new SessionProjection();
+        p.onEvent(
+            event("tool-call-chunks", {
+                turn: 1,
+                step: 0,
+                index: 1,
+                id: "c1",
+                name: "subagent",
+                args: ["{}"],
+            }),
+        );
+        p.onEvent(
+            event("assistant/chunk", {
+                turn: 1,
+                step: 0,
+                chunk: { type: "block-end", index: 1 },
+            }),
+        );
+
+        expect(
+            p.onEvent(
+                event("turn/end", {
+                    turn: 1,
+                    reason: { kind: "aborted", reason: { kind: "user" } },
+                }),
+            ),
+        ).toEqual([]);
+    });
+
     it("emits tool_call then a completed tool_call_update with text content", () => {
         const p = new SessionProjection();
         const start = p.onEvent(
