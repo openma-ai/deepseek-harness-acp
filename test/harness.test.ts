@@ -66,7 +66,7 @@ describe("resolveHost", () => {
     it("fails loudly with installation guidance when the explicit path has no harness", () => {
         const root = makeTree();
         expect(() => resolveHost(root)).toThrow(HarnessNotFoundError);
-        expect(() => resolveHost(root)).toThrow(/npm install -g @deepseek-ai\/dsh/);
+        expect(() => resolveHost(root)).toThrow(/Reinstall @openma\/deepseek-harness-acp/);
     });
 
     it("rejects a partial module tree that has dsh-agent but not the dsh profile launcher", () => {

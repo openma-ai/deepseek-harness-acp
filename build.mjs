@@ -9,6 +9,9 @@ const shared = {
 };
 
 await build({ ...shared, entryPoints: ['src/index.ts'], outfile: 'dist/index.js' });
+// Thin standalone bootstrap: resolve one DSH tree and register a synchronous
+// Node module hook before the main CLI evaluates any @deepseek-ai imports.
+await build({ ...shared, entryPoints: ['src/bin.ts'], outfile: 'dist/bin.js' });
 // The bridge as a dsh bundle plugin (dsh plugin --profile acp add …): bare
 // @deepseek-ai imports stay external and resolve inside the profile.
 await build({ ...shared, entryPoints: ['src/bundle.ts'], outfile: 'dist/bridge.js' });

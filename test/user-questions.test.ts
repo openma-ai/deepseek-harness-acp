@@ -22,6 +22,12 @@ type UserQuestionBridge = {
         sessionId: string,
         create: (request: CreateElicitationRequest) => Promise<CreateElicitationResponse>,
     ) => Promise<AskUserQuestionAnswer>;
+    createElicitation?: (
+        connection: {
+            createElicitation(request: CreateElicitationRequest): Promise<CreateElicitationResponse>;
+        },
+        request: CreateElicitationRequest,
+    ) => Promise<CreateElicitationResponse>;
     installAcpUserQuestionProvider?: (
         service: UserQuestionServiceType,
         options: {
@@ -146,6 +152,25 @@ describe("ACP user-question elicitation", () => {
 
         expect(answer).toEqual({ answers: [{ id: "target", selected: ["Remote"] }] });
         expect(sent).toMatchObject([{ mode: "form", sessionId: "s1" }]);
+    });
+
+    it("uses the stable AgentSideConnection createElicitation method", async () => {
+        const sent: CreateElicitationRequest[] = [];
+        const request = subject.questionsToElicitation?.(
+            [{ id: "confirm", question: "Continue?" }],
+            "s1",
+        );
+        expect(request).toBeDefined();
+
+        const response = await subject.createElicitation?.({
+            async createElicitation(elicitation) {
+                sent.push(elicitation);
+                return { action: "accept", content: { question_0: "yes" } };
+            },
+        }, request!);
+
+        expect(response).toEqual({ action: "accept", content: { question_0: "yes" } });
+        expect(sent).toEqual([request]);
     });
 
     it("turns a cancelled elicitation into the user-question cancellation error", async () => {

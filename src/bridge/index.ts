@@ -110,6 +110,7 @@ import { presetDisplayName, type PresetRow } from "./presets.ts";
 export {
     answerFromElicitation,
     askUserQuestionsOverAcp,
+    createElicitation,
     installAcpUserQuestionProvider,
     questionsToElicitation,
 } from "./user-questions.ts";
@@ -1730,6 +1731,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 await requireCredential(config.provider);
                 mark("credential");
                 validateCwd(params.cwd);
+                validateAdditionalDirectories(params.additionalDirectories);
                 syncMcpServers(params.mcpServers, params.cwd);
                 mark("request setup");
                 const sessionId = SessionId(randomUUID());
@@ -1780,6 +1782,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 assertOpen();
                 await requireCredential(config.provider);
                 validateCwd(params.cwd);
+                validateAdditionalDirectories(params.additionalDirectories);
                 syncMcpServers(params.mcpServers, params.cwd);
                 requirePersistence();
                 const record = await restoreSession(params.sessionId, { replay: true, cwd: params.cwd });
@@ -2084,6 +2087,12 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         if (!isAbsolute(cwd)) throw invalidParams(`cwd must be an absolute path: ${cwd}`);
     }
 
+    function validateAdditionalDirectories(additionalDirectories: string[] | undefined): void {
+        if (additionalDirectories !== undefined && additionalDirectories.length > 0) {
+            throw invalidParams("additionalDirectories is not supported");
+        }
+    }
+
     // ------------------------------------------------------------------ //
     // MCP servers (session mcpServers → dsh-mcp-client instances)         //
     // ------------------------------------------------------------------ //
@@ -2214,7 +2223,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             const record = ownedRecord(request.agent);
             return record === undefined ? undefined : String(record.agent.session.id);
         },
-        create: (request) => conn.unstable_createElicitation(request),
+        create: (request) => userQuestionsPlugin.createElicitation(conn, request),
     });
 
     let quiescing: Promise<void> | undefined;

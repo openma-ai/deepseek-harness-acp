@@ -1,20 +1,18 @@
 /**
  * DeepSeek Harness host discovery and module loading.
  *
- * dsh-acp does not bundle the harness. The user installs DeepSeek Harness
- * themselves (`npm install -g @deepseek-ai/dsh`) and this adapter composes its
- * agent runtime from that installation — the way codex-acp runs the Codex
- * binary the user points it at via `CODEX_PATH`.
+ * dsh-acp prefers a user-provided DeepSeek Harness and falls back to the
+ * immutable runtime shipped as an opaque asset in the standalone package.
+ * The embedded Cordis plugin never imports this module or the private runtime.
  *
  * Resolution order:
  *   1. `--dsh-path` / `DSH_PATH` — a `dsh` binary path, the `@deepseek-ai/dsh`
  *      package directory, an npm prefix, or any directory whose
  *      `node_modules` carries the `@deepseek-ai` scope.
- *   2. This package's own tree (a development checkout with dev dependencies,
- *      or npm's automatically installed dsh peer).
- *   3. `./node_modules` of the invoking directory.
- *   4. `dsh` on PATH — the normal case after `npm install -g @deepseek-ai/dsh`.
- *   5. The global npm root (`npm root -g`).
+ *   2. `./node_modules` of the invoking directory.
+ *   3. `dsh` on PATH — the normal case after `npm install -g @deepseek-ai/dsh`.
+ *   4. The global npm root (`npm root -g`).
+ *   5. The package's integrity-checked, cached standalone runtime.
  *
  * Modules are imported from the resolved tree with Node's ascending
  * `node_modules` walk, honoring package `exports` maps (including subpaths
@@ -29,6 +27,7 @@ import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 
 import { logDebug } from "./log.ts";
+import { resolveVendoredRuntime } from "./runtime.ts";
 
 /** A resolved DeepSeek Harness installation. */
 export interface HarnessHost {
@@ -46,10 +45,8 @@ export class HarnessNotFoundError extends Error {
             [
                 "could not find a DeepSeek Harness installation.",
                 "",
-                "Install it first:",
-                "    npm install -g @deepseek-ai/dsh",
-                "",
-                "or point dsh-acp at an existing installation:",
+                "The bundled DeepSeek Harness runtime is missing or invalid.",
+                "Reinstall @openma/deepseek-harness-acp, or point it at an existing installation:",
                 "    DSH_PATH=/path/to/dsh dsh-acp        (dsh binary, package dir, or npm root)",
                 "",
                 probed.length > 0 ? `Probed:\n${probed.map((p) => `    ${p}`).join("\n")}` : "",
@@ -178,13 +175,12 @@ export function resolveHost(explicit?: string): HarnessHost {
     const globalNpm = hostFromGlobalNpm();
     if (globalNpm !== undefined) return globalNpm;
     probed.push("npm root -g");
-    // Last: this package's own tree — npm installs the @deepseek-ai/dsh peer
-    // for the standalone command. A dsh the user installed always wins (their
-    // Web UI and this server then run the same code over the shared $DSH_HOME);
-    // the peer copy makes a machine without an existing dsh work out of the box.
-    const own = hostAt(dirname(fileURLToPath(import.meta.url)), "dsh-acp package tree (npm peer)");
-    if (own !== undefined) return own;
-    probed.push("dsh-acp package tree (npm peer)");
+    const vendored = resolveVendoredRuntime();
+    if (vendored !== undefined) {
+        const host = hostAt(vendored, "bundled standalone runtime");
+        if (host !== undefined) return host;
+    }
+    probed.push("bundled standalone runtime");
     throw new HarnessNotFoundError(probed);
 }
 
@@ -226,25 +222,32 @@ function entryFile(packageDir: string, subpath: string | undefined): string {
     return join(packageDir, target);
 }
 
-/**
- * Import one module from the host installation.
- *
- * @param specifier - e.g. `@deepseek-ai/dsh-llm` or `@deepseek-ai/dsh-session/invariant`.
- */
-export async function loadHostModule(host: HarnessHost, specifier: string): Promise<ModuleNamespace> {
+/** Resolve one @deepseek-ai module through the selected Host tree. */
+export function hostModuleUrl(host: HarnessHost, specifier: string): string {
     const [scope, packageName, ...rest] = specifier.split("/");
     if (scope === undefined || packageName === undefined) throw new Error(`invalid specifier: ${specifier}`);
     const name = `${scope}/${packageName}`;
     const packageDir = packageDirFrom(host.base, name);
     if (packageDir === undefined) {
         throw new Error(
-            `the DeepSeek Harness installation at ${host.base} (${host.source}) does not provide ${name}; ` +
-                "update it with: npm install -g @deepseek-ai/dsh",
+            `the DeepSeek Harness installation at ${host.base} (${host.source}) does not provide ${name}`,
         );
     }
-    const file = entryFile(packageDir, rest.length > 0 ? rest.join("/") : undefined);
-    logDebug(`loading ${specifier} from ${file}`);
-    return (await import(pathToFileURL(file).href)) as ModuleNamespace;
+    if (rest.length === 1 && rest[0] === "package.json") {
+        return pathToFileURL(join(packageDir, "package.json")).href;
+    }
+    return pathToFileURL(entryFile(packageDir, rest.length > 0 ? rest.join("/") : undefined)).href;
+}
+
+/**
+ * Import one module from the host installation.
+ *
+ * @param specifier - e.g. `@deepseek-ai/dsh-llm` or `@deepseek-ai/dsh-session/invariant`.
+ */
+export async function loadHostModule(host: HarnessHost, specifier: string): Promise<ModuleNamespace> {
+    const url = hostModuleUrl(host, specifier);
+    logDebug(`loading ${specifier} from ${url}`);
+    return (await import(url)) as ModuleNamespace;
 }
 
 // ---------------------------------------------------------------------------
