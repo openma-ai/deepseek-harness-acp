@@ -201,6 +201,35 @@ interface ToolResultFacts {
     diffs: FileDiffMeta[];
 }
 
+function acknowledgementId(text: string, prefix: string): string | undefined {
+    if (!text.startsWith(prefix)) return undefined;
+    const id = text.slice(prefix.length);
+    if (id.length === 0 || id.trim() !== id || id.includes(" ") || id.includes("\t") || id.includes("\n")) {
+        return undefined;
+    }
+    return id;
+}
+
+/** Restore typed handles from DSH's documented background-result renderings. */
+function typedToolAcknowledgement(
+    state: ProjectedToolCall | undefined,
+    text: string,
+    failed: boolean,
+): Record<string, unknown> | undefined {
+    if (state === undefined || failed) return undefined;
+    if (state.name === "bash" || state.name === "pwsh") {
+        const jobId = acknowledgementId(text, "started background job ");
+        return jobId === undefined ? undefined : { kind: "background", jobId };
+    }
+    if (state.name === "subagent") {
+        const jobId = acknowledgementId(text, "started background subagent job ");
+        if (jobId !== undefined) return { kind: "background", jobId };
+        const subagentId = acknowledgementId(text, "started subagent ");
+        if (subagentId !== undefined) return { kind: "continuable", subagentId };
+    }
+    return undefined;
+}
+
 function extractToolResult(data: Record<string, unknown>): ToolResultFacts {
     let failed = data["error"] !== undefined && data["error"] !== null;
     const parts: string[] = [];
@@ -405,6 +434,8 @@ export class SessionProjection {
 
     private streamedText = new Set<string>();
     private streamedReasoning = new Set<string>();
+    /** Structured tool values observed live before DSH omits them from its durable event. */
+    private toolResultValues = new Map<string, unknown>();
     /** One authoritative state per open ACP tool call. Block indexes only
      * route streaming fragments to that state; they never own lifecycle. */
     private toolCalls = new Map<string, ProjectedToolCall>();
@@ -432,6 +463,11 @@ export class SessionProjection {
         this.cwd = options?.cwd;
         this.presentCall = options?.presentCall;
         this.subagent = options?.subagent;
+    }
+
+    /** Stage one live `tools/result` value for the matching durable `tool/result` event. */
+    recordToolResult(callId: string, value: unknown): void {
+        this.toolResultValues.set(callId, value);
     }
 
     /** Reset per-prompt accumulators; call when a new `session/prompt` starts. */
@@ -913,6 +949,21 @@ export class SessionProjection {
         const state = this.toolCalls.get(callId);
         const facts = state?.facts;
         const { failed, text, diffs } = extractToolResult(data);
+        const hasLiveValue = this.toolResultValues.has(callId);
+        const liveValue = this.toolResultValues.get(callId);
+        this.toolResultValues.delete(callId);
+        const toolResultValue = hasLiveValue ? liveValue : typedToolAcknowledgement(state, text, failed);
+        const toolResultMeta =
+            toolResultValue === undefined
+                ? undefined
+                : {
+                      dsh: {
+                          toolResult: {
+                              value: toolResultValue,
+                          },
+                      },
+                  };
+        const rawOutput = text.length > 0 ? { output: text, isError: failed } : undefined;
         const content: ToolCallContent[] = diffs.map((diff) => ({
             type: "diff",
             path: diff.path,
@@ -942,8 +993,9 @@ export class SessionProjection {
                     sessionUpdate: "tool_call_update",
                     toolCallId: callId,
                     status: failed ? "failed" : "completed",
-                    ...(text.length > 0 ? { rawOutput: { output: text, isError: failed } } : {}),
+                    ...(rawOutput !== undefined ? { rawOutput } : {}),
                     _meta: {
+                        ...(toolResultMeta ?? {}),
                         terminal_exit: { terminal_id: callId, exit_code: failed ? 1 : 0, signal: null },
                     },
                 } as unknown as SessionUpdate,
@@ -968,7 +1020,8 @@ export class SessionProjection {
                 toolCallId: callId,
                 status: failed ? "failed" : "completed",
                 ...(content.length > 0 ? { content } : {}),
-                ...(text.length > 0 ? { rawOutput: { output: text, isError: failed } } : {}),
+                ...(rawOutput !== undefined ? { rawOutput } : {}),
+                ...(toolResultMeta !== undefined ? { _meta: toolResultMeta } : {}),
             },
         ];
     }
@@ -986,6 +1039,7 @@ export class SessionProjection {
         }
         this.toolCallBlocks.clear();
         this.toolCalls.clear();
+        this.toolResultValues.clear();
         // A stopped prompt turn owns presentation settlement for any orphaned
         // calls. Do not rewrite `pending`/`in_progress` into a fabricated ACP
         // failure; clients already have the authoritative prompt boundary.
