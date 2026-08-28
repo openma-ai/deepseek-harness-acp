@@ -67,6 +67,7 @@ import type {} from "@deepseek-ai/dsh-skill";
 import type {} from "@deepseek-ai/dsh-agent-default-model";
 import { PERMISSION_SETTINGS_NAMESPACE } from "@deepseek-ai/dsh-permission-presets";
 import type {} from "@deepseek-ai/dsh-agent-presets";
+import type {} from "@deepseek-ai/dsh-tools";
 import type { SubagentRunEndInfo, SubagentRunInfo } from "@deepseek-ai/dsh-subagent";
 
 import { VERSION } from "../version.ts";
@@ -1549,6 +1550,19 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     // ------------------------------------------------------------------ //
     // Live event routing                                                  //
     // ------------------------------------------------------------------ //
+
+    // DSH intentionally omits structured tool values from durable session events.
+    // Observe the finalized execution result one layer earlier and stage its value
+    // by call id so the following `tool/result` projection can publish it as
+    // generic ACP metadata. Nested Code Mode dispatches have no matching
+    // top-level ACP tool call and therefore stay on their own log surface.
+    ctx.on("tools/result", (exec, result) => {
+        if (exec.parent !== undefined || exec.agent === undefined || result.isError) return;
+        const projection =
+            ownedRecord(exec.agent)?.projection
+            ?? subagentByChild.get(String(exec.agent.session.id))?.projection;
+        projection?.recordToolResult(String(exec.callId), result.value);
+    });
 
     ctx.on("session/event", (session, event: SessionEvent) => {
         const sessionId = String(session.header.id);

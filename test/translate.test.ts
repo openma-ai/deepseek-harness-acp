@@ -524,6 +524,107 @@ describe("SessionProjection tool calls", () => {
         });
     });
 
+    it.each([
+        {
+            name: "bash",
+            arguments: '{"command":"sleep 4","run_in_background":true}',
+            text: "started background job bash-1",
+            typed: { kind: "background", jobId: "bash-1" },
+        },
+        {
+            name: "subagent",
+            arguments: '{"description":"check","prompt":"inspect","run_in_background":true}',
+            text: "started background subagent job subagent-2",
+            typed: { kind: "background", jobId: "subagent-2" },
+        },
+        {
+            name: "subagent",
+            arguments: '{"description":"check","prompt":"inspect"}',
+            text: "started subagent child-3",
+            typed: { kind: "continuable", subagentId: "child-3" },
+        },
+    ])("publishes the typed $typed.kind fallback for $name acknowledgements", ({ name, arguments: args, text, typed }) => {
+        const p = new SessionProjection();
+        p.onEvent(event("tool/call", { turn: 1, step: 0, callId: "background-call", name, arguments: args }));
+
+        const done = p.onEvent(
+            event("tool/result", {
+                turn: 1,
+                step: 0,
+                message: {
+                    content: [
+                        {
+                            type: "tool-result",
+                            toolCallId: "background-call",
+                            content: [{ type: "text", text }],
+                        },
+                    ],
+                },
+            }),
+        );
+
+        expect(done[0]).toMatchObject({
+            sessionUpdate: "tool_call_update",
+            toolCallId: "background-call",
+            status: "completed",
+            _meta: { dsh: { toolResult: { value: typed } } },
+        });
+        expect(
+            (done[0] as unknown as { _meta: { dsh: { toolResult: unknown } } })._meta.dsh.toolResult,
+        ).toEqual({ value: typed });
+        expect((done[0] as Record<string, unknown>)["rawOutput"]).toEqual({ output: text, isError: false });
+    });
+
+    it("publishes a captured canonical tool value through generic metadata", () => {
+        const p = new SessionProjection();
+        p.recordToolResult("search-call", {
+            matches: [{ path: "/workspace/a.ts", line: 7 }],
+            truncated: false,
+        });
+        p.onEvent(event("tool/call", {
+            turn: 1,
+            step: 0,
+            callId: "search-call",
+            name: "grep_search",
+            arguments: '{"query":"needle"}',
+        }));
+
+        const done = p.onEvent(event("tool/result", {
+            turn: 1,
+            step: 0,
+            message: {
+                content: [{
+                    type: "tool-result",
+                    toolCallId: "search-call",
+                    content: [{ type: "text", text: "/workspace/a.ts:7:needle" }],
+                }],
+            },
+        }));
+
+        expect(done[0]).toMatchObject({
+            sessionUpdate: "tool_call_update",
+            toolCallId: "search-call",
+            _meta: {
+                dsh: {
+                    toolResult: {
+                        value: {
+                            matches: [{ path: "/workspace/a.ts", line: 7 }],
+                            truncated: false,
+                        },
+                    },
+                },
+            },
+        });
+        expect(
+            (done[0] as unknown as { _meta: { dsh: { toolResult: unknown } } })._meta.dsh.toolResult,
+        ).toEqual({
+            value: {
+                matches: [{ path: "/workspace/a.ts", line: 7 }],
+                truncated: false,
+            },
+        });
+    });
+
     it("streams command output onto a display terminal when the client supports one", () => {
         const p = new SessionProjection(undefined, { terminalOutput: true, cwd: "/ws" });
         const start = p.onEvent(
