@@ -173,49 +173,12 @@ Optional wire behavior follows ACP's extension conventions:
 
 #### DSH tool result values
 
-For a successful DSH tool execution, a `tool_call_update` may include the
-tool's native structured return value before DSH renders it for the model:
+The [ACP metadata registry][metadata-registry] is the authoritative list of
+every `_meta` field this adapter reads or emits. It records direction, carrier,
+shape, negotiation requirements, and replay behavior, including native DSH
+tool values at `_meta.dsh.toolResult.value`.
 
-```json
-{
-  "sessionUpdate": "tool_call_update",
-  "toolCallId": "call_123",
-  "status": "completed",
-  "content": [
-    {
-      "type": "content",
-      "content": {
-        "type": "text",
-        "text": "```sh\nstarted background job bash-1\n```\n"
-      }
-    }
-  ],
-  "rawOutput": {
-    "output": "started background job bash-1",
-    "isError": false
-  },
-  "_meta": {
-    "dsh": {
-      "toolResult": {
-        "value": {
-          "kind": "background",
-          "jobId": "bash-1"
-        }
-      }
-    }
-  }
-}
-```
-
-`content` and `rawOutput` remain the standard, normalized ACP result and are
-complete for ordinary clients. `_meta.dsh.toolResult.value` is an optional
-machine-readable DSH value for clients that need native handles such as a
-background `jobId`; it is not a second model-visible result. Live updates use
-the exact value observed from DSH's `tools/result` event. DSH deliberately
-does not persist that execution-local value, so history replay restores this
-metadata only for recognized background-job and continuable-subagent
-acknowledgements. Clients must therefore treat the metadata as optional and
-ignore unknown fields under `_meta`.
+[metadata-registry]: https://github.com/openma-ai/deepseek-harness-acp/blob/main/docs/metadata.md
 
 The current package applies this pattern to the built-in `_dsh/cordis/*`
 family used by the TUI for Client capability discovery, dynamic Package
