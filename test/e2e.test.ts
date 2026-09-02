@@ -890,6 +890,36 @@ describe("dsh-acp server (e2e smoke)", () => {
         ).rejects.toThrow(/session not found/);
     }, 60_000);
 
+    it("resumes a persisted session without replaying its history", async () => {
+        await client.close();
+        client = new AcpTestClient(sessionRoot, workspace);
+        const initialized = (await client.request("initialize", { protocolVersion: 1 })) as Record<string, unknown>;
+        expect(initialized["agentCapabilities"]).toMatchObject({
+            sessionCapabilities: { resume: {} },
+        });
+
+        const result = (await client.request("session/resume", {
+            sessionId,
+            cwd: workspace,
+            mcpServers: [],
+        })) as Record<string, unknown>;
+        expect(result["modes"]).toMatchObject({ currentModeId: "read-only" });
+
+        const replayKinds = new Set([
+            "user_message_chunk",
+            "agent_message_chunk",
+            "agent_thought_chunk",
+            "tool_call",
+            "tool_call_update",
+        ]);
+        expect(client.updatesFor(sessionId).filter((update) => replayKinds.has(String(update["sessionUpdate"])))).toEqual([]);
+
+        await expect(client.request("session/prompt", {
+            sessionId,
+            prompt: [{ type: "text", text: "/status" }],
+        })).resolves.toMatchObject({ stopReason: "end_turn" });
+    }, 60_000);
+
     it("restores a persisted session on direct prompt without session/load", async () => {
         // Zed keeps threads across agent restarts and may prompt an old
         // session id directly; the adapter restores it from the log.

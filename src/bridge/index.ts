@@ -13,8 +13,8 @@
  * - `todo_write` plans, token usage, session titles
  * - real cancellation (`agent.cancel`), permission requests, sandbox-mode
  *   session modes, model switching via session config options
- * - `session/load` with full history replay from JSONL persistence,
- *   `session/list` from the same store
+ * - `session/resume` without transcript replay, `session/load` with full
+ *   history replay from JSONL persistence, `session/list` from the same store
  */
 
 import { randomUUID } from "node:crypto";
@@ -41,6 +41,8 @@ import {
     type NewSessionResponse,
     type PromptRequest,
     type PromptResponse,
+    type ResumeSessionRequest,
+    type ResumeSessionResponse,
     type SessionConfigOption,
     type SessionInfo,
     type SessionModeState,
@@ -87,7 +89,7 @@ import {
 } from "../auth.ts";
 import { openLocalAuthPage, startLocalAuthPage } from "../auth-page.ts";
 import { logDebug, logWarn } from "../log.ts";
-import { buildReplay } from "./history.ts";
+import { buildReplay, buildResumeMetadata, type ResumeMetadata } from "./history.ts";
 import { LatestPublication } from "./latest-publication.ts";
 import {
     interactionModeFromClientMeta,
@@ -717,8 +719,10 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         } catch (error: unknown) {
             throw invalidParams(`session not found: ${sessionId} (${errorChain(error)})`);
         }
-        const replay = buildReplay(events as unknown as HarnessEvent[]);
+        let restored: ResumeMetadata;
         if (options.replay) {
+            const replay = buildReplay(events as unknown as HarnessEvent[]);
+            restored = replay;
             for (const update of replay.updates) notify(sessionId, update);
             if (replay.title !== undefined) {
                 notify(sessionId, {
@@ -726,6 +730,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     title: replay.title,
                 });
             }
+        } else {
+            restored = buildResumeMetadata(events as unknown as HarnessEvent[]);
         }
         const presets = presetsService();
         const storedPreset = presetFromLog(storedHeader, events as unknown as { type?: string }[]);
@@ -736,11 +742,11 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             ...(presetSetup(presets, presetId) !== undefined ? { setup: presetSetup(presets, presetId) } : {}),
         } as Parameters<typeof agents.resume>[0]);
         const cwd = options.cwd ?? storedHeader?.cwd;
-        const projection = new SessionProjection(replay.contextWindow, {
+        const projection = new SessionProjection(restored.contextWindow, {
             terminalOutput: clientTerminalOutput,
             ...(cwd !== undefined ? { cwd } : {}),
         });
-        projection.title = replay.title;
+        projection.title = restored.title;
         const record = registerRecord(
             sessionId,
             handle.agent,
@@ -1681,7 +1687,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                         // mcp-client's second transport. Legacy SSE does not.
                         mcpCapabilities: { http: true, sse: false },
                         auth: { logout: {} },
-                        sessionCapabilities: { list: {} },
+                        sessionCapabilities: { list: {}, resume: {} },
                     },
                     authMethods: advertisedAuthMethods(
                         providers,
@@ -1800,6 +1806,21 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 syncMcpServers(params.mcpServers, params.cwd);
                 requirePersistence();
                 const record = await restoreSession(params.sessionId, { replay: true, cwd: params.cwd });
+                const options = await configOptions(record);
+                return {
+                    modes: modeState(record),
+                    ...(options.length > 0 ? { configOptions: options } : {}),
+                };
+            },
+
+            async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+                assertOpen();
+                await requireCredential(config.provider);
+                validateCwd(params.cwd);
+                validateAdditionalDirectories(params.additionalDirectories);
+                syncMcpServers(params.mcpServers, params.cwd);
+                requirePersistence();
+                const record = await restoreSession(params.sessionId, { replay: false, cwd: params.cwd });
                 const options = await configOptions(record);
                 return {
                     modes: modeState(record),

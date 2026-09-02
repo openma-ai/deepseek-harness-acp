@@ -21,6 +21,29 @@ export interface ReplayResult {
     contextWindow: number | undefined;
 }
 
+export type ResumeMetadata = Pick<ReplayResult, "title" | "contextWindow">;
+
+/**
+ * Fold only the state needed to continue a persisted session. Unlike
+ * `buildReplay`, this never projects transcript events or retains ACP updates.
+ */
+export function buildResumeMetadata(events: readonly HarnessEvent[]): ResumeMetadata {
+    let title: string | undefined;
+    let contextWindow: number | undefined;
+    for (const event of events) {
+        if (event.type === "session/title") {
+            const value = event.data?.["title"];
+            if (typeof value === "string" && value.length > 0) title = value;
+            continue;
+        }
+        if (event.type === "request/context") {
+            const value = event.data?.["contextWindow"];
+            if (typeof value === "number" && value > 0) contextWindow = value;
+        }
+    }
+    return { title, contextWindow };
+}
+
 function userMessage(data: Record<string, unknown> | undefined): { text?: string } | undefined {
     if (data === undefined) return undefined;
     const source = data["source"];
