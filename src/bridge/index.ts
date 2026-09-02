@@ -56,7 +56,7 @@ import {
 import type { Context } from "@deepseek-ai/cordis";
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
 import type { Agent } from "@deepseek-ai/dsh-agent";
-import { ReasoningEffortId, type createUserMessage, type errorChain } from "@deepseek-ai/dsh-llm";
+import { type createUserMessage, type errorChain } from "@deepseek-ai/dsh-llm";
 import type { SessionId, SessionEvent } from "@deepseek-ai/dsh-session";
 import type { foldSessionTitle } from "@deepseek-ai/dsh-session-title";
 import type { setSandboxMode } from "@deepseek-ai/dsh-sandbox-policy";
@@ -331,27 +331,28 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         label: string;
     }
 
-    /** The composition's default selection (agent-default-model → settings.yaml). */
-    const defaultSelection = (): { provider?: string; model?: string; reasoningEffort?: string } => {
+    /** The composition's default route (agent-default-model → settings.yaml). */
+    const defaultRoute = (): { provider?: string; model?: string } => {
         try {
-            return agentDefaultModel.currentSelection();
+            const { provider, model } = agentDefaultModel.currentSelection();
+            return {
+                ...(provider !== undefined ? { provider } : {}),
+                ...(model !== undefined ? { model } : {}),
+            };
         } catch (error: unknown) {
             logDebug(`agentDefaultModel.currentSelection failed: ${String(error)}`);
             return {};
         }
     };
 
-    /** Match Web: a successful session selection also becomes the live product default. */
-    const saveDefaultSelection = async (record: SessionRecord): Promise<void> => {
+    /** Match Web for the route only; reasoning effort is ACP session state. */
+    const saveDefaultModel = async (record: SessionRecord): Promise<void> => {
         const selected = ensureSelection(record)?.current;
         if (selected === undefined) return;
         try {
             await agentDefaultModel.saveSelection({
                 provider: selected.provider,
                 model: selected.model,
-                ...(selected.reasoningEffort === undefined
-                    ? {}
-                    : { reasoningEffort: ReasoningEffortId(selected.reasoningEffort) }),
             });
         } catch (error: unknown) {
             // The current-session switch remains valid when settings are
@@ -360,7 +361,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         }
     };
 
-    const defaultProvider = (): string | undefined => config.provider ?? defaultSelection().provider;
+    const defaultProvider = (): string | undefined => config.provider ?? defaultRoute().provider;
 
     const encodeChoice = (provider: string | undefined, model: string): string =>
         provider === undefined || provider === defaultProvider() ? model : `${provider}::${model}`;
@@ -425,7 +426,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         const model =
             record.model ??
             config.model ??
-            defaultSelection().model ??
+            defaultRoute().model ??
             logged?.model ??
             record.agent.options.model;
         return {
@@ -488,10 +489,9 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
 
     /**
      * Install (once per live agent) the mutable selection prompt assembly
-     * snapshots. Reads fall back to the logged header, then the session's
-     * route composed with the product-default reasoning effort (the Web UI
-     * saved selection), so an untouched session runs exactly what the other
-     * dsh entry points (web, headless) would run.
+     * snapshots. Reads fall back to the logged header, then only the
+     * session's route. Omitting reasoning effort here lets the owning adapter
+     * materialize its advertised default; product settings are not ACP state.
      */
     const ensureSelection = (record: SessionRecord): ModelSelectionRef | undefined => {
         const install = harness.installModelSelection;
@@ -505,15 +505,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 if (logged !== undefined) return logged;
                 const { provider, model } = routeOf(record);
                 if (provider === undefined || model === undefined) return undefined;
-                const defaults = defaultSelection();
-                // Effort applies when the route is the default selection's own
-                // model (or the default names no model): a explicitly pinned
-                // different model keeps its adapter-default behavior.
-                const effort =
-                    defaults.model === undefined || defaults.model === model
-                        ? defaults.reasoningEffort
-                        : undefined;
-                return { provider, model, ...(effort !== undefined ? { reasoningEffort: effort } : {}) };
+                return { provider, model };
             },
             set current(next: ModelSelectionValue | undefined) {
                 picked = next;
@@ -574,7 +566,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             delete record.provider;
         }
         // The old selection ref died with the disposed agent's scope; reinstall
-        // immediately so the default reasoning effort keeps applying.
+        // it immediately under the new adapter-owned route and effort catalog.
         delete record.selection;
         const route = routeOf(record);
         const catalog = await effortCatalog(route.provider, route.model);
@@ -592,7 +584,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 ...(effort !== undefined ? { reasoningEffort: effort } : {}),
             };
         }
-        await saveDefaultSelection(record);
+        await saveDefaultModel(record);
         // Approval policy is agent-scoped state; re-apply it to the new agent.
         setApprovalPolicy(record, record.approvals);
     };
@@ -648,7 +640,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         model: string | undefined,
         provider?: string,
     ): { provider?: string; model?: string; maxTokens?: number; interactionMode?: AcpInteractionMode } => {
-        const defaults = defaultSelection();
+        const defaults = defaultRoute();
         const resolvedProvider = provider ?? config.provider ?? defaults.provider;
         const resolvedModel = model ?? config.model ?? defaults.model;
         return withInteractionMode({
@@ -1106,7 +1098,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         };
         const current = encodeChoice(
             record.provider,
-            record.model ?? config.model ?? defaultSelection().model ?? record.agent.options.model ?? "",
+            record.model ?? config.model ?? defaultRoute().model ?? record.agent.options.model ?? "",
         );
         if (current.length === 0) return [];
         // Adapter directory first: it carries human names and third-party
@@ -1191,9 +1183,6 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             const preferred = [
                 record.effort,
                 loggedConfig(record)?.reasoningEffort,
-                // The user's saved product default (Web UI → settings.yaml),
-                // e.g. reasoningEffort: max, outranks the adapter's default.
-                defaultSelection().reasoningEffort,
                 efforts.defaultEffort,
             ].find(
                 (candidate): candidate is string => candidate !== undefined && known.has(candidate),
@@ -2062,7 +2051,6 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                             reasoningEffort: value,
                         };
                         record.effort = value;
-                        await saveDefaultSelection(record);
                         break;
                     }
                     case "collaboration_mode": {

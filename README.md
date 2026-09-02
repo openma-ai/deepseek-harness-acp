@@ -223,7 +223,7 @@ another provider.
 - **Tool calls** — ACP kinds, human titles, file locations, real diffs from fs-tool hunks, raw input/output; command output on a **display terminal** when the client supports one, fenced output otherwise.
 - **Permission presets as session modes** — `read-only` / `workspace-write` / `danger-full-access`, each a named `{sandbox, approval}` pair recorded as a durable session fact (also exposed as a config option for clients that only render those).
 - **Agent composition** — when the profile mounts `agentPresets`, an uncategorized config option `id: "agent"` lists the roster (`standard` / `code` / `minimal` / `cordis`, plus user copies). Switching rebuilds the agent live with history preserved. Authoring (copy/rm) stays on the Web settings page; there is no `/preset` slash.
-- **Live model catalog** — providers × models from the running composition (third-party providers added in the Web UI appear immediately), plus reasoning-effort selection that follows your product default.
+- **Live model catalog** — providers × models from the running composition (third-party providers added in the Web UI appear immediately), plus adapter-owned reasoning-effort options and defaults. An ACP effort choice is scoped to its session.
 - **Slash commands** — adapter built-ins (`/status`, `/model`) plus the harness command registry (`/compact`, `/goal`, `/permission`, `/plan`, …) executed without a model turn, plus **skills** (`/skill-name` — the harness's own invocation gesture). Login and logout are ACP methods, not chat commands.
 - **Plans & usage** — `todo_write` snapshots as ACP plans; token accounting as `usage_update` and per-turn usage.
 - **Sessions** — `session/resume` restores a durable session without replaying its transcript; `session/load` remains the full-history path. Also supports `session/list`, silent restore when a client prompts an old session after an agent restart, and titles as `session_info_update`. Multi-root sessions are not advertised: non-empty `additionalDirectories` on `session/new`, `session/resume`, or `session/load` return `Invalid params` until [dsh supports multiple workspace roots](https://github.com/deepseek-ai/deepseek-harness/discussions/2474).
@@ -233,7 +233,8 @@ another provider.
 ## Configuration
 
 Flags win over environment variables, which win over defaults. All optional —
-with no flags, sessions follow your product defaults (`settings.yaml`).
+with no route flags, provider and model follow your product defaults
+(`settings.yaml`); reasoning effort remains adapter/ACP-owned.
 
 | Flag | Env | Default | Purpose |
 |---|---|---|---|
@@ -242,7 +243,7 @@ with no flags, sessions follow your product defaults (`settings.yaml`).
 | `--model` | `DSH_MODEL` | product default | Model override |
 | `--max-tokens` | `DSH_MAX_TOKENS` | provider default | Per-request output-token cap |
 | `--permission-mode` | `DSH_PERMISSION_MODE` | `workspace-write` | Initial permission preset |
-| `--reasoning-effort` | `DSH_REASONING_EFFORT` | product default | `off` / `high` / `max` |
+| `--reasoning-effort` | `DSH_REASONING_EFFORT` | `high` | Adapter default; `off` / `high` / `max` |
 | — | `DEEPSEEK_API_KEY` | — | API credential (fallback to the credential store) |
 | — | `DEEPSEEK_BASE_URL` | DeepSeek endpoint | OpenAI-compatible endpoint override |
 | — | `DSH_ACP_DEBUG` | off | Verbose stderr diagnostics |

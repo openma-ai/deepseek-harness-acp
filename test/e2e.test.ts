@@ -10,6 +10,7 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -47,6 +48,7 @@ class AcpTestClient {
             // Host-default tests must not inherit the developer shell's
             // explicit per-process override.
             DSH_PERMISSION_MODE: undefined,
+            DSH_REASONING_EFFORT: undefined,
             ...(dshPath !== undefined ? { DSH_PATH: dshPath } : {}),
             ...(envPatch ?? {}),
         };
@@ -358,7 +360,7 @@ describe("dsh-acp Host-owned defaults", () => {
             .toMatchObject({ provider: "deepseek-official", model: "deepseek-v4-pro" });
     }, 90_000);
 
-    it("saves the selected model and effort as the default for later sessions", async () => {
+    it("saves the selected model but keeps effort scoped to its session", async () => {
         const sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-default-model-sessions-"));
         const workspace = mkdtempSync(join(tmpdir(), "dsh-acp-default-model-workspace-"));
         roots.push(sessionRoot, workspace);
@@ -380,6 +382,8 @@ describe("dsh-acp Host-owned defaults", () => {
             configId: "effort",
             value: "max",
         });
+        expect(readFileSync(join(sessionRoot, "home", "settings.yaml"), "utf8"))
+            .not.toContain("reasoningEffort");
 
         const later = (await client.request("session/new", {
             cwd: workspace,
@@ -387,7 +391,68 @@ describe("dsh-acp Host-owned defaults", () => {
         })) as { configOptions: Array<Record<string, unknown>> };
         const options = new Map(later.configOptions.map((option) => [option["id"], option]));
         expect(options.get("model")).toMatchObject({ currentValue: "deepseek-v4-pro" });
-        expect(options.get("effort")).toMatchObject({ currentValue: "max" });
+        expect(options.get("effort")).toMatchObject({ currentValue: "high" });
+    }, 90_000);
+
+    it("ignores the persisted settings effort when assembling a prompt", async () => {
+        const sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-settings-effort-sessions-"));
+        const workspace = mkdtempSync(join(tmpdir(), "dsh-acp-settings-effort-workspace-"));
+        const harnessHome = join(sessionRoot, "home");
+        roots.push(sessionRoot, workspace);
+        mkdirSync(harnessHome, { recursive: true });
+        writeFileSync(
+            join(harnessHome, "settings.yaml"),
+            [
+                "agent-default-model:",
+                "  provider: deepseek-official",
+                "  model: deepseek-v4-pro",
+                "  reasoningEffort: max",
+                "",
+            ].join("\n"),
+        );
+
+        const requestBodies: Array<Record<string, unknown>> = [];
+        const server = createServer((request, response) => {
+            let body = "";
+            request.setEncoding("utf8");
+            request.on("data", (chunk: string) => {
+                body += chunk;
+            });
+            request.on("end", () => {
+                requestBodies.push(JSON.parse(body) as Record<string, unknown>);
+                response.writeHead(400, { "content-type": "application/json" });
+                response.end(JSON.stringify({ error: { message: "fixture stop" } }));
+            });
+        });
+        await new Promise<void>((resolve, reject) => {
+            server.once("error", reject);
+            server.listen(0, "127.0.0.1", resolve);
+        });
+
+        try {
+            const address = server.address();
+            if (address === null || typeof address === "string") throw new Error("fixture server has no TCP address");
+            const client = new AcpTestClient(sessionRoot, workspace, undefined, {
+                DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}`,
+            });
+            clients.push(client);
+
+            await client.request("initialize", { protocolVersion: 1 }, 60_000);
+            const created = (await client.request("session/new", {
+                cwd: workspace,
+                mcpServers: [],
+            })) as { sessionId: string };
+            await client.request("session/prompt", {
+                sessionId: created.sessionId,
+                prompt: [{ type: "text", text: "settings effort source probe" }],
+            }).catch(() => undefined);
+
+            expect(requestBodies[0]).toMatchObject({ reasoning_effort: "high" });
+        } finally {
+            await new Promise<void>((resolve, reject) => {
+                server.close((error) => error === undefined ? resolve() : reject(error));
+            });
+        }
     }, 90_000);
 
     it("restores the selected permission after the ACP Host restarts", async () => {
