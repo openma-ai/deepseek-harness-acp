@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildReplay } from "../src/bridge/history.ts";
+import { buildReplay, buildResumeMetadata } from "../src/bridge/history.ts";
 import type { HarnessEvent } from "../src/bridge/translate.ts";
 
 const log: HarnessEvent[] = [
@@ -41,6 +41,13 @@ const log: HarnessEvent[] = [
 ];
 
 describe("buildReplay", () => {
+    it("folds resume metadata without constructing replay updates", () => {
+        expect(buildResumeMetadata(log)).toEqual({
+            title: "Fix the bug",
+            contextWindow: 4096,
+        });
+    });
+
     it("replays user text, tools, assistant text, and only the final plan", () => {
         const replay = buildReplay(log);
         const kinds = replay.updates.map((update) => update.sessionUpdate);
