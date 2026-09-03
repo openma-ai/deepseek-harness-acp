@@ -1,5 +1,5 @@
 /**
- * `session/load` history replay.
+ * Stored-log history replay (`session/load` and `session/resume`).
  *
  * The harness persists every session as an append-only event log; constructor
  * seeds do not re-fire the live `session/event` hook, so history replay reads
@@ -21,13 +21,15 @@ export interface ReplayResult {
     contextWindow: number | undefined;
 }
 
-export type ResumeMetadata = Pick<ReplayResult, "title" | "contextWindow">;
+export type RestoreMetadata = Pick<ReplayResult, "title" | "contextWindow">;
 
 /**
  * Fold only the state needed to continue a persisted session. Unlike
- * `buildReplay`, this never projects transcript events or retains ACP updates.
+ * `buildReplay`, this never projects transcript events or retains ACP updates;
+ * it backs the silent restore when a client keeps prompting an old session id
+ * after an agent restart (the client already renders the thread itself).
  */
-export function buildResumeMetadata(events: readonly HarnessEvent[]): ResumeMetadata {
+export function buildRestoreMetadata(events: readonly HarnessEvent[]): RestoreMetadata {
     let title: string | undefined;
     let contextWindow: number | undefined;
     for (const event of events) {

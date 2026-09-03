@@ -13,8 +13,8 @@
  * - `todo_write` plans, token usage, session titles
  * - real cancellation (`agent.cancel`), permission requests, sandbox-mode
  *   session modes, model switching via session config options
- * - `session/resume` without transcript replay, `session/load` with full
- *   history replay from JSONL persistence, `session/list` from the same store
+ * - `session/resume` and `session/load` both replay the stored transcript
+ *   from JSONL persistence, `session/list` from the same store
  */
 
 import { randomUUID } from "node:crypto";
@@ -89,7 +89,7 @@ import {
 } from "../auth.ts";
 import { openLocalAuthPage, startLocalAuthPage } from "../auth-page.ts";
 import { logDebug, logWarn } from "../log.ts";
-import { buildReplay, buildResumeMetadata, type ResumeMetadata } from "./history.ts";
+import { buildReplay, buildRestoreMetadata, type RestoreMetadata } from "./history.ts";
 import { LatestPublication } from "./latest-publication.ts";
 import {
     interactionModeFromClientMeta,
@@ -692,7 +692,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
      * Resume one persisted session into a live record: inspect the log,
      * optionally replay its history to the client, rebuild the agent with
      * its stored preset, and fold logged permission facts. Shared by
-     * `session/load` (replay: true) and silent restore (replay: false).
+     * `session/load` and `session/resume` (replay: true) and the silent
+     * restore when a client prompts an old session id (replay: false).
      */
     const restoreSession = async (
         sessionId: string,
@@ -719,7 +720,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         } catch (error: unknown) {
             throw invalidParams(`session not found: ${sessionId} (${errorChain(error)})`);
         }
-        let restored: ResumeMetadata;
+        let restored: RestoreMetadata;
         if (options.replay) {
             const replay = buildReplay(events as unknown as HarnessEvent[]);
             restored = replay;
@@ -731,7 +732,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 });
             }
         } else {
-            restored = buildResumeMetadata(events as unknown as HarnessEvent[]);
+            restored = buildRestoreMetadata(events as unknown as HarnessEvent[]);
         }
         const presets = presetsService();
         const storedPreset = presetFromLog(storedHeader, events as unknown as { type?: string }[]);
@@ -1813,6 +1814,12 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 };
             },
 
+            // Downstream clients reopen durable sessions with `session/resume`
+            // (Martty `/resume`, session pickers) and render only what this
+            // adapter streams, so the stored transcript is replayed exactly as
+            // on `session/load`. A client that already renders its own thread
+            // never resumes: it keeps prompting the old session id, which
+            // silently restores without replay.
             async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
                 assertOpen();
                 await requireCredential(config.provider);
@@ -1820,7 +1827,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 validateAdditionalDirectories(params.additionalDirectories);
                 syncMcpServers(params.mcpServers, params.cwd);
                 requirePersistence();
-                const record = await restoreSession(params.sessionId, { replay: false, cwd: params.cwd });
+                const record = await restoreSession(params.sessionId, { replay: true, cwd: params.cwd });
                 const options = await configOptions(record);
                 return {
                     modes: modeState(record),

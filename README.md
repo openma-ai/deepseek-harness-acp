@@ -226,7 +226,7 @@ another provider.
 - **Live model catalog** — providers × models from the running composition (third-party providers added in the Web UI appear immediately), plus reasoning-effort selection that follows your product default.
 - **Slash commands** — adapter built-ins (`/status`, `/model`) plus the harness command registry (`/compact`, `/goal`, `/permission`, `/plan`, …) executed without a model turn, plus **skills** (`/skill-name` — the harness's own invocation gesture). Login and logout are ACP methods, not chat commands.
 - **Plans & usage** — `todo_write` snapshots as ACP plans; token accounting as `usage_update` and per-turn usage.
-- **Sessions** — `session/resume` restores a durable session without replaying its transcript; `session/load` remains the full-history path. Also supports `session/list`, silent restore when a client prompts an old session after an agent restart, and titles as `session_info_update`. Multi-root sessions are not advertised: non-empty `additionalDirectories` on `session/new`, `session/resume`, or `session/load` return `Invalid params` until [dsh supports multiple workspace roots](https://github.com/deepseek-ai/deepseek-harness/discussions/2474).
+- **Sessions** — `session/resume` and `session/load` restore a durable session and replay its stored transcript; downstream clients reopen sessions with either method. Only a client that already renders the thread itself skips replay — it keeps prompting the old session id after an agent restart (silent restore, no replay). Also supports `session/list` and titles as `session_info_update`. Multi-root sessions are not advertised: non-empty `additionalDirectories` on `session/new`, `session/resume`, or `session/load` return `Invalid params` until [dsh supports multiple workspace roots](https://github.com/deepseek-ai/deepseek-harness/discussions/2474).
 - **MCP servers** — per-session `mcpServers` mount `@deepseek-ai/dsh-mcp-client` instances (stdio + streamable HTTP); tools join as `mcp__<server>__<tool>`; a failing server never takes the session down.
 - **Real cancellation** — `session/cancel` interrupts the live turn through the harness agent.
 
@@ -275,7 +275,7 @@ dsh-acp
         ├─ index.ts           sessions, prompts, cancel, modes, options,
         │                     commands, credentials, MCP mounts
         ├─ translate.ts       session-event → ACP update projection (pure)
-        ├─ history.ts         stored-log replay for session/load (pure)
+        ├─ history.ts         stored-log replay for session/load + resume (pure)
         └─ prompt.ts          ACP prompt blocks → harness content blocks (pure)
    ▼
 external or package-bundled dsh     (agent spine, llm, persistence, sandbox,

@@ -866,6 +866,17 @@ describe("dsh-acp server (e2e smoke)", () => {
         });
     }, 60_000);
 
+    it("persists a real user turn into the durable transcript", async () => {
+        // Adapter commands (/status) never reach the model, so their turns
+        // leave no transcript events behind. A real user prompt does — the
+        // model endpoint here is dead by design, and the failed turn still
+        // checkpoints its user/message, which history replay must reproduce.
+        await expect(client.request("session/prompt", {
+            sessionId,
+            prompt: [{ type: "text", text: "remember this turn for replay" }],
+        })).rejects.toThrow(/failed/);
+    }, 60_000);
+
     it("loads a persisted session from a fresh server process", async () => {
         // End the first server so the second owns the JSONL store exclusively.
         await client.close();
@@ -890,7 +901,7 @@ describe("dsh-acp server (e2e smoke)", () => {
         ).rejects.toThrow(/session not found/);
     }, 60_000);
 
-    it("resumes a persisted session without replaying its history", async () => {
+    it("replays the stored transcript when a session is resumed", async () => {
         await client.close();
         client = new AcpTestClient(sessionRoot, workspace);
         const initialized = (await client.request("initialize", { protocolVersion: 1 })) as Record<string, unknown>;
@@ -905,15 +916,33 @@ describe("dsh-acp server (e2e smoke)", () => {
         })) as Record<string, unknown>;
         expect(result["modes"]).toMatchObject({ currentModeId: "read-only" });
 
-        const replayKinds = new Set([
-            "user_message_chunk",
-            "agent_message_chunk",
-            "agent_thought_chunk",
-            "tool_call",
-            "tool_call_update",
-        ]);
-        expect(client.updatesFor(sessionId).filter((update) => replayKinds.has(String(update["sessionUpdate"])))).toEqual([]);
+        // Downstream clients that reopen durable sessions (Martty `/resume`)
+        // render only what this adapter streams, so resume replays the stored
+        // transcript the same way session/load does — including the real user
+        // turn persisted above.
+        const replayedKinds = (): Array<Record<string, unknown>> => client
+            .updatesFor(sessionId)
+            .filter((update) => {
+                const kind = String(update["sessionUpdate"]);
+                return kind === "user_message_chunk"
+                    || kind === "agent_message_chunk"
+                    || kind === "agent_thought_chunk"
+                    || kind === "tool_call"
+                    || kind === "tool_call_update";
+            });
+        let replayed = replayedKinds();
+        for (let attempt = 0; replayed.length === 0 && attempt < 80; attempt += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 25));
+            replayed = replayedKinds();
+        }
+        expect(replayed).toContainEqual(
+            expect.objectContaining({
+                sessionUpdate: "user_message_chunk",
+                content: { type: "text", text: "remember this turn for replay" },
+            }),
+        );
 
+        // The resumed session accepts adapter commands again.
         await expect(client.request("session/prompt", {
             sessionId,
             prompt: [{ type: "text", text: "/status" }],
@@ -922,7 +951,10 @@ describe("dsh-acp server (e2e smoke)", () => {
 
     it("restores a persisted session on direct prompt without session/load", async () => {
         // Zed keeps threads across agent restarts and may prompt an old
-        // session id directly; the adapter restores it from the log.
+        // session id directly; the adapter restores it from the log. This
+        // silent path stays replay-free (the client already renders the
+        // thread) — replay happens only on explicit session/load or
+        // session/resume.
         await client.close();
         client = new AcpTestClient(sessionRoot, workspace);
         await client.request("initialize", { protocolVersion: 1 });
@@ -931,6 +963,12 @@ describe("dsh-acp server (e2e smoke)", () => {
             prompt: [{ type: "text", text: "/status" }],
         })) as Record<string, unknown>;
         expect(status["stopReason"]).toBe("end_turn");
+        // Silent restore must stay replay-free: the live /status turn never
+        // emits user_message_chunk, so one here would mean the stored
+        // transcript had been replayed behind the client's back.
+        expect(client.updatesFor(sessionId).filter(
+            (update) => update["sessionUpdate"] === "user_message_chunk",
+        )).toEqual([]);
         // Truly unknown ids still fail loudly.
         await expect(
             client.request("session/prompt", {
