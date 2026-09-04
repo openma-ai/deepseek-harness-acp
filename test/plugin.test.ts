@@ -46,4 +46,38 @@ describe("embeddable ACP Host plugin", () => {
         ]);
         expect(services.has("acpServer")).toBe(true);
     });
+
+    it("mounts only the ACP server when the surface already provides agentPresets and dynamicCordisRunner", async () => {
+        // dsh 0.1.2-era surfaces (and profiles that carry the ACP bundle rows)
+        // already supply both Host services; the fallback mount must be skipped
+        // entirely so its preset-root discovery can never run or fail.
+        const imports: string[] = [];
+        const services = new Map<string, unknown>();
+        const ctx = {
+            baseUrl: import.meta.url,
+            get(name: string) {
+                return services.get(name);
+            },
+            loader: {
+                async import(specifier: string) {
+                    imports.push(specifier);
+                    throw new Error(`unexpected fallback import of ${specifier}`);
+                },
+                unwrapExports(exports: unknown) {
+                    return exports;
+                },
+            },
+            async plugin(plugin: unknown) {
+                if ((plugin as { name?: string }).name === "acp-server") services.set("acpServer", {});
+            },
+        };
+        services.set("agentPresets", {});
+        services.set("dynamicCordisRunner", {});
+        const plugin = await import("../src/plugin.ts");
+
+        await plugin.apply(ctx as never);
+
+        expect(imports).toEqual([]);
+        expect(services.has("acpServer")).toBe(true);
+    });
 });

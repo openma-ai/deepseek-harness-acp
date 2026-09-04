@@ -35,30 +35,60 @@ function resolvedHostModule(ctx: Context, specifier: string): string {
     return specifier;
 }
 
-function shippedPresetRoot(ctx: Context): string {
+type PresetRoot = { path: string; trust: "system" };
+
+/**
+ * Where the four shipped presets live changed with the dsh generation:
+ *
+ * - dsh 0.1.1 ships them inside the meta package at
+ *   `@deepseek-ai/dsh/config/agent-presets`;
+ * - dsh 0.1.2 ships them inside `@deepseek-ai/dsh-agent-presets/presets` and
+ *   prepends that root itself via its `includeShippedRoot` default, so the
+ *   mount must pass no explicit roots at all.
+ *
+ * Returns the explicit system root for the legacy layout, an empty list when
+ * the resolved roster package self-ships its presets, and throws only when
+ * neither layout can be resolved (the mount would otherwise silently serve an
+ * empty roster).
+ */
+function shippedPresetRoots(ctx: Context): PresetRoot[] {
     const anchors = [ctx.baseUrl, import.meta.url].filter((value): value is string => typeof value === "string");
     for (const anchor of anchors) {
         try {
             const manifest = createRequire(anchor).resolve("@deepseek-ai/dsh/package.json");
             const root = join(dirname(manifest), "config", "agent-presets");
-            if (existsSync(root)) return root;
+            if (existsSync(root)) return [{ path: root, trust: "system" }];
         } catch {
             // Try the next resolution anchor.
         }
     }
-    throw new Error("dsh-acp-plugin: cannot resolve the dsh shipped agent presets");
+    for (const anchor of anchors) {
+        try {
+            const manifest = createRequire(anchor).resolve("@deepseek-ai/dsh-agent-presets/package.json");
+            if (existsSync(join(dirname(manifest), "presets"))) return [];
+        } catch {
+            // Try the next resolution anchor.
+        }
+    }
+    throw new Error(
+        "dsh-acp-plugin: cannot resolve the dsh shipped agent presets (looked for @deepseek-ai/dsh/config/agent-presets and a self-shipping @deepseek-ai/dsh-agent-presets)",
+    );
 }
 
 async function mountService(
     ctx: Context,
     service: string,
     specifier: string,
-    config?: unknown,
+    config?: unknown | (() => unknown),
 ): Promise<void> {
     if (ctx.get(service) !== undefined) return;
+    // A config factory defers resolution to the mount that actually needs it:
+    // a composition that already provides the service never pays for (or can
+    // fail on) the fallback's preset-root discovery.
+    const resolved = typeof config === "function" ? config() : config;
     const exports = await ctx.loader.import(resolvedHostModule(ctx, specifier));
     const plugin = ctx.loader.unwrapExports(exports);
-    await ctx.plugin(plugin, config);
+    await ctx.plugin(plugin, resolved);
     if (ctx.get(service) === undefined) {
         throw new Error(`dsh-acp-plugin: ${specifier} did not provide ${service}`);
     }
@@ -66,9 +96,14 @@ async function mountService(
 
 export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     if (ctx.get("acpServer") !== undefined) return;
-    await mountService(ctx, "agentPresets", "@deepseek-ai/dsh-agent-presets", {
-        default: "standard",
-        roots: [{ path: shippedPresetRoot(ctx), trust: "system" }],
+    await mountService(ctx, "agentPresets", "@deepseek-ai/dsh-agent-presets", () => {
+        const roots = shippedPresetRoots(ctx);
+        return {
+            default: "standard",
+            // dsh 0.1.2's roster self-ships its presets (includeShippedRoot);
+            // passing the legacy root there would duplicate the roster.
+            ...(roots.length > 0 ? { roots } : {}),
+        };
     });
     await mountService(ctx, "dynamicCordisRunner", "@deepseek-ai/dsh-cordis-host-runner");
     await ctx.plugin(server, config);
