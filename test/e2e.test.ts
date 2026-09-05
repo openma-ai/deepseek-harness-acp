@@ -622,7 +622,7 @@ describe("dsh-acp server (e2e smoke)", () => {
             client.request("session/set_config_option", {
                 sessionId: createdSessionId,
                 configId: "agent",
-                value: "code",
+                value: "ptc",
             }),
             client.request("session/set_config_option", {
                 sessionId: createdSessionId,

@@ -61,7 +61,7 @@ jobs:
       - name: Pack ACP plugin
         run: npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP"
       - name: Exercise the installed dsh profile
-        run: node scripts/profile-smoke.mjs "$RUNNER_TEMP/dsh-host/node_modules/@deepseek-ai/dsh/lib/bin.js" "$RUNNER_TEMP/openma-deepseek-harness-acp-$(node -p "require('./package.json').version").tgz"
+        run: npm exec -- node scripts/profile-smoke.mjs "$RUNNER_TEMP/dsh-host/node_modules/@deepseek-ai/dsh/lib/bin.js" "$RUNNER_TEMP/openma-deepseek-harness-acp-$(node -p "require('./package.json').version").tgz"
 
   publish:
     needs: [test, dsh-compatibility]
