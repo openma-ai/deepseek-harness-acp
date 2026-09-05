@@ -28,7 +28,7 @@ export function verifyIntegrity(bytes, integrity) {
 }
 
 // npm ci omits foreign optional binaries. Restore those exact locked packages
-// into the archive only; never install or execute them on the user's machine.
+// into the archive at build time, without executing package install scripts.
 export async function completePlatformPackages(staging) {
     const lock = JSON.parse(readFileSync(join(staging, "package-lock.json"), "utf8"));
     for (const [path, pkg] of platformPackages(lock)) {

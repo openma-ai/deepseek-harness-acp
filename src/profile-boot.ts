@@ -4,7 +4,7 @@
  * Instead of composing a hand-rolled agent spine, this engine drives the
  * harness's own profile machinery (`@deepseek-ai/dsh-app-boot`) against a
  * discovered installation — the user's `dsh` when present, this package's
- * npm-installed peer as the fallback — so the resulting tree is the same
+ * bundled runtime as the fallback — so the resulting tree is the same
  * product composition `dsh --profile acp` would build:
  *
  *   - the `@deepseek-ai/dsh-base` bundle patch (the full product baseline),
