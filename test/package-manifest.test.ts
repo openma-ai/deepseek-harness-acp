@@ -33,7 +33,7 @@ describe("ACP package manifest", () => {
         expect(manifest.files).toEqual(expect.arrayContaining(["vendor/*.json", "vendor/*.tgz"]));
         expect(manifest.scripts?.["prepack"]).toContain("runtime:pack");
         expect(manifest.dshAcp).toEqual({
-            standaloneDsh: "0.1.1-rc.2",
+            standaloneDsh: "0.1.2-rc.1",
             hostCompatibility: { cordisProtocol: 0, policy: "capability-negotiated" },
         });
 

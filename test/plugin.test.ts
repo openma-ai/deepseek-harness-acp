@@ -13,7 +13,8 @@ describe("embeddable ACP Host plugin", () => {
         const services = new Map<string, unknown>();
         const agentPresets = { name: "agent-presets" };
         const dynamicCordisRunner = { name: "dynamic-cordis-runner" };
-        const loaded = [agentPresets, dynamicCordisRunner];
+        const subagentModelSelection = { name: "subagent-model-selection-settings" };
+        const loaded = [agentPresets, dynamicCordisRunner, subagentModelSelection];
         const ctx = {
             baseUrl: import.meta.url,
             get(name: string) {
@@ -31,6 +32,7 @@ describe("embeddable ACP Host plugin", () => {
             async plugin(plugin: unknown) {
                 if (plugin === agentPresets) services.set("agentPresets", {});
                 if (plugin === dynamicCordisRunner) services.set("dynamicCordisRunner", {});
+                if (plugin === subagentModelSelection) services.set("subagentModelSelection", {});
                 if ((plugin as { name?: string }).name === "acp-server") services.set("acpServer", {});
             },
         };
@@ -38,11 +40,12 @@ describe("embeddable ACP Host plugin", () => {
 
         await plugin.apply(ctx as never);
 
-        expect(imports).toHaveLength(2);
-        expect(imports.map((specifier) => specifier.startsWith("file:"))).toEqual([true, true]);
+        expect(imports).toHaveLength(3);
+        expect(imports.map((specifier) => specifier.startsWith("file:"))).toEqual([true, true, true]);
         expect(imports.map((specifier) => fileURLToPath(specifier).replaceAll("\\", "/"))).toEqual([
             expect.stringMatching(/\/@deepseek-ai\/dsh-agent-presets\/lib\/index\.js$/),
             expect.stringMatching(/\/@deepseek-ai\/dsh-cordis-host-runner\/lib\/index\.js$/),
+            expect.stringMatching(/\/@deepseek-ai\/dsh-tool-subagent\/lib\/model-selection-settings\.js$/),
         ]);
         expect(services.has("acpServer")).toBe(true);
     });
@@ -73,6 +76,7 @@ describe("embeddable ACP Host plugin", () => {
         };
         services.set("agentPresets", {});
         services.set("dynamicCordisRunner", {});
+        services.set("subagentModelSelection", {});
         const plugin = await import("../src/plugin.ts");
 
         await plugin.apply(ctx as never);

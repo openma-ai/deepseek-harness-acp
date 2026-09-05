@@ -147,6 +147,10 @@ export interface BridgeHarness {
     mcpClient?: { apply: (ctx: never, config: never) => void };
 }
 
+function readSessionEvents(session: { snapshotEvents?: () => readonly unknown[]; events?: readonly unknown[] }): readonly unknown[] {
+    return session.snapshotEvents?.() ?? session.events ?? [];
+}
+
 export interface AcpBridgeConfig {
     /** Provider route for ACP-created agents; omitted = the composition's default. */
     provider?: string;
@@ -760,8 +764,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         // sandbox/mode, approval/policy events); mirror the service folds
         // so the advertised state matches what is enforced.
         {
-            const permission = permissionService();
-            const storedMode = permission.current(events as unknown as unknown[]);
+            const storedMode = currentPermission(record);
             if (storedMode !== undefined) record.modeId = storedMode as SandboxMode;
             for (let index = events.length - 1; index >= 0; index -= 1) {
                 const event = events[index] as unknown as { type?: string; data?: { policy?: string } };
@@ -1027,7 +1030,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         names: string[];
         defaultPreset: string;
         resolve(name: string): { sandbox: SandboxMode; approval: ApprovalPolicy; name: string; description: string };
-        current(events: readonly unknown[]): string | undefined;
+        current(sessionOrEvents: unknown): string | undefined;
         apply(
             session: unknown,
             name: string,
@@ -1038,6 +1041,11 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
 
     const permissionService = (): PermissionPresetsService =>
         permissionPresets as unknown as PermissionPresetsService;
+
+    const currentPermission = (record: SessionRecord): string | undefined => {
+        const session = record.agent.session as { snapshotEvents?: () => readonly unknown[]; events?: readonly unknown[] };
+        return permissionService().current(typeof session.snapshotEvents === "function" ? session : readSessionEvents(session));
+    };
 
     /** ACP requires labels even when a deployment configures only preset behavior. */
     const permissionPresentation = (id: string): { name: string; description: string } => {
@@ -1156,7 +1164,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         }
 
         if (commandRuntime.list(record.agent).some((command) => command.name === "plan")) {
-            const active = [...record.agent.session.events]
+            const active = [...readSessionEvents(record.agent.session)]
                 .reverse()
                 .map((event) => event as unknown as HarnessEvent)
                 .find((event) => event.type === "plan/mode")?.data?.["active"] === true;
@@ -1376,10 +1384,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
      * back; the advertised mode must follow the log, not our last write.
      */
     const syncPermissionState = (record: SessionRecord, sessionId: string): void => {
-        const events = (record.agent.session as unknown as { events?: readonly unknown[] }).events;
-        if (events === undefined) return;
-        const permission = permissionService();
-        const storedMode = permission.current(events as unknown[]);
+        const events = readSessionEvents(record.agent.session);
+        const storedMode = currentPermission(record);
         for (let index = events.length - 1; index >= 0; index -= 1) {
             const event = events[index] as { type?: string; data?: { policy?: string } };
             if (event?.type === "approval/policy") {

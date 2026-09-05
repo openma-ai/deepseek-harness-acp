@@ -591,7 +591,7 @@ describe("dsh-acp server (e2e smoke)", () => {
         expect(efforts).toContain("high");
         expect(byId.get("agent")).toMatchObject({ type: "select", currentValue: "standard" });
         const agents = (byId.get("agent") as { options: Array<{ value: string }> }).options.map((o) => o.value);
-        expect(agents).toEqual(expect.arrayContaining(["standard", "code", "minimal", "cordis"]));
+        expect(agents).toEqual(expect.arrayContaining(["standard", "ptc", "minimal", "cordis"]));
     }, 60_000);
 
     it("rejects relative cwds", async () => {

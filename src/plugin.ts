@@ -28,7 +28,9 @@ function resolvedHostModule(ctx: Context, specifier: string): string {
     for (const anchor of anchors) {
         try {
             return pathToFileURL(createRequire(anchor).resolve(specifier)).href;
-        } catch {
+        } catch (error) {
+            // A resolved Host package without this export is authoritative.
+            if ((error as NodeJS.ErrnoException).code === "ERR_PACKAGE_PATH_NOT_EXPORTED") return specifier;
             // Try the next resolution anchor.
         }
     }
@@ -106,6 +108,12 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
         };
     });
     await mountService(ctx, "dynamicCordisRunner", "@deepseek-ai/dsh-cordis-host-runner");
+    // Newer shipped presets require this Host settings owner; older hosts
+    // do not export it and keep their existing delegation behavior.
+    const modelSettings = "@deepseek-ai/dsh-tool-subagent/model-selection-settings";
+    if (ctx.get("subagentModelSelection") === undefined && resolvedHostModule(ctx, modelSettings) !== modelSettings) {
+        await mountService(ctx, "subagentModelSelection", modelSettings);
+    }
     await ctx.plugin(server, config);
     if (ctx.get("acpServer") === undefined) {
         throw new Error("dsh-acp-plugin: ACP server did not activate");

@@ -4,7 +4,7 @@ import type {
     ElicitationContentValue,
     ElicitationPropertySchema,
 } from "@agentclientprotocol/sdk";
-import { Service } from "@deepseek-ai/cordis";
+import { Service, type Context } from "@deepseek-ai/cordis";
 import {
     UserQuestionError,
     type AskUserQuestionAnswer,
@@ -190,26 +190,31 @@ export function installAcpUserQuestionProvider(
     let router = routers.get(owner);
     if (router === undefined) {
         const routes: AcpUserQuestionProviderOptions[] = [];
-        const disposeProvider = service.registerProvider({
-            async ask(request) {
-                for (let index = routes.length - 1; index >= 0; index -= 1) {
-                    const route = routes[index];
-                    const sessionId = route?.sessionIdForRequest(request);
-                    if (route === undefined || sessionId === undefined) continue;
-                    if (!route.formSupported()) {
-                        throw new UserQuestionError(
-                            "the ACP client does not support form elicitation",
-                            "CLIENT_UNSUPPORTED",
-                        );
-                    }
-                    return askUserQuestionsOverAcp(request, sessionId, route.create);
+        const ask = async (request: AskUserQuestionRequest, next?: () => Promise<AskUserQuestionAnswer>): Promise<AskUserQuestionAnswer> => {
+            for (let index = routes.length - 1; index >= 0; index -= 1) {
+                const route = routes[index];
+                const sessionId = route?.sessionIdForRequest(request);
+                if (route === undefined || sessionId === undefined) continue;
+                if (!route.formSupported()) {
+                    throw new UserQuestionError(
+                        "the ACP client does not support form elicitation",
+                        "CLIENT_UNSUPPORTED",
+                    );
                 }
-                throw new UserQuestionError(
-                    "ACP user interaction requires a live root session",
-                    "ASK_MISSING_AGENT",
-                );
-            },
-        });
+                return askUserQuestionsOverAcp(request, sessionId, route.create);
+            }
+            if (next !== undefined) return next();
+            throw new UserQuestionError(
+                "ACP user interaction requires a live root session",
+                "ASK_MISSING_AGENT",
+            );
+        };
+        const legacy = service as unknown as {
+            registerProvider?: (provider: { ask: typeof ask }) => () => void;
+        };
+        const disposeProvider = typeof legacy.registerProvider === "function"
+            ? legacy.registerProvider({ ask })
+            : (service as unknown as { ctx: Context }).ctx.root.on("user-questions/request", ask);
         router = { routes, disposeProvider };
         routers.set(owner, router);
     }

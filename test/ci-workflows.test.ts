@@ -41,13 +41,16 @@ describe("supported CI architectures", () => {
 });
 
 describe("dsh compatibility host", () => {
-    it.each(["ci.yml", "release.yml"])("reuses %s's locked 0.1.1 host without a second install", (workflow) => {
-        const steps = readWorkflow(workflow).jobs?.["dsh-compatibility"]?.steps ?? [];
+    it.each(["ci.yml", "release.yml"])("checks three independent RC hosts through %s's profile matrix", (workflow) => {
+        const job = readWorkflow(workflow).jobs?.["dsh-compatibility"];
+        const steps = job?.steps ?? [];
         const commands = steps.flatMap((step) => step.run ?? []);
-        const exercise = steps.find((step) => step.name === "Exercise session controls through the host");
+        const exercise = steps.find((step) => step.name === "Exercise the installed dsh profile");
 
-        expect(commands.some((command) => command.includes("npm install"))).toBe(false);
-        expect(exercise?.env?.["DSH_ACP_TEST_HOST"]).toBe("${{ github.workspace }}");
+        expect(job?.strategy?.matrix?.dsh).toEqual(["0.1.1-rc.1", "0.1.1-rc.2", "0.1.2-rc.1"]);
+        expect(commands.some((command) => command.includes('"@deepseek-ai/dsh@${{ matrix.dsh }}"'))).toBe(true);
+        expect(exercise?.run).toContain("scripts/profile-smoke.mjs");
+        expect(exercise?.run).toContain("$RUNNER_TEMP/dsh-host/");
     });
 });
 
@@ -57,6 +60,7 @@ describe("release provenance", () => {
         const guardCommands = jobs?.["verify-tag"]?.steps?.flatMap((step) => step.run ?? []);
 
         expect(jobs?.["test"]?.needs).toBe("verify-tag");
+        expect(jobs?.["publish"]?.needs).toContain("dsh-compatibility");
         expect(guardCommands).toContain(
             'bash scripts/verify-release-tag.sh "$GITHUB_SHA" origin/main',
         );

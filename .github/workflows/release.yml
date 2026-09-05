@@ -42,8 +42,12 @@ jobs:
       - run: npm test
   dsh-compatibility:
     needs: verify-tag
-    name: dsh compatibility (locked 0.1.1)
+    name: dsh --profile (${{ matrix.dsh }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dsh: [0.1.1-rc.1, 0.1.1-rc.2, 0.1.2-rc.1]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -52,10 +56,12 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      - name: Exercise session controls through the host
-        run: npm run test:host
-        env:
-          DSH_ACP_TEST_HOST: ${{ github.workspace }}
+      - name: Install independent dsh host
+        run: npm install --prefix "$RUNNER_TEMP/dsh-host" --ignore-scripts --no-audit --no-fund "@deepseek-ai/dsh@${{ matrix.dsh }}"
+      - name: Pack ACP plugin
+        run: npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP"
+      - name: Exercise the installed dsh profile
+        run: node scripts/profile-smoke.mjs "$RUNNER_TEMP/dsh-host/node_modules/@deepseek-ai/dsh/lib/bin.js" "$RUNNER_TEMP/openma-deepseek-harness-acp-$(node -p "require('./package.json').version").tgz"
 
   publish:
     needs: [test, dsh-compatibility]
