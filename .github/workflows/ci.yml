@@ -62,7 +62,10 @@ jobs:
       - run: npm ci
       - run: npm run build
       - name: Install independent dsh host
-        run: npm install --prefix "$RUNNER_TEMP/dsh-host" --ignore-scripts --no-audit --no-fund "@deepseek-ai/dsh@${{ matrix.dsh }}"
+        timeout-minutes: 5
+        # Old RC peer graphs make npm's automatic peer placement stall.
+        # The CLI already declares its Host packages; exercise that tree.
+        run: npm install --prefix "$RUNNER_TEMP/dsh-host" --legacy-peer-deps --ignore-scripts --no-audit --no-fund "@deepseek-ai/dsh@${{ matrix.dsh }}"
       - name: Pack ACP plugin
         run: npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP"
       - name: Exercise the installed dsh profile
