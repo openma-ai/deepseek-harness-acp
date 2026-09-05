@@ -24,6 +24,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
+import type { Context } from "@deepseek-ai/cordis";
 
 import type { HarnessHost } from "./harness.ts";
 import { logDebug } from "./log.ts";
@@ -315,6 +316,16 @@ export async function bootAcpProfile(
         (hostCtx) => {
             (hostCtx as BootedContext).provide(launchEnvKey, launchEnvironment);
             (hostCtx as BootedContext).provide("dshAcpHostBaseUrl", bareModuleBaseUrl);
+            // Explicit Host-service rows bypass the ACP plugin's fallback mount.
+            // Preserve their configuration, but give filesystem-based preset
+            // checks the same Host base used by the loader's package imports.
+            (hostCtx as Context).on("loader/patch-context", async (entry, next) => {
+                if (entry.options.name === "@deepseek-ai/dsh-agent-presets"
+                    || entry.options.name === "@deepseek-ai/dsh-cordis-host-runner") {
+                    entry.ctx.baseUrl = bareModuleBaseUrl;
+                }
+                await next();
+            });
         },
         bareModuleBaseUrl,
     );
