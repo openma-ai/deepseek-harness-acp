@@ -3,7 +3,7 @@ import { spawn, execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -71,14 +71,12 @@ try {
     assert.equal(runtimes.length, 1);
     const metadata = JSON.parse(readFileSync(join(root, "node_modules/@openma/deepseek-harness-acp/vendor/runtime.json")));
     assert.equal(readFileSync(join(cache, runtimes[0], ".dsh-acp-runtime"), "utf8").trim(), metadata.dsh);
-    const runtimeRequire = createRequire(join(cache, runtimes[0], "package.json"));
-    assert(runtimeRequire("koffi").version);
-    const png = await runtimeRequire("sharp")({
-        create: { width: 1, height: 1, channels: 3, background: "red" },
-    }).png().toBuffer();
-    assert(png.length > 0);
-    const { rgPath } = runtimeRequire("@vscode/ripgrep");
-    assert.match(execFileSync(rgPath, ["--version"], { encoding: "utf8" }), /ripgrep/);
+    // Windows cannot delete DLLs loaded by this process. The probe must exit
+    // before the parent removes the isolated runtime tree.
+    execFileSync(process.execPath, [
+        fileURLToPath(new URL("./native-smoke.mjs", import.meta.url)),
+        join(cache, runtimes[0], "package.json"),
+    ], { stdio: "inherit", timeout: 60_000 });
     console.log(`STANDALONE_SMOKE_OK ${process.platform}/${process.arch} dsh=${metadata.dsh}`);
 } finally {
     if (child && child.exitCode === null && child.signalCode === null) {
