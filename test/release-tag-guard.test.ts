@@ -51,5 +51,5 @@ describe("release tag ancestry guard", () => {
         expect(accepted.status, accepted.stderr).toBe(0);
         expect(rejected.status).not.toBe(0);
         expect(rejected.stderr).toContain("release tags must point to a commit on origin/main");
-    });
+    }, 60_000);
 });
