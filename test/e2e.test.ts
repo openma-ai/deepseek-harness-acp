@@ -641,7 +641,7 @@ describe("dsh-acp server (e2e smoke)", () => {
                 update["sessionUpdate"] === "agent_message_chunk" &&
                 (update["content"] as { text?: string } | undefined)?.text?.includes("**dsh-acp**"),
         );
-        expect((status?.["content"] as { text: string }).text).toContain("| Preset | code |");
+        expect((status?.["content"] as { text: string }).text).toContain("| Preset | ptc |");
         expect((status?.["content"] as { text: string }).text).toContain("| Model | deepseek-v4-pro |");
     }, 60_000);
 
