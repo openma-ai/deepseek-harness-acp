@@ -62,6 +62,12 @@ describe("dsh compatibility host", () => {
 });
 
 describe("release provenance", () => {
+    it.each(["ci.yml", "release.yml"])("boots the same bundled artifact across platforms in %s", (workflow) => {
+        const jobs = readWorkflow(workflow).jobs;
+        expect(jobs?.["standalone"]?.strategy?.matrix?.os).toContain("macos-latest");
+        expect(jobs?.["standalone"]?.steps?.some((step) => step.run?.includes("scripts/standalone-smoke.mjs"))).toBe(true);
+        if (workflow === "release.yml") expect(jobs?.["publish"]?.needs).toContain("standalone");
+    });
     it("gates release tests on verifying that the tag commit belongs to main", () => {
         const jobs = readWorkflow("release.yml").jobs;
         const guardCommands = jobs?.["verify-tag"]?.steps?.flatMap((step) => step.run ?? []);

@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as tar from "tar";
+import { completePlatformPackages } from "./runtime-platforms.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
@@ -35,6 +36,7 @@ try {
         cwd: staging,
         stdio: "inherit",
     });
+    await completePlatformPackages(staging);
     mkdirSync(vendor, { recursive: true });
     await tar.c(
         {

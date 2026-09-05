@@ -36,6 +36,28 @@ jobs:
           name: package-tgz
           path: "*.tgz"
 
+  standalone:
+    needs: test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-tgz
+          path: artifact
+      - name: Boot isolated bundled runtime
+        shell: bash
+        run: node scripts/standalone-smoke.mjs artifact/*.tgz
+
   compatibility-versions:
     runs-on: ubuntu-latest
     outputs:

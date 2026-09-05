@@ -76,8 +76,46 @@ jobs:
       - name: Exercise the installed dsh profile
         run: npm exec -- node scripts/profile-smoke.mjs "$RUNNER_TEMP/dsh-host/node_modules/@deepseek-ai/dsh/lib/bin.js" "$RUNNER_TEMP/openma-deepseek-harness-acp-$(node -p "require('./package.json').version").tgz"
 
+  package:
+    needs: verify-tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-tgz
+          path: "*.tgz"
+
+  standalone:
+    needs: package
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-tgz
+          path: artifact
+      - name: Boot isolated bundled runtime
+        shell: bash
+        run: node scripts/standalone-smoke.mjs artifact/*.tgz
+
   publish:
-    needs: [test, dsh-compatibility]
+    needs: [test, dsh-compatibility, standalone]
     runs-on: ubuntu-latest
     permissions:
       id-token: write # npm OIDC trusted publishing
@@ -97,14 +135,16 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME != package.json $PKG"
             exit 1
           fi
-      - name: Pack and publish the same artifact to npm (OIDC)
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-tgz
+      - name: Publish the tested artifact to npm (OIDC)
         run: |
           case "$GITHUB_REF_NAME" in
             *-alpha.*|*-beta.*|*-rc.*) DIST_TAG=beta ;;
             *) DIST_TAG=latest ;;
           esac
           echo "publishing with dist-tag: $DIST_TAG"
-          npm pack
           TARBALL=$(find . -maxdepth 1 -name '*.tgz' -print -quit)
           test -n "$TARBALL"
           npm publish "$TARBALL" --tag "$DIST_TAG"
