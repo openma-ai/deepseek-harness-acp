@@ -47,7 +47,14 @@ describe("dsh compatibility host", () => {
         const commands = steps.flatMap((step) => step.run ?? []);
         const exercise = steps.find((step) => step.name === "Exercise the installed dsh profile");
 
-        expect(job?.strategy?.matrix?.dsh).toEqual(["0.1.1-rc.1", "0.1.1-rc.2", "0.1.2-rc.1"]);
+        expect(job?.strategy?.matrix?.dsh).toBe("${{ fromJSON(needs.compatibility-versions.outputs.versions) }}");
+        expect(job?.needs).toBe("compatibility-versions");
+        const versions = JSON.parse(readFileSync(join(import.meta.dirname, "../runtime/compatibility.json"), "utf8")) as string[];
+        expect(versions).toHaveLength(3);
+        expect(new Set(versions).size).toBe(3);
+        for (const version of versions) expect(version).toMatch(/^\d+\.\d+\.\d+(?:-rc\.\d+)?$/);
+        const manifest = JSON.parse(readFileSync(join(import.meta.dirname, "../package.json"), "utf8"));
+        expect(versions).toContain(manifest.dshAcp.standaloneDsh);
         expect(commands.some((command) => command.includes('"@deepseek-ai/dsh@${{ matrix.dsh }}"'))).toBe(true);
         expect(exercise?.run).toContain("scripts/profile-smoke.mjs");
         expect(exercise?.run).toContain("$RUNNER_TEMP/dsh-host/");

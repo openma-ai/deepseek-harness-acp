@@ -51,7 +51,7 @@ class AcpTestClient {
             ...(envPatch ?? {}),
         };
         for (const [key, value] of Object.entries(env)) if (value === undefined) delete env[key];
-        this.child = spawn(process.execPath, ["--import", "tsx", "src/index.ts", ...serverArgs], {
+        this.child = spawn(process.execPath, ["--import", "tsx", "src/bin.ts", ...serverArgs], {
             cwd: ROOT,
             env: env as Record<string, string>,
             stdio: ["pipe", "pipe", "pipe"],

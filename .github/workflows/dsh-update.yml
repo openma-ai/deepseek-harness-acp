@@ -1,0 +1,76 @@
+name: Update bundled dsh
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: dsh-update
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Check published dsh release
+        id: version
+        run: node scripts/update-dsh.mjs
+      - name: Check existing update branch
+        if: steps.version.outputs.changed == 'true'
+        id: branch
+        env:
+          UPDATE_BRANCH: codex/bump-dsh-${{ steps.version.outputs.version }}
+        run: |
+          if git ls-remote --exit-code --heads origin "$UPDATE_BRANCH"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Update development lockfile
+        if: steps.version.outputs.changed == 'true' && steps.branch.outputs.exists != 'true'
+        id: dev-lock
+        continue-on-error: true
+        run: npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+      - name: Update runtime lockfile
+        if: steps.version.outputs.changed == 'true' && steps.branch.outputs.exists != 'true'
+        id: runtime-lock
+        continue-on-error: true
+        working-directory: runtime
+        run: npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+      - name: Open upgrade PR and run CI
+        if: steps.version.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPDATE_BRANCH: codex/bump-dsh-${{ steps.version.outputs.version }}
+          DSH_VERSION: ${{ steps.version.outputs.version }}
+          PREVIOUS_VERSION: ${{ steps.version.outputs.previous }}
+          DEV_LOCK: ${{ steps.dev-lock.outcome }}
+          RUNTIME_LOCK: ${{ steps.runtime-lock.outcome }}
+          BRANCH_EXISTS: ${{ steps.branch.outputs.exists }}
+        run: |
+          if [ "$BRANCH_EXISTS" != true ]; then
+            git switch -c "$UPDATE_BRANCH"
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add package.json package-lock.json runtime/package.json runtime/package-lock.json runtime/compatibility.json
+            git commit -m "chore: upgrade bundled dsh to $DSH_VERSION"
+            git push origin "$UPDATE_BRANCH"
+          fi
+          if [ "$(gh pr list --state all --head "$UPDATE_BRANCH" --json number --jq length)" != 0 ]; then
+            exit 0
+          fi
+          printf 'Updates bundled dsh from `%s` to `%s` and refreshes the last three release/RC profile checks.\n\nLockfile updates: development %s; runtime %s. CI must pass before merging. This PR does not bump or release the ACP package.\n' "$PREVIOUS_VERSION" "$DSH_VERSION" "$DEV_LOCK" "$RUNTIME_LOCK" > "$RUNNER_TEMP/dsh-pr.md"
+          gh pr create --base main --head "$UPDATE_BRANCH" --title "chore: upgrade bundled dsh to $DSH_VERSION" --body-file "$RUNNER_TEMP/dsh-pr.md"
+          # GITHUB_TOKEN-created PRs do not trigger pull_request workflows.
+          gh workflow run ci.yml --ref "$UPDATE_BRANCH"

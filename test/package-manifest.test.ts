@@ -32,10 +32,8 @@ describe("ACP package manifest", () => {
         expect(manifest.bin?.["dsh-acp"]).toBe("dist/bin.js");
         expect(manifest.files).toEqual(expect.arrayContaining(["vendor/*.json", "vendor/*.tgz"]));
         expect(manifest.scripts?.["prepack"]).toContain("runtime:pack");
-        expect(manifest.dshAcp).toEqual({
-            standaloneDsh: "0.1.2-rc.1",
-            hostCompatibility: { cordisProtocol: 0, policy: "capability-negotiated" },
-        });
+        expect(manifest.dshAcp?.standaloneDsh).toMatch(/^\d+\.\d+\.\d+(?:-rc\.\d+)?$/);
+        expect(manifest.dshAcp?.hostCompatibility).toEqual({ cordisProtocol: 0, policy: "capability-negotiated" });
 
         const dshDevelopmentRanges = Object.entries(manifest.devDependencies ?? {})
             .filter(([name]) => name === "@deepseek-ai/dsh" || name.startsWith("@deepseek-ai/dsh-"))

@@ -40,14 +40,24 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
-  dsh-compatibility:
+  compatibility-versions:
     needs: verify-tag
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.matrix.outputs.versions }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: matrix
+        run: echo "versions=$(cat runtime/compatibility.json)" >> "$GITHUB_OUTPUT"
+
+  dsh-compatibility:
+    needs: compatibility-versions
     name: dsh --profile (${{ matrix.dsh }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        dsh: [0.1.1-rc.1, 0.1.1-rc.2, 0.1.2-rc.1]
+        dsh: ${{ fromJSON(needs.compatibility-versions.outputs.versions) }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5

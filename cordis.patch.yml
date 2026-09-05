@@ -20,6 +20,14 @@
 - id: hmr
   disabled: true
 
+# Newer dsh versions seed the acp profile with their own ACP transport.
+# This bundle owns stdout and must replace that transport.
+- id: acp
+  disabled: true
+
+- id: acp-app-startup
+  disabled: true
+
 # Model-facing tool rows move off the host plane and into each agent preset's
 # own composition (standard/code/minimal/cordis ship complete agent.cordis.yml
 # files) — the same split the web-app bundle makes, and what gives "minimal"
