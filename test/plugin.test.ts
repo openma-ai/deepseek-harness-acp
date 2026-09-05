@@ -8,15 +8,21 @@ vi.mock("../src/bridge/index.ts", () => bridge);
 vi.mock("../src/server.ts", () => server);
 
 describe("embeddable ACP Host plugin", () => {
-    it("resolves Host service modules to file URLs before Cordis imports them", async () => {
+    it.each([false, true])("resolves Host services with standalone base override=%s", async (standalone) => {
         const imports: string[] = [];
+        const bases: string[] = [];
         const services = new Map<string, unknown>();
+        const hostBase = new URL("../node_modules/@deepseek-ai/dsh/", import.meta.url).href;
+        if (standalone) services.set("dshAcpHostBaseUrl", hostBase);
         const agentPresets = { name: "agent-presets" };
         const dynamicCordisRunner = { name: "dynamic-cordis-runner" };
         const subagentModelSelection = { name: "subagent-model-selection-settings" };
         const loaded = [agentPresets, dynamicCordisRunner, subagentModelSelection];
         const ctx = {
             baseUrl: import.meta.url,
+            extend(meta: Record<string, unknown>) {
+                return Object.assign(Object.create(this), meta);
+            },
             get(name: string) {
                 return services.get(name);
             },
@@ -30,6 +36,7 @@ describe("embeddable ACP Host plugin", () => {
                 },
             },
             async plugin(plugin: unknown) {
+                if (loaded.includes(plugin as never)) bases.push(this.baseUrl);
                 if (plugin === agentPresets) services.set("agentPresets", {});
                 if (plugin === dynamicCordisRunner) services.set("dynamicCordisRunner", {});
                 if (plugin === subagentModelSelection) services.set("subagentModelSelection", {});
@@ -48,6 +55,7 @@ describe("embeddable ACP Host plugin", () => {
             expect.stringMatching(/\/@deepseek-ai\/dsh-tool-subagent\/lib\/model-selection-settings\.js$/),
         ]);
         expect(services.has("acpServer")).toBe(true);
+        expect(bases).toEqual(Array(3).fill(standalone ? hostBase : import.meta.url));
     });
 
     it("mounts only the ACP server when the surface already provides agentPresets and dynamicCordisRunner", async () => {

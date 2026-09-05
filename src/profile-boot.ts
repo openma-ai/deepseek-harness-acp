@@ -314,6 +314,7 @@ export async function bootAcpProfile(
         structuredClone(allPatches) as PatchEntry[],
         (hostCtx) => {
             (hostCtx as BootedContext).provide(launchEnvKey, launchEnvironment);
+            (hostCtx as BootedContext).provide("dshAcpHostBaseUrl", bareModuleBaseUrl);
         },
         bareModuleBaseUrl,
     );

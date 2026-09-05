@@ -98,8 +98,12 @@ async function mountService(
 
 export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     if (ctx.get("acpServer") !== undefined) return;
-    await mountService(ctx, "agentPresets", "@deepseek-ai/dsh-agent-presets", () => {
-        const roots = shippedPresetRoots(ctx);
+    // A standalone runtime is outside the ACP package's node_modules tree.
+    // Preset health checks walk ctx.baseUrl on disk, bypassing import hooks.
+    const hostBase = ctx.get("dshAcpHostBaseUrl");
+    const hostCtx = typeof hostBase === "string" ? ctx.extend({ baseUrl: hostBase }) : ctx;
+    await mountService(hostCtx, "agentPresets", "@deepseek-ai/dsh-agent-presets", () => {
+        const roots = shippedPresetRoots(hostCtx);
         return {
             default: "standard",
             // dsh 0.1.2's roster self-ships its presets (includeShippedRoot);
@@ -107,12 +111,12 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
             ...(roots.length > 0 ? { roots } : {}),
         };
     });
-    await mountService(ctx, "dynamicCordisRunner", "@deepseek-ai/dsh-cordis-host-runner");
+    await mountService(hostCtx, "dynamicCordisRunner", "@deepseek-ai/dsh-cordis-host-runner");
     // Newer shipped presets require this Host settings owner; older hosts
     // do not export it and keep their existing delegation behavior.
     const modelSettings = "@deepseek-ai/dsh-tool-subagent/model-selection-settings";
-    if (ctx.get("subagentModelSelection") === undefined && resolvedHostModule(ctx, modelSettings) !== modelSettings) {
-        await mountService(ctx, "subagentModelSelection", modelSettings);
+    if (ctx.get("subagentModelSelection") === undefined && resolvedHostModule(hostCtx, modelSettings) !== modelSettings) {
+        await mountService(hostCtx, "subagentModelSelection", modelSettings);
     }
     await ctx.plugin(server, config);
     if (ctx.get("acpServer") === undefined) {
