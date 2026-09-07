@@ -215,7 +215,7 @@ export function installAcpUserQuestionProvider(
         };
         const disposeProvider = typeof legacy.registerProvider === "function"
             ? routeLegacyQuestions(service, ask) ?? legacy.registerProvider({ ask })
-            : (service as unknown as { ctx: Context }).ctx.root.on("user-questions/request", ask);
+            : (service as unknown as { ctx: Context }).ctx.root.on("user-questions/request", ask, { prepend: true });
         router = { routes, disposeProvider };
         routers.set(owner, router);
     }

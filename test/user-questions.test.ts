@@ -186,6 +186,23 @@ describe("ACP user-question elicitation", () => {
         });
     });
 
+    it("routes owned questions before an existing Web handler and delegates other questions", async () => {
+        const ctx = new Context();
+        await ctx.plugin(UserQuestionService);
+        ctx.on("user-questions/request", async () => ({ answers: [{ id: "web", selected: [], custom: "web" }] }));
+        const dispose = subject.installAcpUserQuestionProvider!(ctx.userQuestions, {
+            formSupported: () => true,
+            sessionIdForRequest: request => request.questions[0]?.id === "acp" ? "session" : undefined,
+            create: async () => ({ action: "accept", content: { question_0: "acp" } }),
+        });
+        try {
+            await expect(ctx.userQuestions.ask({ questions: [{ id: "acp", question: "Where?" }] }))
+                .resolves.toEqual({ answers: [{ id: "acp", selected: [], custom: "acp" }] });
+            await expect(ctx.userQuestions.ask({ questions: [{ id: "web", question: "Where?" }] }))
+                .resolves.toEqual({ answers: [{ id: "web", selected: [], custom: "web" }] });
+        } finally { dispose(); await ctx.fiber.dispose(); }
+    });
+
     it("registers the ACP client as the active user-questions provider", async () => {
         const ctx = new Context();
         const fiber = ctx.plugin(UserQuestionService);
