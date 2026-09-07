@@ -1,3 +1,4 @@
+import { routeLegacyQuestions } from "./legacy-user-questions.ts";
 import type {
     CreateElicitationRequest,
     CreateElicitationResponse,
@@ -213,7 +214,7 @@ export function installAcpUserQuestionProvider(
             registerProvider?: (provider: { ask: typeof ask }) => () => void;
         };
         const disposeProvider = typeof legacy.registerProvider === "function"
-            ? legacy.registerProvider({ ask })
+            ? routeLegacyQuestions(service, ask) ?? legacy.registerProvider({ ask })
             : (service as unknown as { ctx: Context }).ctx.root.on("user-questions/request", ask);
         router = { routes, disposeProvider };
         routers.set(owner, router);
