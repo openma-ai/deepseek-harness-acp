@@ -2249,14 +2249,9 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     // Transport wiring and teardown                                       //
     // ------------------------------------------------------------------ //
 
-    const raw: Stream =
-        config.stream ??
-        ndJsonStream(
-            Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
-            Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>,
-        );
-    const stream = muxAcpStream(raw, rpc);
-    conn = new AgentSideConnection(makeAgent, stream);
+    // Complete fallible plugin setup before the SDK starts reading requests.
+    // Cordis rolls back listeners on failure, but cannot stop an unowned SDK
+    // connection that was already started (e.g. a legacy Web provider clash).
     await ctx.plugin(userQuestionsPlugin, {
         formSupported: () => clientElicitationForm,
         sessionIdForRequest: (request) => {
@@ -2302,6 +2297,17 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         return quiescing;
     };
 
+    ctx.effect(() => quiesce, "acp-bridge.connection");
+
+    const raw: Stream =
+        config.stream ??
+        ndJsonStream(
+            Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
+            Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>,
+        );
+    const stream = muxAcpStream(raw, rpc);
+    conn = new AgentSideConnection(makeAgent, stream);
+
     void conn.closed
         .catch((error: unknown) => {
             logWarn(`connection closed with an error: ${String(error)}`);
@@ -2310,6 +2316,4 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         .catch((error: unknown) => {
             logWarn(`connection-close teardown failed: ${String(error)}`);
         });
-
-    ctx.effect(() => quiesce, "acp-bridge.connection");
 }
