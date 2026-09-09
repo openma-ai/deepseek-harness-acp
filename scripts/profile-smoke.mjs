@@ -69,6 +69,14 @@ try {
         sessionId: session.sessionId, prompt: [{ type: "text", text: "/status" }],
     });
     assert.equal(status.stopReason, "end_turn");
+    await request("session/close", { sessionId: session.sessionId });
+    const listed = await request("session/list", { cwd: root });
+    assert(listed.sessions.some((entry) => entry.sessionId === session.sessionId && entry.cwd === root));
+    const loaded = await request("session/load", { sessionId: session.sessionId, cwd: root, mcpServers: [] });
+    assert.equal(loaded.modes.currentModeId, "read-only");
+    await request("session/close", { sessionId: session.sessionId });
+    const resumed = await request("session/resume", { sessionId: session.sessionId, cwd: root, mcpServers: [] });
+    assert.equal(resumed.modes.currentModeId, "read-only");
     console.log("PROFILE_SMOKE_OK");
 } finally {
     if (child && child.exitCode === null && child.signalCode === null) {

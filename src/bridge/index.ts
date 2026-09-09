@@ -89,7 +89,7 @@ import {
 } from "../auth.ts";
 import { openLocalAuthPage, startLocalAuthPage } from "../auth-page.ts";
 import { logDebug, logWarn } from "../log.ts";
-import { buildReplay, buildResumeMetadata, type ResumeMetadata } from "./history.ts";
+import { buildReplay, buildResumeMetadata } from "./history.ts";
 import { LatestPublication } from "./latest-publication.ts";
 import {
     interactionModeFromClientMeta,
@@ -149,6 +149,31 @@ export interface BridgeHarness {
 
 function readSessionEvents(session: { snapshotEvents?: () => readonly unknown[]; events?: readonly unknown[] }): readonly unknown[] {
     return session.snapshotEvents?.() ?? session.events ?? [];
+}
+
+/** Metadata returned directly by rc stores and wrapped in alpha snapshots. */
+interface StoredHeader {
+    id: SessionId;
+    cwd?: string;
+    createdAt?: number;
+}
+
+/** Read-only title lookup; alpha handles must close even if reading fails. */
+async function readStoredEvents(persistence: unknown, id: SessionId): Promise<readonly SessionEvent[]> {
+    const store = persistence as {
+        open?: (id: SessionId, access: "read") => Promise<{
+            read(): Promise<{ events: readonly SessionEvent[] }>;
+            close(): Promise<void>;
+        }>;
+        inspect: (id: SessionId) => Promise<{ events: readonly SessionEvent[] }>;
+    };
+    if (typeof store.open !== "function") return (await store.inspect(id)).events;
+    const handle = await store.open(id, "read");
+    try {
+        return (await handle.read()).events;
+    } finally {
+        await handle.close();
+    }
 }
 
 export interface AcpBridgeConfig {
@@ -688,13 +713,14 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         try {
             return await restoreSession(sessionId, { replay: false });
         } catch (error: unknown) {
+            if (error instanceof RequestError && error.code !== -32602) throw error;
             throw invalidParams(`unknown session: ${sessionId} (${errorChain(error)})`);
         }
     };
 
     /**
-     * Resume one persisted session into a live record: inspect the log,
-     * optionally replay its history to the client, rebuild the agent with
+     * Resume one persisted session into a live record: acquire ownership,
+     * rebuild the agent and replay its history to the client with
      * its stored preset, and fold logged permission facts. Shared by
      * `session/load` (replay: true) and silent restore (replay: false).
      */
@@ -702,7 +728,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         sessionId: string,
         options: { replay: boolean; cwd?: string },
     ): Promise<SessionRecord> => {
-        const persistence = requirePersistence();
+        requirePersistence();
         const existing = sessions.get(sessionId);
         if (existing !== undefined) {
             // Reloading an open session: drop the live agent first so
@@ -714,37 +740,35 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 logWarn(`dispose before reload failed: ${String(error)}`);
             });
         }
-        let events: readonly SessionEvent[];
+        let events: readonly SessionEvent[] = [];
+        let replay: ReturnType<typeof buildReplay> | undefined;
         let storedHeader: { agentPreset?: string; cwd?: string } | undefined;
-        try {
-            const inspected = await persistence.inspect(SessionId(sessionId));
-            events = inspected.events;
-            storedHeader = (inspected as unknown as { header?: { agentPreset?: string; cwd?: string } }).header;
-        } catch (error: unknown) {
-            throw invalidParams(`session not found: ${sessionId} (${errorChain(error)})`);
-        }
-        let restored: ResumeMetadata;
-        if (options.replay) {
-            const replay = buildReplay(events as unknown as HarnessEvent[]);
-            restored = replay;
-            for (const update of replay.updates) notify(sessionId, update);
-            if (replay.title !== undefined) {
-                notify(sessionId, {
-                    sessionUpdate: "session_info_update",
-                    title: replay.title,
-                });
-            }
-        } else {
-            restored = buildResumeMetadata(events as unknown as HarnessEvent[]);
-        }
+        let presetId: string | undefined;
         const presets = presetsService();
-        const storedPreset = presetFromLog(storedHeader, events as unknown as { type?: string }[]);
-        const presetId = (await presets.resolve(storedPreset)).id;
-        const handle = await agents.resume({
-            resumeSessionId: SessionId(sessionId),
-            agentOptions: agentOptionsFor(config.model),
-            ...(presetSetup(presets, presetId) !== undefined ? { setup: presetSetup(presets, presetId) } : {}),
-        } as Parameters<typeof agents.resume>[0]);
+        let handle: Awaited<ReturnType<typeof agents.resume>>;
+        try {
+            // The host acquires write ownership and migrates historical formats
+            // before setup. Read the restored session there, never a separate
+            // pre-resume snapshot that could be stale or require migration.
+            handle = await agents.resume({
+                resumeSessionId: SessionId(sessionId),
+                agentOptions: agentOptionsFor(config.model),
+                setup: async (agentCtx: Context, restoredAgent?: Agent) => {
+                    // Alpha passes Agent explicitly; rc hosts expose ctx.agent.
+                    const agent = restoredAgent ?? (agentCtx as unknown as { agent: Agent }).agent;
+                    storedHeader = agent.session.header;
+                    events = readSessionEvents(agent.session) as readonly SessionEvent[];
+                    if (options.replay) replay = buildReplay(events as unknown as HarnessEvent[]);
+                    presetId = (await presets.resolve(presetFromLog(storedHeader, events))).id;
+                    await presets.mount(agentCtx, presetId);
+                },
+            } as Parameters<typeof agents.resume>[0]);
+        } catch (error: unknown) {
+            const detail = errorChain(error);
+            if (detail.includes(`session "${sessionId}" not found`) || (error as NodeJS.ErrnoException)?.code === "ENOENT") throw invalidParams(`session not found: ${sessionId} (${detail})`);
+            throw internalError(`cannot restore session ${sessionId}: ${detail}`);
+        }
+        const restored = replay ?? buildResumeMetadata(events as unknown as HarnessEvent[]);
         const cwd = options.cwd ?? storedHeader?.cwd;
         const projection = new SessionProjection(restored.contextWindow, {
             terminalOutput: clientTerminalOutput,
@@ -773,6 +797,13 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     if (policy === "ask" || policy === "never") record.approvals = policy;
                     break;
                 }
+            }
+        }
+        // A failed ownership claim publishes no transcript or title updates.
+        if (replay !== undefined) {
+            for (const update of replay.updates) notify(sessionId, update);
+            if (restored.title !== undefined) {
+                notify(sessionId, { sessionUpdate: "session_info_update", title: restored.title });
             }
         }
         ensureSelection(record);
@@ -1837,7 +1868,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
                 assertOpen();
                 const persistence = requirePersistence();
-                const headers = await persistence.list();
+                const headers = (await persistence.list() as unknown as readonly (StoredHeader | { header: StoredHeader })[])
+                    .map((entry) => "header" in entry ? entry.header : entry);
                 headers.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
                 const filtered = params.cwd !== undefined && params.cwd !== null
                     ? headers.filter((header) => header.cwd === params.cwd)
@@ -1845,7 +1877,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 const page = filtered.slice(0, 100);
                 const withTitles = await Promise.allSettled(
                     page.slice(0, 20).map(async (header) => {
-                        const { events } = await persistence.inspect(header.id);
+                        const events = await readStoredEvents(persistence, header.id);
                         return foldSessionTitle(events)?.title;
                     }),
                 );

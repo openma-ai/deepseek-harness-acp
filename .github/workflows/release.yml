@@ -58,6 +58,9 @@ jobs:
       fail-fast: false
       matrix:
         dsh: ${{ fromJSON(needs.compatibility-versions.outputs.versions) }}
+        # Keep alpha coverage when update-dsh refreshes the three RC versions.
+        include:
+          - dsh: 0.1.5-alpha.1
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -71,6 +74,13 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/dsh-host"
           npm exec -- pnpm --dir "$RUNNER_TEMP/dsh-host" add --ignore-scripts --config.auto-install-peers=true "@deepseek-ai/dsh@${{ matrix.dsh }}"
+      - name: Verify alpha session ownership and migration
+        if: contains(matrix.dsh, '-alpha.')
+        env:
+          DSH_PATH: ${{ runner.temp }}/dsh-host/node_modules/@deepseek-ai/dsh/lib/bin.js
+          DSH_ACP_TEST_ALPHA_HOST: ${{ runner.temp }}/dsh-host/node_modules/@deepseek-ai/dsh/lib/bin.js
+          DSH_ACP_TEST_HOST: ${{ runner.temp }}/dsh-host/node_modules/@deepseek-ai/dsh/lib/bin.js
+        run: npm test -- test/e2e.test.ts
       - name: Pack ACP plugin
         run: npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP"
       - name: Exercise the installed dsh profile

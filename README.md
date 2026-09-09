@@ -54,6 +54,23 @@ plugin used by other dsh applications: one Host composition can expose the
 same sessions, tools, presets, skills, and persistence through a transport
 chosen by the surface.
 
+### DSH alpha compatibility
+
+The adapter also supports **DSH `0.1.5-alpha.1`** as an installed host.
+The bundled fallback remains `0.1.2-rc.1`; to use alpha, select its launcher
+with `dsh-acp --dsh-path /path/to/alpha/dsh` or install this plugin in that
+alpha host's ACP profile.
+
+Alpha's persistence backend owns the cross-process session write lock.
+A competing load/resume returns a standard JSON-RPC error; closing the
+session or exiting the owner process allows another process to resume it.
+Every process writing shared sessions must use a fixed backend—older hosts
+and the bundled rc fallback do not participate in this lock.
+
+Restoring a historical session through alpha uses the host's V3 migration,
+which preserves the original log. The upgraded session cannot be read by
+older hosts. Multi-root workspaces remain unsupported.
+
 ### A · dsh profile plugin (recommended)
 
 ```bash

@@ -3,8 +3,8 @@
  *
  * The harness persists every session as an append-only event log; constructor
  * seeds do not re-fire the live `session/event` hook, so history replay reads
- * the stored log (`sessionPersistence.inspect`) and projects it through the
- * same translation used for live streaming — with two replay-specific
+ * the restored session after the host has acquired write ownership. It uses
+ * the same translation as live streaming, with two replay-specific
  * differences: user messages become `user_message_chunk`s, and only the final
  * plan snapshot is replayed (intermediate todo states are noise after the
  * fact).
