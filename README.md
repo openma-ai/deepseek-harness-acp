@@ -54,6 +54,21 @@ plugin used by other dsh applications: one Host composition can expose the
 same sessions, tools, presets, skills, and persistence through a transport
 chosen by the surface.
 
+### DSH compatibility
+
+The bundled runtime is **DSH `0.1.5-rc.1`**, including the upstream
+cross-process session write lock. Your installed DSH still takes precedence;
+use an updated host or the bundled runtime to get the fix.
+
+A competing load/resume returns a standard JSON-RPC error. Closing the
+session or exiting the owner process allows another process to resume it.
+Every process writing shared sessions must use a fixed backend; older hosts
+do not participate in this lock.
+
+Restoring historical sessions uses the host's V3 migration, which preserves
+the original log. Upgraded sessions cannot be read by older hosts.
+Multi-root workspaces remain unsupported.
+
 ### A · dsh profile plugin (recommended)
 
 ```bash

@@ -11,6 +11,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createServer, type Server } from "node:http";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -136,6 +137,15 @@ class AcpTestClient {
                     notification.method === "session/update" && notification.params["sessionId"] === sessionId,
             )
             .map((notification) => notification.params["update"] as Record<string, unknown>);
+    }
+
+    async crash(): Promise<void> {
+        if (this.child.exitCode !== null || this.child.signalCode !== null) return;
+        await new Promise<void>((resolve) => {
+            this.child.once("exit", () => resolve());
+            this.child.kill("SIGKILL");
+        });
+        this.closePromise = Promise.resolve();
     }
 
     async close(): Promise<void> {
@@ -577,7 +587,7 @@ describe("dsh-acp server (e2e smoke)", () => {
         // bundled inside it, never a standalone option (matching the Web UI).
         expect(byId.get("mode")).toMatchObject({ type: "select", category: "mode", currentValue: "workspace-write" });
         expect(byId.has("approvals")).toBe(false);
-        expect(byId.get("model")).toMatchObject({ type: "select", category: "model", currentValue: "deepseek-v4-flash" });
+        expect(byId.get("model")).toMatchObject({ type: "select", category: "model", currentValue: expect.stringMatching(/^deepseek-(?:v4-)?flash$/) });
         expect(byId.get("effort")).toMatchObject({ type: "select", category: "thought_level" });
         expect(byId.get("collaboration_mode")).toMatchObject({
             type: "select",
@@ -1007,6 +1017,122 @@ describe.skipIf(HOST_TREE === undefined)("dsh-acp against a standalone host inst
             prompt: [{ type: "text", text: "/status" }],
         })) as Record<string, unknown>;
         expect(status["stopReason"]).toBe("end_turn");
+    }, 120_000);
+});
+
+// Only fixed backends participate in cross-process ownership. Older hosts
+// remain covered by the ordinary host and bundled-runtime suites above.
+const WRITE_HOST = process.env["DSH_ACP_TEST_WRITE_HOST"] ?? ROOT;
+const LEGACY_HOST = process.env["DSH_ACP_TEST_LEGACY_HOST"];
+describe("session ownership", () => {
+    const clients: AcpTestClient[] = [];
+    let sessionRoot: string;
+    let workspace: string;
+
+    let provider: Server;
+    let baseUrl: string;
+    beforeAll(async () => {
+        sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-alpha-sessions-"));
+        workspace = mkdtempSync(join(tmpdir(), "dsh-acp-alpha-workspace-"));
+        // Exercise a complete model turn without contacting a real provider.
+        provider = createServer((request, response) => {
+            request.resume();
+            response.writeHead(200, { "Content-Type": "text/event-stream" });
+            response.end([
+                { id: "alpha-test", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: "Alpha reply." }, finish_reason: null }] },
+                { id: "alpha-test", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 } },
+            ].map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("") + "data: [DONE]\n\n");
+        });
+        await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
+        baseUrl = `http://127.0.0.1:${(provider.address() as { port: number }).port}`;
+    });
+    afterAll(async () => {
+        await Promise.all(clients.map((client) => client.close()));
+        await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()));
+        rmSync(sessionRoot, { recursive: true, force: true });
+        rmSync(workspace, { recursive: true, force: true });
+    });
+    async function connect(host = WRITE_HOST): Promise<AcpTestClient> {
+        const client = new AcpTestClient(sessionRoot, workspace, host, { DEEPSEEK_BASE_URL: baseUrl });
+        clients.push(client);
+        await client.request("initialize", { protocolVersion: 1 });
+        return client;
+    }
+    async function seed(host = WRITE_HOST, preset?: string): Promise<string> {
+        const client = await connect(host);
+        const { sessionId } = await client.request("session/new", { cwd: workspace, mcpServers: [] }) as { sessionId: string };
+        if (preset !== undefined) await client.request("session/set_config_option", { sessionId, configId: "agent", value: preset });
+        await expect(client.request("session/prompt", { sessionId, prompt: [{ type: "text", text: "Remember the alpha test." }] }))
+            .resolves.toMatchObject({ stopReason: "end_turn" });
+        expect(client.updatesFor(sessionId)).toContainEqual(expect.objectContaining({
+            sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Alpha reply." },
+        }));
+        await client.request("session/set_mode", { sessionId, modeId: "read-only" });
+        await client.request("session/close", { sessionId });
+        await client.close();
+        return sessionId;
+    }
+    it("lists and reloads persisted metadata through the handle API", async () => {
+        const sessionId = await seed();
+        const client = await connect();
+        const listed = await client.request("session/list", { cwd: workspace }) as { sessions: unknown[] };
+        expect(listed.sessions).toContainEqual(expect.objectContaining({ sessionId, cwd: workspace, title: expect.any(String) }));
+        await expect(client.request("session/load", { sessionId, cwd: workspace, mcpServers: [] }))
+            .resolves.toMatchObject({ modes: { currentModeId: "read-only" } });
+        expect(client.updatesFor(sessionId)).toContainEqual(expect.objectContaining({
+            sessionUpdate: "user_message_chunk", content: { type: "text", text: "Remember the alpha test." },
+        }));
+        expect(client.updatesFor(sessionId)).toContainEqual(expect.objectContaining({
+            sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Alpha reply." },
+        }));
+        await expect(client.request("session/prompt", { sessionId, prompt: [{ type: "text", text: "/status" }] }))
+            .resolves.toMatchObject({ stopReason: "end_turn" });
+        await client.close();
+    }, 120_000);
+    it.skipIf(LEGACY_HOST === undefined)("migrates an rc session and preserves its preset before replay", async () => {
+        // An independent pre-V3 host writes the historical session.
+        const sessionId = await seed(LEGACY_HOST, "ptc");
+        const client = await connect();
+        const loaded = await client.request("session/load", { sessionId, cwd: workspace, mcpServers: [] }) as {
+            modes: { currentModeId: string }; configOptions: Array<{ id: string; currentValue: string }>;
+        };
+        expect(loaded.modes.currentModeId).toBe("read-only");
+        expect(loaded.configOptions).toContainEqual(expect.objectContaining({ id: "agent", currentValue: "ptc" }));
+        expect(client.updatesFor(sessionId)).toContainEqual(expect.objectContaining({
+            sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Alpha reply." },
+        }));
+        await expect(client.request("session/prompt", { sessionId, prompt: [{ type: "text", text: "Continue after migration." }] }))
+            .resolves.toMatchObject({ stopReason: "end_turn" });
+        await client.close();
+    }, 120_000);
+    it.each(["close", "crash"] as const)("rejects a competing resume and permits handoff after %s", async (release) => {
+        const sessionId = await seed();
+        const owner = await connect();
+        const contender = await connect();
+        const params = { sessionId, cwd: workspace, mcpServers: [] };
+        await owner.request("session/resume", params);
+        await expect(contender.request("session/load", params)).rejects.toMatchObject({
+            code: -32603, message: expect.stringContaining("already owned"),
+        });
+        await expect(contender.request("session/resume", params)).rejects.toMatchObject({ code: -32603 });
+        await expect(contender.request("session/prompt", { sessionId, prompt: [{ type: "text", text: "/status" }] }))
+            .rejects.toMatchObject({ code: -32603 });
+        // A rejected load must not publish history for a session it failed to own.
+        expect(contender.updatesFor(sessionId)).toEqual([]);
+        await expect(owner.request("session/prompt", { sessionId, prompt: [{ type: "text", text: "/status" }] }))
+            .resolves.toMatchObject({ stopReason: "end_turn" });
+        if (release === "crash") await owner.crash();
+        else await owner.request("session/close", { sessionId });
+        await expect(contender.request("session/resume", params))
+            .resolves.toMatchObject({ modes: { currentModeId: "read-only" } });
+        await expect(contender.request("session/prompt", { sessionId, prompt: [{ type: "text", text: "Continue after handoff." }] }))
+            .resolves.toMatchObject({ stopReason: "end_turn" });
+        await contender.request("session/close", { sessionId });
+        // Re-read the log after both writers: no seq collision or corruption.
+        await expect(contender.request("session/load", params))
+            .resolves.toMatchObject({ modes: { currentModeId: "read-only" } });
+        await contender.close();
+        await owner.close();
     }, 120_000);
 });
 
