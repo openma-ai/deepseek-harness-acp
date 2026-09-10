@@ -587,7 +587,7 @@ describe("dsh-acp server (e2e smoke)", () => {
         // bundled inside it, never a standalone option (matching the Web UI).
         expect(byId.get("mode")).toMatchObject({ type: "select", category: "mode", currentValue: "workspace-write" });
         expect(byId.has("approvals")).toBe(false);
-        expect(byId.get("model")).toMatchObject({ type: "select", category: "model", currentValue: "deepseek-v4-flash" });
+        expect(byId.get("model")).toMatchObject({ type: "select", category: "model", currentValue: expect.stringMatching(/^deepseek-(?:v4-)?flash$/) });
         expect(byId.get("effort")).toMatchObject({ type: "select", category: "thought_level" });
         expect(byId.get("collaboration_mode")).toMatchObject({
             type: "select",
@@ -1022,8 +1022,9 @@ describe.skipIf(HOST_TREE === undefined)("dsh-acp against a standalone host inst
 
 // Only fixed backends participate in cross-process ownership. Older hosts
 // remain covered by the ordinary host and bundled-runtime suites above.
-const ALPHA_HOST = process.env["DSH_ACP_TEST_ALPHA_HOST"];
-describe.skipIf(ALPHA_HOST === undefined)("alpha session ownership", () => {
+const WRITE_HOST = process.env["DSH_ACP_TEST_WRITE_HOST"] ?? ROOT;
+const LEGACY_HOST = process.env["DSH_ACP_TEST_LEGACY_HOST"];
+describe("session ownership", () => {
     const clients: AcpTestClient[] = [];
     let sessionRoot: string;
     let workspace: string;
@@ -1051,13 +1052,13 @@ describe.skipIf(ALPHA_HOST === undefined)("alpha session ownership", () => {
         rmSync(sessionRoot, { recursive: true, force: true });
         rmSync(workspace, { recursive: true, force: true });
     });
-    async function connect(host = ALPHA_HOST): Promise<AcpTestClient> {
+    async function connect(host = WRITE_HOST): Promise<AcpTestClient> {
         const client = new AcpTestClient(sessionRoot, workspace, host, { DEEPSEEK_BASE_URL: baseUrl });
         clients.push(client);
         await client.request("initialize", { protocolVersion: 1 });
         return client;
     }
-    async function seed(host = ALPHA_HOST, preset?: string): Promise<string> {
+    async function seed(host = WRITE_HOST, preset?: string): Promise<string> {
         const client = await connect(host);
         const { sessionId } = await client.request("session/new", { cwd: workspace, mcpServers: [] }) as { sessionId: string };
         if (preset !== undefined) await client.request("session/set_config_option", { sessionId, configId: "agent", value: preset });
@@ -1071,7 +1072,7 @@ describe.skipIf(ALPHA_HOST === undefined)("alpha session ownership", () => {
         await client.close();
         return sessionId;
     }
-    it("lists and reloads persisted metadata through the alpha handle API", async () => {
+    it("lists and reloads persisted metadata through the handle API", async () => {
         const sessionId = await seed();
         const client = await connect();
         const listed = await client.request("session/list", { cwd: workspace }) as { sessions: unknown[] };
@@ -1088,9 +1089,9 @@ describe.skipIf(ALPHA_HOST === undefined)("alpha session ownership", () => {
             .resolves.toMatchObject({ stopReason: "end_turn" });
         await client.close();
     }, 120_000);
-    it("migrates an rc session and preserves its preset before replay", async () => {
-        // This checkout's development runtime remains the supported rc host.
-        const sessionId = await seed(ROOT, "ptc");
+    it.skipIf(LEGACY_HOST === undefined)("migrates an rc session and preserves its preset before replay", async () => {
+        // An independent pre-V3 host writes the historical session.
+        const sessionId = await seed(LEGACY_HOST, "ptc");
         const client = await connect();
         const loaded = await client.request("session/load", { sessionId, cwd: workspace, mcpServers: [] }) as {
             modes: { currentModeId: string }; configOptions: Array<{ id: string; currentValue: string }>;

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,12 +9,21 @@ import { createInterface } from "node:readline";
 const [binary, archive] = process.argv.slice(2).map((path) => resolve(path));
 assert(binary && archive, "usage: node scripts/profile-smoke.mjs DSH_BIN ACP_TARBALL");
 const root = mkdtempSync(join(tmpdir(), "dsh-acp-profile-"));
+const provider = createServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end([
+        { id: "smoke", choices: [{ index: 0, delta: { role: "assistant", content: "Saved." }, finish_reason: null }] },
+        { id: "smoke", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    ].map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("") + "data: [DONE]\n\n");
+});
+await new Promise((resolve) => provider.listen(0, "127.0.0.1", resolve));
 const env = {
     ...process.env,
     DSH_HOME: join(root, "home"),
     DSH_SESSION_ROOT: join(root, "sessions"),
     DEEPSEEK_API_KEY: "sk-test-profile-not-a-real-key",
-    DEEPSEEK_BASE_URL: "http://127.0.0.1:1",
+    DEEPSEEK_BASE_URL: `http://127.0.0.1:${provider.address().port}`,
     DSH_TELEMETRY_DISABLED: "1",
 };
 delete env.DSH_PATH;
@@ -69,6 +79,12 @@ try {
         sessionId: session.sessionId, prompt: [{ type: "text", text: "/status" }],
     });
     assert.equal(status.stopReason, "end_turn");
+    // Older stores do not materialize command-only sessions. Commit a real
+    // model turn before asserting cross-process persistence behavior.
+    const turn = await request("session/prompt", {
+        sessionId: session.sessionId, prompt: [{ type: "text", text: "Remember this session." }],
+    });
+    assert.equal(turn.stopReason, "end_turn");
     await request("session/close", { sessionId: session.sessionId });
     const listed = await request("session/list", { cwd: root });
     assert(listed.sessions.some((entry) => entry.sessionId === session.sessionId && entry.cwd === root));
@@ -84,5 +100,6 @@ try {
         child.kill("SIGKILL");
         await exited;
     }
+    await new Promise((resolve) => provider.close(resolve));
     rmSync(root, { recursive: true, force: true });
 }

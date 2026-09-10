@@ -76,9 +76,6 @@ jobs:
       fail-fast: false
       matrix:
         dsh: ${{ fromJSON(needs.compatibility-versions.outputs.versions) }}
-        # Keep alpha coverage when update-dsh refreshes the three RC versions.
-        include:
-          - dsh: 0.1.5-alpha.1
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -92,11 +89,17 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/dsh-host"
           npm exec -- pnpm --dir "$RUNNER_TEMP/dsh-host" add --ignore-scripts --config.auto-install-peers=true "@deepseek-ai/dsh@${{ matrix.dsh }}"
-      - name: Verify alpha session ownership and migration
-        if: contains(matrix.dsh, '-alpha.')
+      - name: Install pre-V3 migration host
+        if: matrix.dsh == '0.1.5-rc.1'
+        run: |
+          mkdir -p "$RUNNER_TEMP/dsh-legacy"
+          npm exec -- pnpm --dir "$RUNNER_TEMP/dsh-legacy" add --ignore-scripts --config.auto-install-peers=true @deepseek-ai/dsh@0.1.2-rc.1
+      - name: Verify session ownership and migration
+        if: matrix.dsh == '0.1.5-rc.1'
         env:
+          DSH_ACP_TEST_LEGACY_HOST: ${{ runner.temp }}/dsh-legacy/node_modules/@deepseek-ai/dsh/lib/bin.js
           DSH_PATH: ${{ runner.temp }}/dsh-host/node_modules/@deepseek-ai/dsh/lib/bin.js
-          DSH_ACP_TEST_ALPHA_HOST: ${{ runner.temp }}/dsh-host/node_modules/@deepseek-ai/dsh/lib/bin.js
+          DSH_ACP_TEST_WRITE_HOST: ${{ runner.temp }}/dsh-host/node_modules/@deepseek-ai/dsh/lib/bin.js
           DSH_ACP_TEST_HOST: ${{ runner.temp }}/dsh-host/node_modules/@deepseek-ai/dsh/lib/bin.js
         run: npm test -- test/e2e.test.ts
       - name: Pack ACP plugin
