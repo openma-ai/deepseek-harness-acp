@@ -53,6 +53,7 @@ import {
     type StopReason,
     type Stream,
 } from "@agentclientprotocol/sdk";
+import { z } from "zod";
 import type { Context } from "@deepseek-ai/cordis";
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
 import type { Agent } from "@deepseek-ai/dsh-agent";
@@ -241,6 +242,20 @@ interface SessionRecord {
     /** Serializes agent rebuilds requested concurrently by ACP clients. */
     mutationTail: Promise<void>;
 }
+
+// Extension requests bypass the SDK's core prompt schema validation.
+const steeringRequestSchema = z.object({
+    sessionId: z.string().min(1),
+    prompt: z.array(z.discriminatedUnion("type", [
+        z.object({ type: z.literal("text"), text: z.string() }),
+        z.object({ type: z.literal("image"), data: z.string(), mimeType: z.string(), uri: z.string().nullable().default(null) }),
+        z.object({ type: z.literal("resource_link"), name: z.string(), uri: z.string() }),
+        z.object({ type: z.literal("resource"), resource: z.object({ uri: z.string(), text: z.string() }) }),
+    ])).min(1).refine((blocks) => blocks.some((block) => block.type !== "text" || block.text.length > 0)),
+    _meta: z.object({
+        steering: z.object({ idleBehavior: z.literal("promptRequired").optional() }).optional(),
+    }).optional(),
+});
 
 function invalidParams(detail: string): RequestError {
     // Detail travels in the wire error message (second arg); the first is data.
@@ -1711,6 +1726,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                         typeof requested === "number" && requested >= 1 && requested < PROTOCOL_VERSION
                             ? requested
                             : PROTOCOL_VERSION,
+                    _meta: { steering: { supported: true } },
                     agentInfo: { name: "dsh-acp", title: "DeepSeek Harness", version: VERSION },
                     agentCapabilities: {
                         _meta: { dsh: { cordis: { ...CORDIS_CAPABILITY } } },
@@ -1894,6 +1910,57 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     };
                 });
                 return { sessions: sessionsInfo };
+            },
+
+            async extMethod(method, params): Promise<Record<string, unknown>> {
+                if (method !== "_session/steering") throw RequestError.methodNotFound(method);
+                assertOpen();
+                const parsed = steeringRequestSchema.safeParse(params);
+                if (!parsed.success) throw invalidParams("invalid steering request");
+                const record = requireSession(parsed.data.sessionId);
+                const inflight = record.inflight;
+                const promptRequired = { outcome: "promptRequired", reason: "noRunningTurn" };
+                const stillRunning = () => inflight !== undefined
+                    && record.inflight === inflight
+                    && !record.cancelled
+                    && record.agent.status === "running"
+                    && (inflight.turn === undefined || record.projection.turnEndFor(inflight.turn) === undefined);
+                // No detached prompt, even when idleBehavior was omitted. The
+                // client owns the ordinary prompt lifecycle and event window.
+                if (!stillRunning()) {
+                    return promptRequired;
+                }
+                let converted;
+                try {
+                    converted = await convertPrompt(parsed.data.prompt, attachmentIngestOf(ctx.get("attachments")));
+                } catch (error: unknown) {
+                    if (error instanceof UnsupportedPromptContentError || error instanceof PromptImageError) {
+                        throw invalidParams(error.message);
+                    }
+                    throw error;
+                }
+                if (converted.blocks.length === 0) throw invalidParams("empty prompt");
+                await requireCredential(record.provider ?? config.provider);
+                assertOpen();
+                if (agents.get(record.agent.id) !== record.agent) {
+                    throw internalError("steering failed: the agent was disposed outside the bridge");
+                }
+                // Conversion/auth may yield through completion, cancellation,
+                // or even admission of another prompt. Never cross that turn
+                // boundary. Check native idle too: whenIdle settles later.
+                if (!stillRunning()) {
+                    return promptRequired;
+                }
+                try {
+                    deliverPrompt(record.agent, createUserMessage({
+                        content: converted.blocks,
+                        source: { kind: "user" },
+                    }), true);
+                } catch (error: unknown) {
+                    const detail = error instanceof Error ? error.message : String(error);
+                    throw internalError(`steering failed: ${detail}`);
+                }
+                return { outcome: "injected" };
             },
 
             async prompt(params: PromptRequest): Promise<PromptResponse> {

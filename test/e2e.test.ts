@@ -11,7 +11,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { createServer, type Server } from "node:http";
+import { createServer, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -128,6 +128,10 @@ class AcpTestClient {
         });
         this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
         return promise;
+    }
+
+    notify(method: string, params: unknown): void {
+        this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
     }
 
     updatesFor(sessionId: string): Array<Record<string, unknown>> {
@@ -1210,4 +1214,197 @@ describe("ACP authentication (Agent Auth + logout)", () => {
         >;
         expect(created["sessionId"]).toBeTruthy();
     }, 120_000);
+});
+
+
+describe("ACP steering extension", () => {
+    let client: AcpTestClient;
+    let root: string;
+    const calls: Array<{ body: string; response: ServerResponse }> = [];
+    const server = createServer(async (request, response) => {
+        let body = "";
+        for await (const chunk of request) body += String(chunk);
+        // The profile also requests session titles; these are not agent steps.
+        if (JSON.parse(body).messages?.[0]?.content?.startsWith("Create a concise title")) {
+            response.writeHead(200, { "content-type": "application/json" });
+            response.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: "Steering test" }, finish_reason: "stop" }] }));
+            return;
+        }
+        calls.push({ body, response });
+    });
+    const idleMeta = { steering: { idleBehavior: "promptRequired" } };
+
+    function reply(index: number, text: string): void {
+        const response = calls[index]!.response;
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.end(`data: ${JSON.stringify({
+            id: "steering-test", object: "chat.completion.chunk", created: 1,
+            model: "deepseek-v4-flash",
+            choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: "stop" }],
+        })}\n\ndata: [DONE]\n\n`);
+    }
+
+    beforeAll(async () => {
+        root = mkdtempSync(join(tmpdir(), "dsh-acp-steering-"));
+        await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+        const address = server.address();
+        if (!address || typeof address === "string") throw new Error("missing server address");
+        const bundle = join(root, "test-bundle");
+        mkdirSync(bundle);
+        writeFileSync(join(bundle, "package.json"), JSON.stringify({
+            name: "dsh-acp-test-steering", version: "0.0.0", type: "module", main: "./index.js",
+            dsh: { bundle: { patch: "./cordis.patch.yml" } },
+        }));
+        writeFileSync(join(bundle, "cordis.patch.yml"), JSON.stringify([{
+            insert: [{ id: "steering-fixture", name: "dsh-acp-test-steering", config: { root } }],
+        }]));
+        writeFileSync(join(bundle, "index.js"), `
+            import { existsSync, writeFileSync, appendFileSync } from 'node:fs';
+            import { join } from 'node:path';
+            import { setTimeout } from 'node:timers/promises';
+            export const inject = ['agents', 'attachments'];
+            export function apply(ctx, { root }) {
+                const validate = ctx.attachments.validateImage.bind(ctx.attachments);
+                ctx.attachments.validateImage = async (input) => {
+                    if (existsSync(join(root, 'hold-image'))) {
+                        writeFileSync(join(root, 'image-entered'), '1');
+                        while (existsSync(join(root, 'hold-image'))) await setTimeout(10);
+                    }
+                    return validate(input);
+                };
+                ctx.on('agent/created', ({ agent }) => {
+                    const steer = agent.steer.bind(agent);
+                    agent.steer = (message) => {
+                        if (existsSync(join(root, 'fail-steer'))) throw new Error('injection rejected');
+                        return steer(message);
+                    };
+                });
+                ctx.on('session/event', (_session, event) => {
+                    if (event.type === 'turn/start') appendFileSync(join(root, 'turns'), 'turn\\n');
+                });
+            }
+        `);
+        client = new AcpTestClient(root, root, undefined, {
+            DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}`,
+        }, ["--bundle", bundle]);
+    });
+    afterAll(async () => {
+        await client?.close();
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        rmSync(root, { recursive: true, force: true });
+    });
+
+    it("advertises steering on the initialize response", async () => {
+        expect(await client.request("initialize", { protocolVersion: 1 })).toMatchObject({
+            _meta: { steering: { supported: true } },
+        });
+    }, 60_000);
+
+    it("rejects malformed input and unknown methods with JSON-RPC errors", async () => {
+        const { sessionId } = await client.request("session/new", { cwd: root, mcpServers: [] }) as { sessionId: string };
+        for (const params of [
+            {}, { sessionId, prompt: "bad" }, { sessionId, prompt: [] },
+            { sessionId, prompt: [{ type: "text", text: "" }] },
+            { sessionId, prompt: [null] }, { sessionId, prompt: [{ type: "text", text: 1 }] },
+            { sessionId, prompt: [{ type: "audio", data: "aA==", mimeType: "audio/wav" }] },
+            { sessionId: "missing-session", prompt: [{ type: "text", text: "hello" }] },
+            { sessionId, prompt: [{ type: "text", text: "hello" }], _meta: { steering: { idleBehavior: "unsupported" } } },
+        ]) {
+            await expect(client.request("_session/steering", params)).rejects.toMatchObject({ code: -32602 });
+        }
+        await expect(client.request("_session/unknown", {})).rejects.toMatchObject({ code: -32601 });
+        expect(calls).toHaveLength(0);
+    }, 60_000);
+
+    it("returns idle input to the client and injects active input exactly once in the original turn", async () => {
+        const { sessionId } = await client.request("session/new", { cwd: root, mcpServers: [] }) as { sessionId: string };
+        const turnsBefore = existsSync(join(root, "turns")) ? readFileSync(join(root, "turns"), "utf8") : "";
+        const prompt = [{ type: "text", text: "original steering test" }];
+        expect(await client.request("_session/steering", { sessionId, prompt, _meta: idleMeta })).toEqual({
+            outcome: "promptRequired", reason: "noRunningTurn",
+        });
+        expect(calls).toHaveLength(0);
+        let settled = false;
+        const original = client.request("session/prompt", { sessionId, prompt });
+        void original.then(() => { settled = true; });
+        await expect.poll(() => calls.length).toBe(1);
+        expect(await client.request("_session/steering", {
+            sessionId, prompt: [{ type: "text", text: "unique-steering-input" }], _meta: idleMeta,
+        })).toEqual({ outcome: "injected" });
+        expect(settled).toBe(false);
+        reply(0, "first step");
+        await expect.poll(() => calls.length).toBe(2);
+        expect(calls[1]!.body.split("unique-steering-input")).toHaveLength(2);
+        reply(1, "steered continuation");
+        await expect(original).resolves.toMatchObject({ stopReason: "end_turn" });
+        expect(client.updatesFor(sessionId)).toContainEqual(expect.objectContaining({
+            sessionUpdate: "agent_message_chunk", content: { type: "text", text: "steered continuation" },
+        }));
+        expect(await client.request("_session/steering", { sessionId, prompt, _meta: idleMeta })).toEqual({
+            outcome: "promptRequired", reason: "noRunningTurn",
+        });
+        const followup = client.request("session/prompt", { sessionId, prompt: [{ type: "text", text: "next ordinary turn" }] });
+        await expect.poll(() => calls.length).toBe(3);
+        // Older clients can still steer with concurrent session/prompt.
+        await expect(client.request("session/prompt", {
+            sessionId, prompt: [{ type: "text", text: "legacy-steering-input" }],
+        })).resolves.toMatchObject({ stopReason: "end_turn" });
+        reply(2, "second turn");
+        await expect.poll(() => calls.length).toBe(4);
+        expect(calls[3]!.body.split("legacy-steering-input")).toHaveLength(2);
+        reply(3, "legacy continuation");
+        await expect(followup).resolves.toMatchObject({ stopReason: "end_turn" });
+        expect(calls).toHaveLength(4);
+        expect(readFileSync(join(root, "turns"), "utf8").slice(turnsBefore.length)).toBe("turn\nturn\n");
+    }, 60_000);
+    it.each([false, true])("returns promptRequired when conversion crosses turn completion (replacement turn: %s)", async (replacement) => {
+        const { sessionId } = await client.request("session/new", { cwd: root, mcpServers: [] }) as { sessionId: string };
+        const start = calls.length;
+        const original = client.request("session/prompt", { sessionId, prompt: [{ type: "text", text: "race original" }] });
+        await expect.poll(() => calls.length).toBe(start + 1);
+        rmSync(join(root, "image-entered"), { force: true });
+        writeFileSync(join(root, "hold-image"), "1");
+        const steering = client.request("_session/steering", {
+            sessionId, _meta: idleMeta, prompt: [
+                { type: "text", text: "race-input" },
+                { type: "image", mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC" },
+            ],
+        });
+        await expect.poll(() => existsSync(join(root, "image-entered"))).toBe(true);
+        reply(start, "finished before steering");
+        await expect(original).resolves.toMatchObject({ stopReason: "end_turn" });
+        let next: Promise<unknown> | undefined;
+        if (replacement) {
+            next = client.request("session/prompt", { sessionId, prompt: [{ type: "text", text: "race-input" }] });
+            await expect.poll(() => calls.length).toBe(start + 2);
+        }
+        rmSync(join(root, "hold-image"));
+        await expect(steering).resolves.toEqual({ outcome: "promptRequired", reason: "noRunningTurn" });
+        const followup = next ?? client.request("session/prompt", { sessionId, prompt: [{ type: "text", text: "race-input" }] });
+        await expect.poll(() => calls.length).toBe(start + 2);
+        expect(calls[start + 1]!.body.split("race-input")).toHaveLength(2);
+        reply(start + 1, "client-owned followup");
+        await expect(followup).resolves.toMatchObject({ stopReason: "end_turn" });
+        expect(calls).toHaveLength(start + 2);
+    }, 60_000);
+
+    it("does not claim delivery on injection failure or after cancellation", async () => {
+        const { sessionId } = await client.request("session/new", { cwd: root, mcpServers: [] }) as { sessionId: string };
+        const start = calls.length;
+        const original = client.request("session/prompt", { sessionId, prompt: [{ type: "text", text: "cancel original" }] });
+        await expect.poll(() => calls.length).toBe(start + 1);
+        writeFileSync(join(root, "fail-steer"), "1");
+        await expect(client.request("_session/steering", {
+            sessionId, prompt: [{ type: "text", text: "rejected-input" }],
+        })).rejects.toMatchObject({ code: -32603 });
+        rmSync(join(root, "fail-steer"));
+        client.notify("session/cancel", { sessionId });
+        await expect(original).resolves.toMatchObject({ stopReason: "cancelled" });
+        expect(await client.request("_session/steering", {
+            sessionId, prompt: [{ type: "text", text: "cancelled-input" }], _meta: idleMeta,
+        })).toEqual({ outcome: "promptRequired", reason: "noRunningTurn" });
+        expect(calls).toHaveLength(start + 1);
+    }, 60_000);
+
 });
