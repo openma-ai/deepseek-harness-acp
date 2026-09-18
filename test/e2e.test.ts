@@ -404,6 +404,102 @@ describe("dsh-acp Host-owned defaults", () => {
         expect(options.get("effort")).toMatchObject({ currentValue: "max" });
     }, 90_000);
 
+    it("keeps model option ids stable while switches move the default provider (#24)", async () => {
+        const sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-model-ids-sessions-"));
+        const workspace = mkdtempSync(join(tmpdir(), "dsh-acp-model-ids-workspace-"));
+        const bundle = mkdtempSync(join(tmpdir(), "dsh-acp-model-ids-bundle-"));
+        roots.push(sessionRoot, workspace, bundle);
+
+        // A second, catalog-only provider: enough for switching (no request
+        // is ever streamed), and it serves an id the default provider also has.
+        writeFileSync(join(bundle, "package.json"), JSON.stringify({
+            name: "dsh-acp-test-acme-provider",
+            type: "module",
+            main: "./index.js",
+            dsh: { bundle: { patch: "./cordis.patch.yml" } },
+        }));
+        writeFileSync(join(bundle, "cordis.patch.yml"), JSON.stringify([{
+            insert: [{ id: "dsh-acp-test-acme-provider", name: "dsh-acp-test-acme-provider" }],
+        }]));
+        writeFileSync(join(bundle, "index.js"), [
+            "import { LlmAdapter } from '@deepseek-ai/dsh-llm'",
+            "class AcmeAdapter extends LlmAdapter {",
+            "  providerInfo(provider) { return { id: provider, name: 'Acme Gateway' } }",
+            "  listModels(provider) {",
+            "    return Promise.resolve([",
+            "      { provider, id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro via Acme' },",
+            "      { provider, id: 'acme-think', name: 'Acme Think' },",
+            "    ])",
+            "  }",
+            "  async *stream() { throw new Error('acme is a catalog-only test provider') }",
+            "}",
+            "export const inject = ['llm']",
+            "export function apply(ctx) { ctx.llm.registerAdapter(['acme'], new AcmeAdapter()) }",
+        ].join("\n"));
+
+        const client = new AcpTestClient(sessionRoot, workspace, undefined, undefined, ["--bundle", bundle]);
+        clients.push(client);
+        await client.request("initialize", { protocolVersion: 1 }, 60_000);
+
+        const modelOption = (response: unknown): { currentValue: string; values: string[] } => {
+            const options = (response as { configOptions: Array<Record<string, unknown>> }).configOptions;
+            const option = options.find((entry) => entry["id"] === "model") as
+                | { currentValue: string; options: Array<{ value: string }> }
+                | undefined;
+            expect(option).toBeDefined();
+            return { currentValue: option!.currentValue, values: option!.options.map((entry) => entry.value) };
+        };
+        const setModel = (sessionId: string, value: string) =>
+            client.request("session/set_config_option", { sessionId, configId: "model", value });
+
+        const first = (await client.request("session/new", { cwd: workspace, mcpServers: [] })) as {
+            sessionId: string;
+        };
+        const initial = modelOption(first);
+        // Two providers: every value is fully qualified, none depends on the default.
+        expect(initial.currentValue).toMatch(/^deepseek-official::/);
+        for (const value of initial.values) expect(value).toMatch(/^[^:]+::./);
+        expect(initial.values).toEqual(expect.arrayContaining([
+            "deepseek-official::deepseek-v4-pro",
+            "acme::deepseek-v4-pro",
+            "acme::acme-think",
+        ]));
+
+        // Switching to the other provider rewrites the product default…
+        expect(modelOption(await setModel(first.sessionId, "acme::acme-think")).currentValue).toBe("acme::acme-think");
+
+        // …and a later session still lists the very same ids.
+        const second = (await client.request("session/new", { cwd: workspace, mcpServers: [] })) as {
+            sessionId: string;
+        };
+        const later = modelOption(second);
+        expect(later.currentValue).toBe("acme::acme-think");
+        expect(new Set(later.values)).toEqual(new Set(initial.values));
+
+        // The ids that worked before the default moved keep working after it.
+        expect(modelOption(await setModel(second.sessionId, "acme::acme-think")).currentValue).toBe("acme::acme-think");
+        expect(modelOption(await setModel(second.sessionId, "deepseek-official::deepseek-v4-pro")).currentValue)
+            .toBe("deepseek-official::deepseek-v4-pro");
+
+        // Bare ids (older clients) resolve to the provider that serves them:
+        // the default when it does, otherwise the unique owner.
+        expect(modelOption(await setModel(second.sessionId, "acme-think")).currentValue).toBe("acme::acme-think");
+        expect(modelOption(await setModel(second.sessionId, "deepseek-v4-pro")).currentValue).toBe("acme::deepseek-v4-pro");
+        await expect(setModel(second.sessionId, "acme::nope")).rejects.toThrow(/unknown model/);
+
+        await expect(client.request("session/prompt", {
+            sessionId: second.sessionId,
+            prompt: [{ type: "text", text: "/status" }],
+        })).resolves.toMatchObject({ stopReason: "end_turn" });
+        const status = client.updatesFor(second.sessionId).find(
+            (update) =>
+                update["sessionUpdate"] === "agent_message_chunk" &&
+                (update["content"] as { text?: string } | undefined)?.text?.includes("**dsh-acp**"),
+        );
+        expect((status?.["content"] as { text: string }).text).toContain("| Provider | acme |");
+        expect((status?.["content"] as { text: string }).text).toContain("| Model | deepseek-v4-pro |");
+    }, 120_000);
+
     it("restores the selected permission after the ACP Host restarts", async () => {
         const sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-default-permission-switch-sessions-"));
         const workspace = mkdtempSync(join(tmpdir(), "dsh-acp-default-permission-switch-workspace-"));

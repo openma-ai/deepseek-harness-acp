@@ -363,11 +363,13 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     // ------------------------------------------------------------------ //
 
     /**
-     * One selectable model. Values are encoded as the bare model id on the
-     * default provider (stable for existing clients) and `provider::model`
-     * on any other route — which is how third-party providers configured in
-     * the dsh Web UI (an `llm-pi-ai:` settings section) become selectable
-     * here the moment their routes register.
+     * One selectable model. With a single registered provider values are bare
+     * model ids (stable for existing clients); once several providers are
+     * registered every value is `provider::model` — which is how third-party
+     * providers configured in the dsh Web UI (an `llm-pi-ai:` settings
+     * section) become selectable here the moment their routes register.
+     * The encoding never depends on the *default* provider: a successful
+     * switch rewrites that default, so ids keyed on it went stale (#24).
      */
     interface ModelChoice {
         provider: string | undefined;
@@ -406,13 +408,45 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
 
     const defaultProvider = (): string | undefined => config.provider ?? defaultSelection().provider;
 
-    const encodeChoice = (provider: string | undefined, model: string): string =>
-        provider === undefined || provider === defaultProvider() ? model : `${provider}::${model}`;
+    const multiProvider = (): boolean => {
+        try {
+            return llm.listProviders().length > 1;
+        } catch {
+            return false;
+        }
+    };
 
-    const decodeChoice = (value: string): { provider: string | undefined; model: string } => {
+    const encodeChoice = (provider: string | undefined, model: string): string => {
+        const resolved = provider ?? defaultProvider();
+        return resolved !== undefined && multiProvider() ? `${resolved}::${model}` : model;
+    };
+
+    /** Split `provider::model` (or a bare id) without resolving the provider. */
+    const splitChoice = (value: string): { provider: string | undefined; model: string } => {
         const i = value.indexOf("::");
-        if (i <= 0) return { provider: defaultProvider(), model: value };
+        if (i <= 0) return { provider: undefined, model: value };
         return { provider: value.slice(0, i), model: value.slice(i + 2) };
+    };
+
+    /**
+     * A bare id (older clients, cached lists) names the model on whichever
+     * provider serves it: the default provider when it does, else the single
+     * provider that does. Only an id no provider serves stays on the default.
+     */
+    const decodeChoice = (
+        value: string,
+        catalog: ModelChoice[],
+    ): { provider: string | undefined; model: string } => {
+        const split = splitChoice(value);
+        if (split.provider !== undefined) return split;
+        const owners = new Set(
+            catalog.filter((entry) => entry.model === split.model && entry.provider !== undefined)
+                .map((entry) => entry.provider as string),
+        );
+        const fallback = defaultProvider();
+        if (fallback !== undefined && owners.has(fallback)) return { provider: fallback, model: split.model };
+        if (owners.size === 1) return { provider: [...owners][0], model: split.model };
+        return { provider: fallback, model: split.model };
     };
 
     /** Cached adapter directory; invalidated by `llm/adapters-updated`. */
@@ -431,11 +465,13 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         try {
             const providers = llm.listProviders();
             const multi = providers.length > 1;
+            logDebug(`model discovery: providers ${providers.map((provider) => provider.id).join(", ") || "(none)"}`);
             for (const provider of providers) {
                 const models = await llm.listModels(provider.id).catch((error: unknown) => {
                     logDebug(`listModels(${provider.id}) failed: ${String(error)}`);
                     return [];
                 });
+                logDebug(`model discovery: ${provider.id} lists ${models.length} model(s)`);
                 for (const model of models) {
                     found.push({
                         provider: provider.id,
@@ -583,13 +619,16 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         if (record.inflight !== undefined) {
             throw invalidParams("cannot switch models while a prompt is running");
         }
-        const choice = decodeChoice(value);
+        const discovered = await discoverModels();
+        const choice = decodeChoice(value, discovered);
         const known = new Set<string>([
             ...modelCandidates().map((model) => encodeChoice(undefined, model)),
-            ...(await discoverModels()).map((entry) => encodeChoice(entry.provider, entry.model)),
+            ...discovered.map((entry) => encodeChoice(entry.provider, entry.model)),
             encodeChoice(record.provider, record.model ?? ""),
         ]);
-        if (!known.has(value)) throw invalidParams(`unknown model: ${value}`);
+        if (!known.has(value) && !known.has(encodeChoice(choice.provider, choice.model))) {
+            throw invalidParams(`unknown model: ${value}`);
+        }
         if (choice.model === record.model && choice.provider === (record.provider ?? defaultProvider())) return;
         const sessionId = record.agent.session.id;
         await record.dispose().catch((error: unknown) => {
@@ -612,7 +651,9 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         record.agent = handle.agent;
         record.dispose = () => handle.dispose();
         record.model = choice.model;
-        if (choice.provider !== undefined && choice.provider !== defaultProvider()) {
+        // Keep the provider explicit even when it is today's default: the
+        // default moves with every switch, the session's route must not.
+        if (choice.provider !== undefined) {
             record.provider = choice.provider;
         } else {
             delete record.provider;
@@ -1529,7 +1570,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         const exact = catalog.filter(
             (entry) =>
                 entry.value.toLowerCase() === lowered ||
-                decodeChoice(entry.value).model.toLowerCase() === lowered,
+                splitChoice(entry.value).model.toLowerCase() === lowered,
         );
         const matches =
             exact.length > 0
