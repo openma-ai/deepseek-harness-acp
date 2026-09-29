@@ -483,13 +483,14 @@ export class SessionProjection {
     streamToolOutput(callId: string, text: string): SessionUpdate[] {
         const state = this.toolCalls.get(callId);
         if (state === undefined || text.length === 0) return [];
-        this.streamedToolOutput.set(callId, ((this.streamedToolOutput.get(callId) ?? "") + text).slice(0, MAX_RESULT_TEXT));
+        const output = ((this.streamedToolOutput.get(callId) ?? "") + text).slice(0, MAX_RESULT_TEXT);
+        this.streamedToolOutput.set(callId, output);
         const terminal = this.terminalOutput && state.facts.kind === "execute";
         return [{
             sessionUpdate: "tool_call_update",
             toolCallId: callId,
             status: "in_progress",
-            ...(terminal ? {} : { content: [{ type: "content", content: { type: "text", text } }] }),
+            ...(terminal ? {} : { content: [{ type: "content", content: { type: "text", text: output } }] }),
             ...(terminal
                 ? { _meta: { terminal_output: { terminal_id: callId, data: text } } }
                 : {}),
@@ -1004,14 +1005,14 @@ export class SessionProjection {
             newText: diff.newText,
         }));
         const isCommand = facts?.kind === "execute";
-        if (remainingText.length > 0 && diffs.length === 0 && !(this.terminalOutput && isCommand)) {
+        if (text.length > 0 && diffs.length === 0 && !(this.terminalOutput && isCommand)) {
             // Fenced output renders in tool-call cards (raw text does not in
             // every client); markdown-ish tool output passes through as is.
             const block: AcpContentBlock = {
                 type: "text",
                 text: isCommand && streamed.length === 0
-                    ? `\`\`\`sh\n${remainingText.replace(/\n+$/, "")}\n\`\`\`\n`
-                    : remainingText,
+                    ? `\`\`\`sh\n${text.replace(/\n+$/, "")}\n\`\`\`\n`
+                    : text,
             };
             content.push({ type: "content", content: block });
         }

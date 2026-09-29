@@ -525,7 +525,7 @@ describe("SessionProjection tool calls", () => {
         expect(done).toHaveLength(1);
     });
 
-    it("streams live tool chunks and emits only the remaining text on completion", () => {
+    it("streams cumulative tool content and replaces it with the full result on completion", () => {
         const p = new SessionProjection();
         p.onEvent(event("tool/call", { turn: 1, step: 0, callId: "live", name: "bash", arguments: '{"command":"echo hello"}' }));
         expect(p.streamToolOutput("live", "hello")).toMatchObject([{
@@ -534,13 +534,16 @@ describe("SessionProjection tool calls", () => {
             status: "in_progress",
             content: [{ type: "content", content: { type: "text", text: "hello" } }],
         }]);
+        expect(p.streamToolOutput("live", " ")).toMatchObject([{
+            content: [{ type: "content", content: { type: "text", text: "hello " } }],
+        }]);
         const done = p.onEvent(event("tool/result", {
             turn: 1, step: 0,
             message: { content: [{ type: "tool-result", toolCallId: "live", content: [{ type: "text", text: "hello world" }] }] },
         }));
         expect(done[0]).toMatchObject({
             status: "completed",
-            content: [{ type: "content", content: { type: "text", text: " world" } }],
+            content: [{ type: "content", content: { type: "text", text: "hello world" } }],
         });
         expect(done[0]).toMatchObject({ rawOutput: { output: "hello world" } });
     });
@@ -560,7 +563,7 @@ describe("SessionProjection tool calls", () => {
         }));
         expect(done[0]).toMatchObject({
             status: "completed",
-            content: [{ type: "content", content: { type: "text", text: "found" } }],
+            content: [{ type: "content", content: { type: "text", text: "match found" } }],
         });
     });
 
