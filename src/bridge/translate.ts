@@ -122,10 +122,11 @@ export function classifyToolCall(name: string, rawArguments: string): ToolCallFa
     });
 
     switch (name) {
-        case "bash": {
+        case "bash":
+        case "pwsh": {
             const command = asString(args["command"]);
             const restart = args["restart"] === true;
-            return facts("execute", command !== undefined ? firstLine(command) : restart ? "Restart bash" : "bash");
+            return facts("execute", command !== undefined ? firstLine(command) : restart ? `Restart ${name}` : name);
         }
         case "read":
             return facts("read", path !== undefined ? `Read ${path}` : "Read file");
@@ -238,10 +239,16 @@ function extractToolResult(data: Record<string, unknown>): ToolResultFacts {
         message !== null && typeof message === "object"
             ? (message as Record<string, unknown>)["content"]
             : undefined;
+    if (message !== null && typeof message === "object"
+        && (message as Record<string, unknown>)["isError"] === true) failed = true;
     if (Array.isArray(content)) {
         for (const block of content) {
             if (block === null || typeof block !== "object") continue;
             const b = block as Record<string, unknown>;
+            if (b["type"] === "text" && typeof b["text"] === "string") {
+                parts.push(b["text"]);
+                continue;
+            }
             if (b["type"] !== "tool-result") continue;
             if (b["isError"] === true) failed = true;
             const inner = b["content"];
@@ -436,6 +443,8 @@ export class SessionProjection {
     private streamedReasoning = new Set<string>();
     /** Structured tool values observed live before DSH omits them from its durable event. */
     private toolResultValues = new Map<string, unknown>();
+    /** Live bytes already sent for each tool, used to avoid replaying them at settlement. */
+    private streamedToolOutput = new Map<string, string>();
     /** One authoritative state per open ACP tool call. Block indexes only
      * route streaming fragments to that state; they never own lifecycle. */
     private toolCalls = new Map<string, ProjectedToolCall>();
@@ -468,6 +477,23 @@ export class SessionProjection {
     /** Stage one live `tools/result` value for the matching durable `tool/result` event. */
     recordToolResult(callId: string, value: unknown): void {
         this.toolResultValues.set(callId, value);
+    }
+
+    /** Publish a running command's output through the client's supported path. */
+    streamToolOutput(callId: string, text: string): SessionUpdate[] {
+        const state = this.toolCalls.get(callId);
+        if (state === undefined || text.length === 0) return [];
+        this.streamedToolOutput.set(callId, ((this.streamedToolOutput.get(callId) ?? "") + text).slice(0, MAX_RESULT_TEXT));
+        const terminal = this.terminalOutput && state.facts.kind === "execute";
+        return [{
+            sessionUpdate: "tool_call_update",
+            toolCallId: callId,
+            status: "in_progress",
+            ...(terminal ? {} : { content: [{ type: "content", content: { type: "text", text } }] }),
+            ...(terminal
+                ? { _meta: { terminal_output: { terminal_id: callId, data: text } } }
+                : {}),
+        } as SessionUpdate];
     }
 
     /** Reset per-prompt accumulators; call when a new `session/prompt` starts. */
@@ -944,11 +970,18 @@ export class SessionProjection {
                           return block === undefined ? undefined : (block as Record<string, unknown>)["toolCallId"];
                       })()
                     : undefined,
-            ) ?? asString(data["callId"]);
+            ) ?? asString((message as Record<string, unknown> | undefined)?.["toolCallId"])
+              ?? asString(((message as Record<string, unknown> | undefined)?.["source"] as Record<string, unknown> | undefined)?.["callId"])
+              ?? asString(data["callId"]);
         if (callId === undefined) return [];
         const state = this.toolCalls.get(callId);
         const facts = state?.facts;
         const { failed, text, diffs } = extractToolResult(data);
+        const streamed = this.streamedToolOutput.get(callId) ?? "";
+        this.streamedToolOutput.delete(callId);
+        const remainingText = streamed.length > 0 && text.startsWith(streamed)
+            ? text.slice(streamed.length)
+            : text;
         const hasLiveValue = this.toolResultValues.has(callId);
         const liveValue = this.toolResultValues.get(callId);
         this.toolResultValues.delete(callId);
@@ -971,42 +1004,14 @@ export class SessionProjection {
             newText: diff.newText,
         }));
         const isCommand = facts?.kind === "execute";
-        if (this.terminalOutput && isCommand) {
-            // Display-terminal path: stream the whole captured output onto the
-            // embedded terminal, then close it with the exit status. Content
-            // stays empty — the terminal is the presentation.
-            this.toolCalls.delete(callId);
-            for (const [key, value] of this.toolCallBlocks) {
-                if (value === callId) this.toolCallBlocks.delete(key);
-            }
-            return [
-                ...(text.length > 0
-                    ? [
-                          {
-                              sessionUpdate: "tool_call_update",
-                              toolCallId: callId,
-                              _meta: { terminal_output: { terminal_id: callId, data: text } },
-                          } as unknown as SessionUpdate,
-                      ]
-                    : []),
-                {
-                    sessionUpdate: "tool_call_update",
-                    toolCallId: callId,
-                    status: failed ? "failed" : "completed",
-                    ...(rawOutput !== undefined ? { rawOutput } : {}),
-                    _meta: {
-                        ...(toolResultMeta ?? {}),
-                        terminal_exit: { terminal_id: callId, exit_code: failed ? 1 : 0, signal: null },
-                    },
-                } as unknown as SessionUpdate,
-            ];
-        }
-        if (text.length > 0 && diffs.length === 0) {
+        if (remainingText.length > 0 && diffs.length === 0 && !(this.terminalOutput && isCommand)) {
             // Fenced output renders in tool-call cards (raw text does not in
             // every client); markdown-ish tool output passes through as is.
             const block: AcpContentBlock = {
                 type: "text",
-                text: isCommand ? `\`\`\`sh\n${text.replace(/\n+$/, "")}\n\`\`\`\n` : text,
+                text: isCommand && streamed.length === 0
+                    ? `\`\`\`sh\n${remainingText.replace(/\n+$/, "")}\n\`\`\`\n`
+                    : remainingText,
             };
             content.push({ type: "content", content: block });
         }
@@ -1021,7 +1026,21 @@ export class SessionProjection {
                 status: failed ? "failed" : "completed",
                 ...(content.length > 0 ? { content } : {}),
                 ...(rawOutput !== undefined ? { rawOutput } : {}),
-                ...(toolResultMeta !== undefined ? { _meta: toolResultMeta } : {}),
+                ...(toolResultMeta !== undefined || (this.terminalOutput && isCommand)
+                    ? {
+                        _meta: {
+                            ...(toolResultMeta ?? {}),
+                            ...(this.terminalOutput && isCommand
+                                ? {
+                                    ...(remainingText.length > 0
+                                        ? { terminal_output: { terminal_id: callId, data: remainingText } }
+                                        : {}),
+                                    terminal_exit: { terminal_id: callId, exit_code: failed ? 1 : 0, signal: null },
+                                }
+                                : {}),
+                        },
+                    }
+                    : {}),
             },
         ];
     }
@@ -1039,6 +1058,7 @@ export class SessionProjection {
         }
         this.toolCallBlocks.clear();
         this.toolCalls.clear();
+        this.streamedToolOutput.clear();
         this.toolResultValues.clear();
         // A stopped prompt turn owns presentation settlement for any orphaned
         // calls. Do not rewrite `pending`/`in_progress` into a fabricated ACP

@@ -24,10 +24,7 @@ describe('profile bridge transport', () => {
         const server = rows.find((row) => row.id === 'acp-plugin')
         const stdio = rows.find((row) => row.id === 'acp-bridge')
 
-        expect(agentPresets).toMatchObject({
-            id: 'agent-presets',
-            name: '@deepseek-ai/dsh-agent-presets',
-        })
+        expect(agentPresets).toBeUndefined()
         expect(hostRunner).toMatchObject({
             id: 'cordis-host-runner',
             name: '@deepseek-ai/dsh-cordis-host-runner',
@@ -40,7 +37,6 @@ describe('profile bridge transport', () => {
             id: 'acp-bridge',
             name: '@openma/deepseek-harness-acp/stdio',
         })
-        expect(rows.indexOf(agentPresets as never)).toBeLessThan(rows.indexOf(server as never))
         expect(rows.indexOf(hostRunner as never)).toBeLessThan(rows.indexOf(server as never))
         expect(rows.indexOf(server as never)).toBeLessThan(rows.indexOf(stdio as never))
     })

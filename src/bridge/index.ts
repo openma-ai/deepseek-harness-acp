@@ -18,6 +18,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { isAbsolute } from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
@@ -68,8 +69,8 @@ import type {} from "@deepseek-ai/dsh-session-persistence";
 import type {} from "@deepseek-ai/dsh-commands";
 import type {} from "@deepseek-ai/dsh-skill";
 import type {} from "@deepseek-ai/dsh-agent-default-model";
-import { PERMISSION_SETTINGS_NAMESPACE } from "@deepseek-ai/dsh-permission-presets";
-import type {} from "@deepseek-ai/dsh-agent-presets";
+import type {} from "@deepseek-ai/dsh-permission-presets";
+import type {} from "@deepseek-ai/dsh-agent-preset-registry";
 import type {} from "@deepseek-ai/dsh-tools";
 import type { SubagentRunEndInfo, SubagentRunInfo } from "@deepseek-ai/dsh-subagent";
 
@@ -120,6 +121,8 @@ export {
 } from "./user-questions.ts";
 
 export const name = "acp-bridge";
+// dsh 0.1.7 keeps this settings section but no longer exports its namespace.
+const PERMISSION_SETTINGS_NAMESPACE = "permission";
 /** Wait for the dsh-base services this bridge captures during apply. */
 export const inject = ["agents", "credentials", "llm", "agentDefaultModel", "sessionPersistence", "approval", "permissionPresets", "commands", "agentPresets", "skills", "subagents", "userQuestions"];
 
@@ -377,8 +380,11 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         label: string;
     }
 
-    /** The composition's default selection (agent-default-model → settings.yaml). */
+    let standaloneDefaultSelection: { provider: string; model: string; reasoningEffort?: string } | undefined;
+
+    /** The composition's default selection, with the standalone save fallback. */
     const defaultSelection = (): { provider?: string; model?: string; reasoningEffort?: string } => {
+        if (standaloneDefaultSelection !== undefined) return standaloneDefaultSelection;
         try {
             return agentDefaultModel.currentSelection();
         } catch (error: unknown) {
@@ -399,6 +405,20 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     ? {}
                     : { reasoningEffort: ReasoningEffortId(selected.reasoningEffort) }),
             });
+            const save = ctx.get("dshAcpSaveModel") as ((selection: {
+                provider: string;
+                model: string;
+                reasoningEffort?: string;
+            }) => Promise<void>) | undefined;
+            if (save !== undefined && selected.provider !== undefined) {
+                const next = {
+                    provider: selected.provider,
+                    model: selected.model,
+                    ...(selected.reasoningEffort === undefined ? {} : { reasoningEffort: selected.reasoningEffort }),
+                };
+                await save(next);
+                standaloneDefaultSelection = next;
+            }
         } catch (error: unknown) {
             // The current-session switch remains valid when settings are
             // read-only or no settings provider is mounted.
@@ -1152,9 +1172,13 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     const saveDefaultPermission = async (modeId: string): Promise<void> => {
         if (!permissionService().names.includes(modeId)) return;
         try {
-            await ctx.get("settings")?.update(PERMISSION_SETTINGS_NAMESPACE, {
-                defaultPreset: modeId,
-            });
+            const settings = ctx.get("settings");
+            if (settings !== undefined) {
+                await settings.update(PERMISSION_SETTINGS_NAMESPACE, { defaultPreset: modeId });
+            } else {
+                const save = ctx.get("dshAcpSavePermission") as ((mode: string) => Promise<void>) | undefined;
+                await save?.(modeId);
+            }
         } catch (error: unknown) {
             // The current-session switch remains valid when settings are
             // read-only or no settings provider is mounted.
@@ -1649,6 +1673,65 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     // ------------------------------------------------------------------ //
     // Live event routing                                                  //
     // ------------------------------------------------------------------ //
+
+    // Current dsh exposes running tool output through its job ring. Pair
+    // registration with the tool dispatch that created it, then observe the
+    // ring with an independent cursor so the model's own cursor is untouched.
+    // Hosts without this capability keep the final-result content path.
+    const liveTool = new AsyncLocalStorage<{ agent: Agent; callId: string }>();
+    ctx.on("tools/execute", (exec, next) =>
+        exec.agent === undefined
+            ? next()
+            : liveTool.run({ agent: exec.agent, callId: String(exec.callId) }, next));
+    ctx.inject(["jobs"], (jobCtx) => {
+        const jobs = jobCtx.get("jobs") as {
+            events?: { subscribe(filter: { owners: "all" }, listener: (event: Record<string, unknown>) => void): () => void };
+            readAt(id: never, from: number, owner: never): {
+                chunks: readonly { text: string }[];
+                next: number;
+                lossy: boolean;
+            };
+        } | undefined;
+        if (jobs?.events?.subscribe === undefined || typeof jobs.readAt !== "function") return;
+        const active = new Map<string, { agent: Agent; callId: string; offset: number }>();
+        const publish = (id: string): void => {
+            const source = active.get(id);
+            if (source === undefined) return;
+            const record = ownedRecord(source.agent);
+            if (record === undefined) return;
+            const read = jobs.readAt(id as never, source.offset, source.agent.id as never);
+            source.offset = read.next;
+            if (read.lossy) {
+                for (const update of record.projection.streamToolOutput(source.callId, "\n[earlier output was truncated]\n")) {
+                    notify(String(source.agent.session.id), update);
+                }
+            }
+            for (const chunk of read.chunks) {
+                for (const update of record.projection.streamToolOutput(source.callId, chunk.text)) {
+                    notify(String(source.agent.session.id), update);
+                }
+            }
+        };
+        const dispose = jobs.events.subscribe({ owners: "all" }, (event) => {
+            const type = event["type"];
+            if (type === "registered") {
+                const job = event["job"] as { id?: unknown; owner?: unknown } | undefined;
+                const tool = liveTool.getStore();
+                if (tool !== undefined && job?.owner === tool.agent.id && typeof job.id === "string") {
+                    active.set(job.id, { ...tool, offset: 0 });
+                }
+                return;
+            }
+            if (type !== "output" && type !== "settled") return;
+            const id = type === "output"
+                ? event["id"]
+                : (event["job"] as { id?: unknown } | undefined)?.id;
+            if (typeof id !== "string") return;
+            publish(id);
+            if (type === "settled") active.delete(id);
+        });
+        jobCtx.effect(() => dispose);
+    });
 
     // DSH intentionally omits structured tool values from durable session events.
     // Observe the finalized execution result one layer earlier and stage its value

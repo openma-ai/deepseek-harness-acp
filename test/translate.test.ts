@@ -12,8 +12,8 @@ function event(type: string, data: Record<string, unknown>): HarnessEvent {
 }
 
 describe("classifyToolCall", () => {
-    it("maps bash to execute with the command as title", () => {
-        const facts = classifyToolCall("bash", JSON.stringify({ command: "npm test\necho done" }));
+    it.each(["bash", "pwsh"])("maps %s to execute with the command as title", (name) => {
+        const facts = classifyToolCall(name, JSON.stringify({ command: "npm test\necho done" }));
         expect(facts.kind).toBe("execute");
         expect(facts.title).toBe("npm test");
     });
@@ -490,7 +490,7 @@ describe("SessionProjection tool calls", () => {
         ).toEqual([]);
     });
 
-    it("emits tool_call then a completed tool_call_update with text content", () => {
+    it("publishes final tool text as content with completion", () => {
         const p = new SessionProjection();
         const start = p.onEvent(
             event("tool/call", { turn: 1, step: 0, callId: "c1", name: "bash", arguments: '{"command":"ls"}' }),
@@ -520,8 +520,68 @@ describe("SessionProjection tool calls", () => {
             // Command output renders as a fenced block (raw text does not
             // render in every client's tool-call card).
             content: [{ type: "content", content: { type: "text", text: "```sh\na.ts\n```\n" } }],
-            rawOutput: { output: "a.ts\n", isError: false },
         });
+        expect(done[0]).toMatchObject({ rawOutput: { output: "a.ts\n", isError: false } });
+        expect(done).toHaveLength(1);
+    });
+
+    it("streams live tool chunks and emits only the remaining text on completion", () => {
+        const p = new SessionProjection();
+        p.onEvent(event("tool/call", { turn: 1, step: 0, callId: "live", name: "bash", arguments: '{"command":"echo hello"}' }));
+        expect(p.streamToolOutput("live", "hello")).toMatchObject([{
+            sessionUpdate: "tool_call_update",
+            toolCallId: "live",
+            status: "in_progress",
+            content: [{ type: "content", content: { type: "text", text: "hello" } }],
+        }]);
+        const done = p.onEvent(event("tool/result", {
+            turn: 1, step: 0,
+            message: { content: [{ type: "tool-result", toolCallId: "live", content: [{ type: "text", text: "hello world" }] }] },
+        }));
+        expect(done[0]).toMatchObject({
+            status: "completed",
+            content: [{ type: "content", content: { type: "text", text: " world" } }],
+        });
+        expect(done[0]).toMatchObject({ rawOutput: { output: "hello world" } });
+    });
+
+    it("streams other job text into the tool card", () => {
+        const p = new SessionProjection();
+        p.onEvent(event("tool/call", { turn: 1, step: 0, callId: "search", name: "grep_search", arguments: '{"query":"needle"}' }));
+        expect(p.streamToolOutput("search", "match ")).toMatchObject([{
+            sessionUpdate: "tool_call_update",
+            toolCallId: "search",
+            status: "in_progress",
+            content: [{ type: "content", content: { type: "text", text: "match " } }],
+        }]);
+        const done = p.onEvent(event("tool/result", {
+            turn: 1, step: 0,
+            message: { role: "tool", toolCallId: "search", content: [{ type: "text", text: "match found" }] },
+        }));
+        expect(done[0]).toMatchObject({
+            status: "completed",
+            content: [{ type: "content", content: { type: "text", text: "found" } }],
+        });
+    });
+
+    it("accepts the direct tool result message emitted by current dsh", () => {
+        const p = new SessionProjection();
+        p.onEvent(event("tool/call", { turn: 1, step: 0, callId: "direct", name: "bash", arguments: '{"command":"pwd"}' }));
+        const done = p.onEvent(event("tool/result", {
+            turn: 1, step: 0,
+            message: {
+                role: "tool",
+                toolCallId: "direct",
+                content: [{ type: "text", text: "/ws\n" }],
+                isError: false,
+            },
+        }));
+        expect(done[0]).toMatchObject({
+            toolCallId: "direct",
+            status: "completed",
+            content: [{ type: "content", content: { type: "text", text: "```sh\n/ws\n```\n" } }],
+        });
+        expect(done).toHaveLength(1);
     });
 
     it.each([
@@ -625,16 +685,21 @@ describe("SessionProjection tool calls", () => {
         });
     });
 
-    it("streams command output onto a display terminal when the client supports one", () => {
+    it.each(["bash", "pwsh"])("uses display-terminal metadata for %s output when supported", (name) => {
         const p = new SessionProjection(undefined, { terminalOutput: true, cwd: "/ws" });
         const start = p.onEvent(
-            event("tool/call", { turn: 1, step: 0, callId: "t1", name: "bash", arguments: '{"command":"pwd"}' }),
+            event("tool/call", { turn: 1, step: 0, callId: "t1", name, arguments: '{"command":"pwd"}' }),
         );
         expect(start[0]).toMatchObject({
             sessionUpdate: "tool_call",
             content: [{ type: "terminal", terminalId: "t1" }],
             _meta: { terminal_info: { terminal_id: "t1", cwd: "/ws" } },
         });
+        expect(p.streamToolOutput("t1", "/w")).toMatchObject([{
+            sessionUpdate: "tool_call_update",
+            status: "in_progress",
+            _meta: { terminal_output: { terminal_id: "t1", data: "/w" } },
+        }]);
         const done = p.onEvent(
             event("tool/result", {
                 turn: 1,
@@ -648,14 +713,11 @@ describe("SessionProjection tool calls", () => {
         );
         expect(done[0]).toMatchObject({
             sessionUpdate: "tool_call_update",
-            _meta: { terminal_output: { terminal_id: "t1", data: "/ws\n" } },
-        });
-        expect(done[1]).toMatchObject({
-            sessionUpdate: "tool_call_update",
             status: "completed",
-            _meta: { terminal_exit: { terminal_id: "t1", exit_code: 0, signal: null } },
+            _meta: { terminal_output: { terminal_id: "t1", data: "s\n" } },
         });
-        expect((done[1] as Record<string, unknown>)["content"]).toBeUndefined();
+        expect(done[0]).toMatchObject({ _meta: { terminal_exit: { terminal_id: "t1", exit_code: 0, signal: null } } });
+        expect((done[0] as Record<string, unknown>)["content"]).toBeUndefined();
     });
 
     it("marks failed results and carries fs diffs as diff content", () => {
@@ -678,7 +740,7 @@ describe("SessionProjection tool calls", () => {
                 },
             }),
         );
-        expect(failed[0]).toMatchObject({ sessionUpdate: "tool_call_update", status: "failed" });
+        expect(failed.at(-1)).toMatchObject({ sessionUpdate: "tool_call_update", status: "failed" });
 
         p.onEvent(event("tool/call", { turn: 1, step: 1, callId: "c3", name: "edit", arguments: "{}" }));
         const withDiff = p.onEvent(

@@ -1,5 +1,8 @@
-import { fileURLToPath } from "node:url";
-import { describe, expect, it, vi } from "vitest";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 const bridge = { inject: [] as string[] };
 const server = { name: "acp-server" };
@@ -7,17 +10,33 @@ const server = { name: "acp-server" };
 vi.mock("../src/bridge/index.ts", () => bridge);
 vi.mock("../src/server.ts", () => server);
 
+// Keep the legacy capability test independent of another local checkout:
+// CI installs only the current dsh generation in this package's node_modules.
+const legacyHost = mkdtempSync(join(tmpdir(), "dsh-acp-legacy-host-"));
+for (const name of ["dsh-cordis-host-runner", "dsh-agent-presets"]) {
+    const packageRoot = join(legacyHost, "node_modules", "@deepseek-ai", name);
+    mkdirSync(join(packageRoot, "lib"), { recursive: true });
+    writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name: `@deepseek-ai/${name}`, main: "lib/index.js" }));
+    writeFileSync(join(packageRoot, "lib", "index.js"), "module.exports = {};\n");
+    if (name === "dsh-agent-presets") mkdirSync(join(packageRoot, "presets"));
+}
+writeFileSync(join(legacyHost, "host.js"), "");
+afterAll(() => rmSync(legacyHost, { recursive: true, force: true }));
+
 describe("embeddable ACP Host plugin", () => {
-    it.each([false, true])("resolves Host services with standalone base override=%s", async (standalone) => {
+    it.each(["current", "legacy"] as const)("resolves %s Host preset capabilities", async (generation) => {
         const imports: string[] = [];
         const bases: string[] = [];
         const services = new Map<string, unknown>();
-        const hostBase = new URL("../node_modules/@deepseek-ai/dsh/", import.meta.url).href;
-        if (standalone) services.set("dshAcpHostBaseUrl", hostBase);
+        const hostBase = generation === "current"
+            ? new URL("../node_modules/@deepseek-ai/dsh/", import.meta.url).href
+            : pathToFileURL(join(legacyHost, "host.js")).href;
+        services.set("dshAcpHostBaseUrl", hostBase);
         const agentPresets = { name: "agent-presets" };
         const dynamicCordisRunner = { name: "dynamic-cordis-runner" };
         const subagentModelSelection = { name: "subagent-model-selection-settings" };
-        const loaded = [agentPresets, dynamicCordisRunner, subagentModelSelection];
+        const preset = { name: "agent-preset" };
+        const loaded = [agentPresets, dynamicCordisRunner, subagentModelSelection, preset];
         const ctx = {
             baseUrl: import.meta.url,
             extend(meta: Record<string, unknown>) {
@@ -29,7 +48,12 @@ describe("embeddable ACP Host plugin", () => {
             loader: {
                 async import(specifier: string) {
                     imports.push(specifier);
-                    return loaded[imports.length - 1];
+                    if (specifier.includes("dsh-tool-subagent")) return subagentModelSelection;
+                    if (specifier.includes("dsh-cordis-host-runner")) return dynamicCordisRunner;
+                    if (specifier.includes("dsh-agent-preset-registry") || specifier.includes("dsh-agent-presets")) return agentPresets;
+                    if (specifier.includes("dsh-agent-preset/")) return preset;
+                    if (specifier.includes("dsh-app-boot")) return import("@deepseek-ai/dsh-app-boot");
+                    throw new Error(`unexpected import: ${specifier}`);
                 },
                 unwrapExports(exports: unknown) {
                     return exports;
@@ -47,15 +71,18 @@ describe("embeddable ACP Host plugin", () => {
 
         await plugin.apply(ctx as never);
 
-        expect(imports).toHaveLength(3);
-        expect(imports.map((specifier) => specifier.startsWith("file:"))).toEqual([true, true, true]);
-        expect(imports.map((specifier) => fileURLToPath(specifier).replaceAll("\\", "/"))).toEqual([
-            expect.stringMatching(/\/@deepseek-ai\/dsh-agent-presets\/lib\/index\.js$/),
-            expect.stringMatching(/\/@deepseek-ai\/dsh-cordis-host-runner\/lib\/index\.js$/),
-            expect.stringMatching(/\/@deepseek-ai\/dsh-tool-subagent\/lib\/model-selection-settings\.js$/),
-        ]);
+        expect(imports.every((specifier) => specifier.startsWith("file:"))).toBe(true);
+        const names = imports.map((specifier) => fileURLToPath(specifier).replaceAll("\\", "/"));
+        expect(names).toEqual(expect.arrayContaining([
+            expect.stringMatching(/\/dsh-cordis-host-runner\/lib\/index\.js$/),
+            expect.stringMatching(generation === "current"
+                ? /\/dsh-agent-preset-registry\/lib\/index\.js$/
+                : /\/dsh-agent-presets\/lib\/index\.js$/),
+        ]));
+        expect(names.some((name) => name.includes("dsh-agent-preset-registry"))).toBe(generation === "current");
+        expect(names.some((name) => name.includes("dsh-tool-subagent"))).toBe(generation === "current");
         expect(services.has("acpServer")).toBe(true);
-        expect(bases).toEqual(Array(3).fill(standalone ? hostBase : import.meta.url));
+        expect(bases).toEqual(Array(generation === "current" ? 7 : 2).fill(hostBase));
     });
 
     it("mounts only the ACP server when the surface already provides agentPresets and dynamicCordisRunner", async () => {
