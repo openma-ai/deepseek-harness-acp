@@ -24,14 +24,15 @@ export const name = "dsh-acp-plugin";
 export const inject = [...new Set([...bridge.inject.filter((service) => service !== "agentPresets"), "loader"])];
 
 function resolvedHostModule(ctx: Context, specifier: string): string {
-    const anchors = [ctx.baseUrl, import.meta.url].filter((value): value is string => typeof value === "string");
+    const anchors = [ctx.baseUrl ?? import.meta.url];
     for (const anchor of anchors) {
         try {
             return pathToFileURL(createRequire(anchor).resolve(specifier)).href;
         } catch (error) {
             // A resolved Host package without this export is authoritative.
             if ((error as NodeJS.ErrnoException).code === "ERR_PACKAGE_PATH_NOT_EXPORTED") return specifier;
-            // Try the next resolution anchor.
+            // The selected Host is authoritative; do not mix its packages
+            // with this adapter's development dependency tree.
         }
     }
     return specifier;
@@ -54,7 +55,7 @@ type PresetRoot = { path: string; trust: "system" };
  * empty roster).
  */
 function shippedPresetRoots(ctx: Context): PresetRoot[] {
-    const anchors = [ctx.baseUrl, import.meta.url].filter((value): value is string => typeof value === "string");
+    const anchors = [ctx.baseUrl ?? import.meta.url];
     for (const anchor of anchors) {
         try {
             const manifest = createRequire(anchor).resolve("@deepseek-ai/dsh/package.json");
@@ -96,28 +97,48 @@ async function mountService(
     }
 }
 
+async function mountAgentPresets(ctx: Context): Promise<void> {
+    if (ctx.get("agentPresets") !== undefined) return;
+    const registry = "@deepseek-ai/dsh-agent-preset-registry";
+    if (resolvedHostModule(ctx, registry) === registry) {
+        await mountService(ctx, "agentPresets", "@deepseek-ai/dsh-agent-presets", () => {
+            const roots = shippedPresetRoots(ctx);
+            return { default: "standard", ...(roots.length > 0 ? { roots } : {}) };
+        });
+        return;
+    }
+
+    await mountService(ctx, "agentPresets", registry, { default: "standard" });
+    const boot = await ctx.loader.import(resolvedHostModule(ctx, "@deepseek-ai/dsh-app-boot")) as {
+        loadOverlayPatches(bin: string, path: string): Array<{ insert?: Array<{ name?: string; config?: unknown }> }>;
+    };
+    const preset = await ctx.loader.import(resolvedHostModule(ctx, "@deepseek-ai/dsh-agent-preset"));
+    const plugin = ctx.loader.unwrapExports(preset);
+    const webPackage = createRequire(ctx.baseUrl ?? import.meta.url).resolve("@deepseek-ai/dsh-web-app/package.json");
+    for (const name of ["standard", "ptc", "minimal", "cordis"]) {
+        const path = join(dirname(webPackage), "presets", `${name}.patch.yml`);
+        const declaration = boot.loadOverlayPatches("dsh-acp", path)[0]?.insert?.[0];
+        if (declaration?.name !== "@deepseek-ai/dsh-agent-preset") {
+            throw new Error(`dsh-acp-plugin: invalid shipped ${name} preset`);
+        }
+        await ctx.plugin(plugin, declaration.config);
+    }
+}
+
 export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     if (ctx.get("acpServer") !== undefined) return;
     // A standalone runtime is outside the ACP package's node_modules tree.
     // Preset health checks walk ctx.baseUrl on disk, bypassing import hooks.
     const hostBase = ctx.get("dshAcpHostBaseUrl");
     const hostCtx = typeof hostBase === "string" ? ctx.extend({ baseUrl: hostBase }) : ctx;
-    await mountService(hostCtx, "agentPresets", "@deepseek-ai/dsh-agent-presets", () => {
-        const roots = shippedPresetRoots(hostCtx);
-        return {
-            default: "standard",
-            // dsh 0.1.2's roster self-ships its presets (includeShippedRoot);
-            // passing the legacy root there would duplicate the roster.
-            ...(roots.length > 0 ? { roots } : {}),
-        };
-    });
-    await mountService(hostCtx, "dynamicCordisRunner", "@deepseek-ai/dsh-cordis-host-runner");
     // Newer shipped presets require this Host settings owner; older hosts
     // do not export it and keep their existing delegation behavior.
     const modelSettings = "@deepseek-ai/dsh-tool-subagent/model-selection-settings";
     if (ctx.get("subagentModelSelection") === undefined && resolvedHostModule(hostCtx, modelSettings) !== modelSettings) {
         await mountService(hostCtx, "subagentModelSelection", modelSettings);
     }
+    await mountService(hostCtx, "dynamicCordisRunner", "@deepseek-ai/dsh-cordis-host-runner");
+    await mountAgentPresets(hostCtx);
     await ctx.plugin(server, config);
     if (ctx.get("acpServer") === undefined) {
         throw new Error("dsh-acp-plugin: ACP server did not activate");

@@ -21,6 +21,7 @@ describe("ACP package manifest", () => {
         expect(manifest.dependencies).toEqual({
             "@agentclientprotocol/sdk": "1.4.0",
             tar: "7.5.22",
+            yaml: "^2.9.1",
             zod: "4.4.3",
         });
         expect(manifest.dependencies).not.toHaveProperty("@deepseek-ai/dsh");

@@ -17,6 +17,45 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const ROOT = join(import.meta.dirname, "..");
 
+function mockModelStream(text: string, path: string | undefined): string {
+    if (!path?.endsWith("/messages")) {
+        return [
+            { id: "acp-test", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }] },
+            { id: "acp-test", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+        ].map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("") + "data: [DONE]\n\n";
+    }
+    return [
+        { type: "message_start", message: { usage: { input_tokens: 10, output_tokens: 0 } } },
+        { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+        { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
+        { type: "content_block_stop", index: 0 },
+        { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } },
+        { type: "message_stop" },
+    ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+}
+
+function mockToolUseStream(command: string): string {
+    return [
+        { type: "message_start", message: { usage: { input_tokens: 10, output_tokens: 0 } } },
+        { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "live-bash-call", name: "bash", input: { command, description: "Print output before and after a pause" } } },
+        { type: "content_block_stop", index: 0 },
+        { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 3 } },
+        { type: "message_stop" },
+    ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+}
+
+function countSentText(body: string, needle: string): number {
+    const payload = JSON.parse(body) as { messages?: Array<{ content?: unknown }> };
+    const sent = (payload.messages ?? []).flatMap((message) => {
+        if (typeof message.content === "string") return [message.content];
+        if (!Array.isArray(message.content)) return [];
+        return message.content.flatMap((block: unknown) =>
+            block !== null && typeof block === "object" && typeof (block as { text?: unknown }).text === "string"
+                ? [(block as { text: string }).text] : []);
+    }).join("\n");
+    return sent.split(needle).length - 1;
+}
+
 interface Pending {
     resolve: (value: unknown) => void;
     reject: (error: Error) => void;
@@ -142,6 +181,7 @@ class AcpTestClient {
             )
             .map((notification) => notification.params["update"] as Record<string, unknown>);
     }
+
 
     async crash(): Promise<void> {
         if (this.child.exitCode !== null || this.child.signalCode !== null) return;
@@ -400,7 +440,7 @@ describe("dsh-acp Host-owned defaults", () => {
             mcpServers: [],
         })) as { configOptions: Array<Record<string, unknown>> };
         const options = new Map(later.configOptions.map((option) => [option["id"], option]));
-        expect(options.get("model")).toMatchObject({ currentValue: "deepseek-v4-pro" });
+        expect((options.get("model")?.["currentValue"] as string).split("::").at(-1)).toBe("deepseek-v4-pro");
         expect(options.get("effort")).toMatchObject({ currentValue: "max" });
     }, 90_000);
 
@@ -624,6 +664,56 @@ describe("dsh-acp Host-owned defaults", () => {
     }, 90_000);
 });
 
+describe("live tool output", () => {
+    it("sends bash output before the command finishes", async () => {
+        const root = mkdtempSync(join(tmpdir(), "dsh-acp-live-output-"));
+        const workspace = mkdtempSync(join(tmpdir(), "dsh-acp-live-workspace-"));
+        let agentCalls = 0;
+        const provider = createServer(async (request, response) => {
+            let body = "";
+            for await (const chunk of request) body += String(chunk);
+            const payload = JSON.parse(body) as { system?: unknown };
+            response.writeHead(200, { "content-type": "text/event-stream" });
+            if (typeof payload.system === "string" && payload.system.startsWith("Create a concise title")) {
+                response.end(mockModelStream("Live output test", request.url));
+                return;
+            }
+            agentCalls += 1;
+            response.end(agentCalls === 1
+                ? mockToolUseStream("printf first; sleep 2; printf second")
+                : mockModelStream("Finished.", request.url));
+        });
+        await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
+        const address = provider.address() as { port: number };
+        const client = new AcpTestClient(root, workspace, undefined, {
+            DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}`,
+            DSH_PERMISSION_MODE: "danger-full-access",
+        });
+        try {
+            await client.request("initialize", { protocolVersion: 1 }, 60_000);
+            const { sessionId } = await client.request("session/new", { cwd: workspace, mcpServers: [] }) as { sessionId: string };
+            let settled = false;
+            const prompt = client.request("session/prompt", { sessionId, prompt: [{ type: "text", text: "Run the live output test." }] }, 60_000);
+            void prompt.then(() => { settled = true; }, () => { settled = true; });
+            const output = () => client.updatesFor(sessionId)
+                .filter((update) => update["sessionUpdate"] === "tool_call_update")
+                .flatMap((update) => (update["content"] as Array<{ content?: { text?: string } }> | undefined) ?? [])
+                .map((block) => block.content?.text ?? "")
+                .join("");
+            await expect.poll(() => output().includes("first"), { timeout: 8_000 }).toBe(true);
+            expect(settled).toBe(false);
+            await expect(prompt).resolves.toMatchObject({ stopReason: "end_turn" });
+            expect(output()).toContain("second");
+        } finally {
+            await client.close();
+            provider.closeAllConnections();
+            await new Promise<void>((resolve) => provider.close(() => resolve()));
+            rmSync(root, { recursive: true, force: true });
+            rmSync(workspace, { recursive: true, force: true });
+        }
+    }, 90_000);
+});
+
 describe("dsh-acp server (e2e smoke)", () => {
     let client: AcpTestClient;
     let sessionRoot: string;
@@ -687,7 +777,7 @@ describe("dsh-acp server (e2e smoke)", () => {
         // bundled inside it, never a standalone option (matching the Web UI).
         expect(byId.get("mode")).toMatchObject({ type: "select", category: "mode", currentValue: "workspace-write" });
         expect(byId.has("approvals")).toBe(false);
-        expect(byId.get("model")).toMatchObject({ type: "select", category: "model", currentValue: expect.stringMatching(/^deepseek-(?:v4-)?flash$/) });
+        expect(byId.get("model")).toMatchObject({ type: "select", category: "model", currentValue: expect.stringMatching(/^(?:deepseek-official::)?deepseek-(?:v4-)?flash$/) });
         expect(byId.get("effort")).toMatchObject({ type: "select", category: "thought_level" });
         expect(byId.get("collaboration_mode")).toMatchObject({
             type: "select",
@@ -927,7 +1017,7 @@ describe("dsh-acp server (e2e smoke)", () => {
         })) as Record<string, unknown>;
         const configOptions = result["configOptions"] as Array<Record<string, unknown>>;
         const model = configOptions.find((option) => option["id"] === "model");
-        expect(model).toMatchObject({ id: "model", currentValue: "deepseek-v4-pro" });
+        expect((model?.["currentValue"] as string).split("::").at(-1)).toBe("deepseek-v4-pro");
         // The picked effort survives the resume-based model switch.
         const effort = configOptions.find((option) => option["id"] === "effort");
         expect(effort).toMatchObject({ currentValue: "high" });
@@ -1138,10 +1228,7 @@ describe("session ownership", () => {
         provider = createServer((request, response) => {
             request.resume();
             response.writeHead(200, { "Content-Type": "text/event-stream" });
-            response.end([
-                { id: "alpha-test", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: "Alpha reply." }, finish_reason: null }] },
-                { id: "alpha-test", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 } },
-            ].map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("") + "data: [DONE]\n\n");
+            response.end(mockModelStream("Alpha reply.", request.url));
         });
         await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
         baseUrl = `http://127.0.0.1:${(provider.address() as { port: number }).port}`;
@@ -1316,28 +1403,28 @@ describe("ACP authentication (Agent Auth + logout)", () => {
 describe("ACP steering extension", () => {
     let client: AcpTestClient;
     let root: string;
-    const calls: Array<{ body: string; response: ServerResponse }> = [];
+    const calls: Array<{ body: string; path: string | undefined; response: ServerResponse }> = [];
     const server = createServer(async (request, response) => {
         let body = "";
         for await (const chunk of request) body += String(chunk);
         // The profile also requests session titles; these are not agent steps.
-        if (JSON.parse(body).messages?.[0]?.content?.startsWith("Create a concise title")) {
-            response.writeHead(200, { "content-type": "application/json" });
-            response.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: "Steering test" }, finish_reason: "stop" }] }));
+        const payload = JSON.parse(body) as { system?: unknown; messages?: Array<{ content?: unknown }> };
+        const isTitle = (typeof payload.system === "string" && payload.system.startsWith("Create a concise title"))
+            || (typeof payload.messages?.[0]?.content === "string"
+                && payload.messages[0].content.startsWith("Create a concise title"));
+        if (isTitle) {
+            response.writeHead(200, { "content-type": "text/event-stream" });
+            response.end(mockModelStream("Steering test", request.url));
             return;
         }
-        calls.push({ body, response });
+        calls.push({ body, path: request.url, response });
     });
     const idleMeta = { steering: { idleBehavior: "promptRequired" } };
 
     function reply(index: number, text: string): void {
         const response = calls[index]!.response;
         response.writeHead(200, { "content-type": "text/event-stream" });
-        response.end(`data: ${JSON.stringify({
-            id: "steering-test", object: "chat.completion.chunk", created: 1,
-            model: "deepseek-v4-flash",
-            choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: "stop" }],
-        })}\n\ndata: [DONE]\n\n`);
+        response.end(mockModelStream(text, calls[index]!.path));
     }
 
     beforeAll(async () => {
@@ -1431,7 +1518,7 @@ describe("ACP steering extension", () => {
         expect(settled).toBe(false);
         reply(0, "first step");
         await expect.poll(() => calls.length).toBe(2);
-        expect(calls[1]!.body.split("unique-steering-input")).toHaveLength(2);
+        expect(countSentText(calls[1]!.body, "unique-steering-input")).toBe(1);
         reply(1, "steered continuation");
         await expect(original).resolves.toMatchObject({ stopReason: "end_turn" });
         expect(client.updatesFor(sessionId)).toContainEqual(expect.objectContaining({
@@ -1448,7 +1535,7 @@ describe("ACP steering extension", () => {
         })).resolves.toMatchObject({ stopReason: "end_turn" });
         reply(2, "second turn");
         await expect.poll(() => calls.length).toBe(4);
-        expect(calls[3]!.body.split("legacy-steering-input")).toHaveLength(2);
+        expect(countSentText(calls[3]!.body, "legacy-steering-input")).toBe(1);
         reply(3, "legacy continuation");
         await expect(followup).resolves.toMatchObject({ stopReason: "end_turn" });
         expect(calls).toHaveLength(4);
@@ -1479,7 +1566,7 @@ describe("ACP steering extension", () => {
         await expect(steering).resolves.toEqual({ outcome: "promptRequired", reason: "noRunningTurn" });
         const followup = next ?? client.request("session/prompt", { sessionId, prompt: [{ type: "text", text: "race-input" }] });
         await expect.poll(() => calls.length).toBe(start + 2);
-        expect(calls[start + 1]!.body.split("race-input")).toHaveLength(2);
+        expect(countSentText(calls[start + 1]!.body, "race-input")).toBe(1);
         reply(start + 1, "client-owned followup");
         await expect(followup).resolves.toMatchObject({ stopReason: "end_turn" });
         expect(calls).toHaveLength(start + 2);

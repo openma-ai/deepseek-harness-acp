@@ -8,16 +8,19 @@ vi.mock("../src/bridge/index.ts", () => bridge);
 vi.mock("../src/server.ts", () => server);
 
 describe("embeddable ACP Host plugin", () => {
-    it.each([false, true])("resolves Host services with standalone base override=%s", async (standalone) => {
+    it.each(["current", "legacy"] as const)("resolves %s Host preset capabilities", async (generation) => {
         const imports: string[] = [];
         const bases: string[] = [];
         const services = new Map<string, unknown>();
-        const hostBase = new URL("../node_modules/@deepseek-ai/dsh/", import.meta.url).href;
-        if (standalone) services.set("dshAcpHostBaseUrl", hostBase);
+        const hostBase = generation === "current"
+            ? new URL("../node_modules/@deepseek-ai/dsh/", import.meta.url).href
+            : new URL("../../deepseek-harness-acp/node_modules/@deepseek-ai/dsh/", import.meta.url).href;
+        services.set("dshAcpHostBaseUrl", hostBase);
         const agentPresets = { name: "agent-presets" };
         const dynamicCordisRunner = { name: "dynamic-cordis-runner" };
         const subagentModelSelection = { name: "subagent-model-selection-settings" };
-        const loaded = [agentPresets, dynamicCordisRunner, subagentModelSelection];
+        const preset = { name: "agent-preset" };
+        const loaded = [agentPresets, dynamicCordisRunner, subagentModelSelection, preset];
         const ctx = {
             baseUrl: import.meta.url,
             extend(meta: Record<string, unknown>) {
@@ -29,7 +32,12 @@ describe("embeddable ACP Host plugin", () => {
             loader: {
                 async import(specifier: string) {
                     imports.push(specifier);
-                    return loaded[imports.length - 1];
+                    if (specifier.includes("dsh-tool-subagent")) return subagentModelSelection;
+                    if (specifier.includes("dsh-cordis-host-runner")) return dynamicCordisRunner;
+                    if (specifier.includes("dsh-agent-preset-registry") || specifier.includes("dsh-agent-presets")) return agentPresets;
+                    if (specifier.includes("dsh-agent-preset/")) return preset;
+                    if (specifier.includes("dsh-app-boot")) return import("@deepseek-ai/dsh-app-boot");
+                    throw new Error(`unexpected import: ${specifier}`);
                 },
                 unwrapExports(exports: unknown) {
                     return exports;
@@ -47,15 +55,18 @@ describe("embeddable ACP Host plugin", () => {
 
         await plugin.apply(ctx as never);
 
-        expect(imports).toHaveLength(3);
-        expect(imports.map((specifier) => specifier.startsWith("file:"))).toEqual([true, true, true]);
-        expect(imports.map((specifier) => fileURLToPath(specifier).replaceAll("\\", "/"))).toEqual([
-            expect.stringMatching(/\/@deepseek-ai\/dsh-agent-presets\/lib\/index\.js$/),
-            expect.stringMatching(/\/@deepseek-ai\/dsh-cordis-host-runner\/lib\/index\.js$/),
-            expect.stringMatching(/\/@deepseek-ai\/dsh-tool-subagent\/lib\/model-selection-settings\.js$/),
-        ]);
+        expect(imports.every((specifier) => specifier.startsWith("file:"))).toBe(true);
+        const names = imports.map((specifier) => fileURLToPath(specifier).replaceAll("\\", "/"));
+        expect(names).toEqual(expect.arrayContaining([
+            expect.stringMatching(/\/dsh-cordis-host-runner\/lib\/index\.js$/),
+            expect.stringMatching(generation === "current"
+                ? /\/dsh-agent-preset-registry\/lib\/index\.js$/
+                : /\/dsh-agent-presets\/lib\/index\.js$/),
+        ]));
+        expect(names.some((name) => name.includes("dsh-agent-preset-registry"))).toBe(generation === "current");
+        expect(names.some((name) => name.includes("dsh-tool-subagent"))).toBe(generation === "current");
         expect(services.has("acpServer")).toBe(true);
-        expect(bases).toEqual(Array(3).fill(standalone ? hostBase : import.meta.url));
+        expect(bases).toEqual(Array(generation === "current" ? 7 : 2).fill(hostBase));
     });
 
     it("mounts only the ACP server when the surface already provides agentPresets and dynamicCordisRunner", async () => {

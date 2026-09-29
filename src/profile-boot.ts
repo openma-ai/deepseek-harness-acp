@@ -28,6 +28,7 @@ import type { Context } from "@deepseek-ai/cordis";
 
 import type { HarnessHost } from "./harness.ts";
 import { logDebug } from "./log.ts";
+import { readStandaloneModel, readStandalonePermission, writeStandaloneModel, writeStandalonePermission } from "./standalone-defaults.ts";
 
 /** Loader patch entries (opaque to us; owned by the harness loader). */
 type PatchEntry = { id?: unknown; config?: Record<string, unknown>; [key: string]: unknown };
@@ -49,8 +50,9 @@ interface AppBoot {
     loadOptionalPatches(binName: string, patchPath: string): PatchEntry[] | undefined;
     composeEntries(layers: PatchEntry[][]): PatchEntry[];
     loadLayeredEnv(binName: string): unknown;
-    assertEntriesLoaded(ctx: unknown, binName: string): void;
-    assertEntriesActivated(ctx: unknown, binName: string): Promise<void>;
+    assertEntriesLoaded?(ctx: unknown, binName: string): void;
+    assertEntriesActivated?(ctx: unknown, binName: string): Promise<void>;
+    auditStartupEntries?(ctx: unknown, binName: string): Promise<void>;
     installFailLoud(binName: string, proc: NodeJS.Process, dispose: () => Promise<void>): void;
     healProfilesModuleFallback(installAnchor: string): void;
 }
@@ -276,6 +278,22 @@ export async function bootAcpProfile(
     if (process.env["DSH_TELEMETRY_DISABLED"] !== undefined && rows.has("session-telemetry-otel")) {
         overlays.push({ id: "session-telemetry-otel", disabled: true });
     }
+    const savedPermission = readStandalonePermission(home);
+    const permissionRow = rows.get("permission");
+    if (savedPermission !== undefined && permissionRow !== undefined) {
+        overlays.push({
+            id: "permission",
+            config: { ...(permissionRow.config ?? {}), defaultPreset: savedPermission },
+        });
+    }
+    const savedModel = readStandaloneModel(home);
+    const modelRow = rows.get("agent-default-model");
+    if (savedModel !== undefined && modelRow !== undefined) {
+        overlays.push({
+            id: "agent-default-model",
+            config: { ...(modelRow.config ?? {}), ...savedModel },
+        });
+    }
 
     // The CLI-argument layer: an overlay over the acp-bridge row, the same
     // id-targeted override a user patch would express.
@@ -316,6 +334,8 @@ export async function bootAcpProfile(
         (hostCtx) => {
             (hostCtx as BootedContext).provide(launchEnvKey, launchEnvironment);
             (hostCtx as BootedContext).provide("dshAcpHostBaseUrl", bareModuleBaseUrl);
+            (hostCtx as BootedContext).provide("dshAcpSavePermission", (mode: string) => writeStandalonePermission(home, mode));
+            (hostCtx as BootedContext).provide("dshAcpSaveModel", (model: Parameters<typeof writeStandaloneModel>[1]) => writeStandaloneModel(home, model));
             // Explicit Host-service rows bypass the ACP plugin's fallback mount.
             // Preserve their configuration, but give filesystem-based preset
             // checks the same Host base used by the loader's package imports.
@@ -330,8 +350,12 @@ export async function bootAcpProfile(
         bareModuleBaseUrl,
     );
     try {
-        appBoot.assertEntriesLoaded(ctx, BIN);
-        await appBoot.assertEntriesActivated(ctx, BIN);
+        if (appBoot.auditStartupEntries !== undefined) {
+            await appBoot.auditStartupEntries(ctx as Context, BIN);
+        } else {
+            appBoot.assertEntriesLoaded?.(ctx, BIN);
+            await appBoot.assertEntriesActivated?.(ctx, BIN);
+        }
     } catch (error: unknown) {
         await ctx.fiber.dispose().catch(() => {});
         throw error;

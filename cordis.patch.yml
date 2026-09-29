@@ -109,11 +109,6 @@
     # from the same dsh installation as AgentLoop and dsh-scope.  Loading
     # either one from the ACP package's development dependency tree would mix
     # scope identities when --dsh-path points at a newer standalone host.
-    - id: agent-presets
-      name: '@deepseek-ai/dsh-agent-presets'
-      config:
-        default: standard
-
     - id: cordis-host-runner
       name: '@deepseek-ai/dsh-cordis-host-runner'
 
