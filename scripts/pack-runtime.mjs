@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as tar from "tar";
-import { completePlatformPackages } from "./runtime-platforms.mjs";
+import { completePlatformPackages, pruneExternalPackages } from "./runtime-platforms.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
@@ -37,6 +37,12 @@ try {
         stdio: "inherit",
     });
     await completePlatformPackages(staging);
+    const externalPackages = pruneExternalPackages(staging);
+    for (const [name, version] of Object.entries(externalPackages)) {
+        if (manifest.optionalDependencies?.[name] !== version) {
+            throw new Error(`package.json must declare optional native package ${name}@${version}`);
+        }
+    }
     mkdirSync(vendor, { recursive: true });
     await tar.c(
         {
@@ -50,7 +56,7 @@ try {
     const sha256 = createHash("sha256").update(readFileSync(archive)).digest("hex");
     writeFileSync(
         join(vendor, "runtime.json"),
-        `${JSON.stringify({ archive: "dsh-runtime.tgz", dsh: dshVersion, sha256 }, null, 2)}\n`,
+        `${JSON.stringify({ archive: "dsh-runtime.tgz", dsh: dshVersion, sha256, externalPackages }, null, 2)}\n`,
     );
 } finally {
     rmSync(staging, { recursive: true, force: true });

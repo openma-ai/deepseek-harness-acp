@@ -9,11 +9,26 @@ const matches = (values, target) => !values || (
     !values.includes(`!${target}`)
     && (!values.some((value) => !value.startsWith("!")) || values.includes(target))
 );
+const externalBinary = (path) =>
+    path.startsWith("node_modules/@deepseek-ai/libreoffice-kit-")
+    || path.startsWith("node_modules/sherpa-onnx-");
 
 export function platformPackages(lock) {
     return Object.entries(lock.packages).filter(([, pkg]) =>
         pkg.optional && (pkg.os || pkg.cpu)
-        && targets.some(({ os, cpu }) => matches(pkg.os, os) && matches(pkg.cpu, cpu)));
+        && targets.some(({ os, cpu }) => matches(pkg.os, os) && matches(pkg.cpu, cpu)))
+        .filter(([path]) => !externalBinary(path));
+}
+
+export function pruneExternalPackages(staging) {
+    const lock = JSON.parse(readFileSync(join(staging, "package-lock.json"), "utf8"));
+    const external = {};
+    for (const [path, pkg] of Object.entries(lock.packages)) {
+        if (!pkg.optional || !externalBinary(path)) continue;
+        external[path.slice("node_modules/".length)] = pkg.version;
+        rmSync(join(staging, path), { recursive: true, force: true });
+    }
+    return external;
 }
 
 export function verifyIntegrity(bytes, integrity) {

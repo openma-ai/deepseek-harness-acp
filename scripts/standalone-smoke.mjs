@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join, resolve } from "node:path";
@@ -71,6 +71,13 @@ try {
     assert.equal(runtimes.length, 1);
     const metadata = JSON.parse(readFileSync(join(root, "node_modules/@openma/deepseek-harness-acp/vendor/runtime.json")));
     assert.equal(readFileSync(join(cache, runtimes[0], ".dsh-acp-runtime"), "utf8").trim(), metadata.dsh);
+    const officePackage = process.platform === "linux"
+        ? "@deepseek-ai/libreoffice-kit-wasm"
+        : `@deepseek-ai/libreoffice-kit-${process.platform}-${process.arch}`;
+    assert(metadata.externalPackages[officePackage], `missing ${officePackage} from runtime metadata`);
+    assert(existsSync(join(root, "node_modules", officePackage, "package.json")), `npm did not install ${officePackage}`);
+    assert(existsSync(join(cache, runtimes[0], "node_modules", officePackage, "package.json")),
+        `runtime did not copy ${officePackage}`);
     // Windows cannot delete DLLs loaded by this process. The probe must exit
     // before the parent removes the isolated runtime tree.
     execFileSync(process.execPath, [

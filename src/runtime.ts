@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+    cpSync,
     existsSync,
     mkdirSync,
     mkdtempSync,
@@ -9,7 +10,7 @@ import {
     writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as tar from "tar";
 
@@ -17,6 +18,29 @@ interface RuntimeMetadata {
     archive: string;
     dsh: string;
     sha256: string;
+    externalPackages?: Record<string, string>;
+}
+
+export function copyExternalPackages(packageRoot: string, runtimeRoot: string, packages: Record<string, string>): void {
+    for (const [name, version] of Object.entries(packages)) {
+        if (!/^(?:@[a-z0-9-]+\/)?[a-z0-9-]+$/.test(name)) throw new Error(`Invalid external package: ${name}`);
+        let parent = resolve(packageRoot);
+        let source: string | undefined;
+        for (;;) {
+            const candidate = join(parent, "node_modules", name);
+            if (existsSync(join(candidate, "package.json"))) {
+                source = candidate;
+                break;
+            }
+            const next = dirname(parent);
+            if (next === parent) break;
+            parent = next;
+        }
+        if (source === undefined) continue; // npm may omit an unsupported optional platform package.
+        const installed = JSON.parse(readFileSync(join(source, "package.json"), "utf8")) as { version?: string };
+        if (installed.version !== version) throw new Error(`External package version mismatch: ${name}`);
+        cpSync(source, join(runtimeRoot, "node_modules", name), { recursive: true });
+    }
 }
 
 function cacheRoot(): string {
@@ -68,6 +92,7 @@ export function resolveVendoredRuntime(): string | undefined {
     const temporary = mkdtempSync(join(dirname(target), ".extract-"));
     try {
         tar.x({ cwd: temporary, file: archive, sync: true, strict: true });
+        copyExternalPackages(packageRoot, temporary, metadata.externalPackages ?? {});
         writeFileSync(join(temporary, ".dsh-acp-runtime"), `${metadata.dsh}\n`);
         try {
             renameSync(temporary, target);
