@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as tar from "tar";
 import { describe, expect, it, vi } from "vitest";
-import { completePlatformPackages, platformPackages, verifyIntegrity } from "../scripts/runtime-platforms.mjs";
+import { completePlatformPackages, platformPackages, pruneExternalPackages, verifyIntegrity } from "../scripts/runtime-platforms.mjs";
 
 describe("bundled platform packages", () => {
     it("includes foreign supported architectures without including unrelated targets", () => {
@@ -22,6 +22,29 @@ describe("bundled platform packages", () => {
     it("rejects corrupt downloads and missing integrity", () => {
         expect(() => verifyIntegrity(Buffer.from("bad"), "sha512-invalid")).toThrow();
         expect(() => verifyIntegrity(Buffer.from("bad"), undefined)).toThrow();
+    });
+    it("puts native office and speech packages outside the vendored runtime", () => {
+        const lock = { packages: {
+            "node_modules/@deepseek-ai/libreoffice-kit-darwin-arm64": { optional: true, os: ["darwin"], cpu: ["arm64"], version: "0.1.1" },
+            "node_modules/sherpa-onnx-linux-x64": { optional: true, os: ["linux"], cpu: ["x64"], version: "1.13.8" },
+            "node_modules/@vscode/ripgrep-linux-x64": { optional: true, os: ["linux"], cpu: ["x64"], version: "1.0.0" },
+        } };
+        expect(platformPackages(lock).map(([path]) => path)).toEqual(["node_modules/@vscode/ripgrep-linux-x64"]);
+        const root = mkdtempSync(join(tmpdir(), "acp-runtime-prune-"));
+        try {
+            writeFileSync(join(root, "package-lock.json"), JSON.stringify(lock));
+            for (const path of Object.keys(lock.packages)) mkdirSync(join(root, path), { recursive: true });
+            const external = pruneExternalPackages(root);
+            expect(external).toEqual({
+                "@deepseek-ai/libreoffice-kit-darwin-arm64": "0.1.1",
+                "sherpa-onnx-linux-x64": "1.13.8",
+            });
+            expect(existsSync(join(root, "node_modules/@deepseek-ai/libreoffice-kit-darwin-arm64"))).toBe(false);
+            expect(existsSync(join(root, "node_modules/sherpa-onnx-linux-x64"))).toBe(false);
+            expect(existsSync(join(root, "node_modules/@vscode/ripgrep-linux-x64"))).toBe(true);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
     });
     it("accepts an exact locked digest", () => {
         const bytes = Buffer.from("platform tarball");
