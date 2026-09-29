@@ -680,7 +680,7 @@ describe("live tool output", () => {
             }
             agentCalls += 1;
             response.end(agentCalls === 1
-                ? mockToolUseStream("printf first; sleep 2; printf second")
+                ? mockToolUseStream("node -e \"process.stdout.write('first'); setTimeout(() => process.stdout.write('second'), 2000)\"")
                 : mockModelStream("Finished.", request.url));
         });
         await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
