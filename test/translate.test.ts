@@ -545,6 +545,25 @@ describe("SessionProjection tool calls", () => {
         expect(done[0]).toMatchObject({ rawOutput: { output: "hello world" } });
     });
 
+    it("streams other job text into the tool card", () => {
+        const p = new SessionProjection();
+        p.onEvent(event("tool/call", { turn: 1, step: 0, callId: "search", name: "grep_search", arguments: '{"query":"needle"}' }));
+        expect(p.streamToolOutput("search", "match ")).toMatchObject([{
+            sessionUpdate: "tool_call_update",
+            toolCallId: "search",
+            status: "in_progress",
+            content: [{ type: "content", content: { type: "text", text: "match " } }],
+        }]);
+        const done = p.onEvent(event("tool/result", {
+            turn: 1, step: 0,
+            message: { role: "tool", toolCallId: "search", content: [{ type: "text", text: "match found" }] },
+        }));
+        expect(done[0]).toMatchObject({
+            status: "completed",
+            content: [{ type: "content", content: { type: "text", text: "found" } }],
+        });
+    });
+
     it("accepts the direct tool result message emitted by current dsh", () => {
         const p = new SessionProjection();
         p.onEvent(event("tool/call", { turn: 1, step: 0, callId: "direct", name: "bash", arguments: '{"command":"pwd"}' }));
@@ -676,6 +695,11 @@ describe("SessionProjection tool calls", () => {
             content: [{ type: "terminal", terminalId: "t1" }],
             _meta: { terminal_info: { terminal_id: "t1", cwd: "/ws" } },
         });
+        expect(p.streamToolOutput("t1", "/w")).toMatchObject([{
+            sessionUpdate: "tool_call_update",
+            status: "in_progress",
+            _meta: { terminal_output: { terminal_id: "t1", data: "/w" } },
+        }]);
         const done = p.onEvent(
             event("tool/result", {
                 turn: 1,
@@ -690,7 +714,7 @@ describe("SessionProjection tool calls", () => {
         expect(done[0]).toMatchObject({
             sessionUpdate: "tool_call_update",
             status: "completed",
-            _meta: { terminal_output: { terminal_id: "t1", data: "/ws\n" } },
+            _meta: { terminal_output: { terminal_id: "t1", data: "s\n" } },
         });
         expect(done[0]).toMatchObject({ _meta: { terminal_exit: { terminal_id: "t1", exit_code: 0, signal: null } } });
         expect((done[0] as Record<string, unknown>)["content"]).toBeUndefined();
