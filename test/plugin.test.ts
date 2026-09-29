@@ -1,11 +1,27 @@
-import { fileURLToPath } from "node:url";
-import { describe, expect, it, vi } from "vitest";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 const bridge = { inject: [] as string[] };
 const server = { name: "acp-server" };
 
 vi.mock("../src/bridge/index.ts", () => bridge);
 vi.mock("../src/server.ts", () => server);
+
+// Keep the legacy capability test independent of another local checkout:
+// CI installs only the current dsh generation in this package's node_modules.
+const legacyHost = mkdtempSync(join(tmpdir(), "dsh-acp-legacy-host-"));
+for (const name of ["dsh-cordis-host-runner", "dsh-agent-presets"]) {
+    const packageRoot = join(legacyHost, "node_modules", "@deepseek-ai", name);
+    mkdirSync(join(packageRoot, "lib"), { recursive: true });
+    writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name: `@deepseek-ai/${name}`, main: "lib/index.js" }));
+    writeFileSync(join(packageRoot, "lib", "index.js"), "module.exports = {};\n");
+    if (name === "dsh-agent-presets") mkdirSync(join(packageRoot, "presets"));
+}
+writeFileSync(join(legacyHost, "host.js"), "");
+afterAll(() => rmSync(legacyHost, { recursive: true, force: true }));
 
 describe("embeddable ACP Host plugin", () => {
     it.each(["current", "legacy"] as const)("resolves %s Host preset capabilities", async (generation) => {
@@ -14,7 +30,7 @@ describe("embeddable ACP Host plugin", () => {
         const services = new Map<string, unknown>();
         const hostBase = generation === "current"
             ? new URL("../node_modules/@deepseek-ai/dsh/", import.meta.url).href
-            : new URL("../../deepseek-harness-acp/node_modules/@deepseek-ai/dsh/", import.meta.url).href;
+            : pathToFileURL(join(legacyHost, "host.js")).href;
         services.set("dshAcpHostBaseUrl", hostBase);
         const agentPresets = { name: "agent-presets" };
         const dynamicCordisRunner = { name: "dynamic-cordis-runner" };
