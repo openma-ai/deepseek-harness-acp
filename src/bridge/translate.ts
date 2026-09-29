@@ -122,10 +122,11 @@ export function classifyToolCall(name: string, rawArguments: string): ToolCallFa
     });
 
     switch (name) {
-        case "bash": {
+        case "bash":
+        case "pwsh": {
             const command = asString(args["command"]);
             const restart = args["restart"] === true;
-            return facts("execute", command !== undefined ? firstLine(command) : restart ? "Restart bash" : "bash");
+            return facts("execute", command !== undefined ? firstLine(command) : restart ? `Restart ${name}` : name);
         }
         case "read":
             return facts("read", path !== undefined ? `Read ${path}` : "Read file");

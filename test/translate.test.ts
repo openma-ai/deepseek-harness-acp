@@ -12,8 +12,8 @@ function event(type: string, data: Record<string, unknown>): HarnessEvent {
 }
 
 describe("classifyToolCall", () => {
-    it("maps bash to execute with the command as title", () => {
-        const facts = classifyToolCall("bash", JSON.stringify({ command: "npm test\necho done" }));
+    it.each(["bash", "pwsh"])("maps %s to execute with the command as title", (name) => {
+        const facts = classifyToolCall(name, JSON.stringify({ command: "npm test\necho done" }));
         expect(facts.kind).toBe("execute");
         expect(facts.title).toBe("npm test");
     });
@@ -685,10 +685,10 @@ describe("SessionProjection tool calls", () => {
         });
     });
 
-    it("uses display-terminal metadata for command output when supported", () => {
+    it.each(["bash", "pwsh"])("uses display-terminal metadata for %s output when supported", (name) => {
         const p = new SessionProjection(undefined, { terminalOutput: true, cwd: "/ws" });
         const start = p.onEvent(
-            event("tool/call", { turn: 1, step: 0, callId: "t1", name: "bash", arguments: '{"command":"pwd"}' }),
+            event("tool/call", { turn: 1, step: 0, callId: "t1", name, arguments: '{"command":"pwd"}' }),
         );
         expect(start[0]).toMatchObject({
             sessionUpdate: "tool_call",

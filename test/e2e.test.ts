@@ -34,10 +34,10 @@ function mockModelStream(text: string, path: string | undefined): string {
     ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
 }
 
-function mockToolUseStream(command: string): string {
+function mockToolUseStream(command: string, name = "bash"): string {
     return [
         { type: "message_start", message: { usage: { input_tokens: 10, output_tokens: 0 } } },
-        { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "live-bash-call", name: "bash", input: { command, description: "Print output before and after a pause" } } },
+        { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "live-command-call", name, input: { command, description: "Print output before and after a pause" } } },
         { type: "content_block_stop", index: 0 },
         { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 3 } },
         { type: "message_stop" },
@@ -680,7 +680,10 @@ describe("live tool output", () => {
             }
             agentCalls += 1;
             response.end(agentCalls === 1
-                ? mockToolUseStream("node -e \"process.stdout.write('first'); setTimeout(() => process.stdout.write('second'), 2000)\"")
+                ? mockToolUseStream(
+                    "node -e \"process.stdout.write('first'); setTimeout(() => process.stdout.write('second'), 2000)\"",
+                    process.platform === "win32" ? "pwsh" : "bash",
+                )
                 : mockModelStream("Finished.", request.url));
         });
         await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
