@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Dispatch a Cursor cloud agent to review dsh compatibility on a PR
 # Usage: dispatch-cursor-review.sh PR_NUMBER REPO_URL [DSH_VERSION] [PREVIOUS_VERSION]
+# Set DRY_RUN=1 to print the payload without making API calls
 
 set -euo pipefail
 
@@ -19,21 +20,30 @@ if [ -z "${CURSOR_API_KEY:-}" ]; then
   exit 0
 fi
 
-if [ -z "${GH_TOKEN:-}" ] && [ -z "${GITHUB_TOKEN:-}" ]; then
-  echo "::error::GH_TOKEN or GITHUB_TOKEN required for gh CLI"
-  exit 1
+# In dry run mode, allow stub values for gh CLI results
+if [ "${DRY_RUN:-0}" = "1" ]; then
+  PR_URL="${PR_URL:-https://github.com/example/repo/pull/$PR_NUMBER}"
+  PR_HEAD_REF="${PR_HEAD_REF:-cursor/test-branch}"
+else
+  if [ -z "${GH_TOKEN:-}" ] && [ -z "${GITHUB_TOKEN:-}" ]; then
+    echo "::error::GH_TOKEN or GITHUB_TOKEN required for gh CLI"
+    exit 1
+  fi
+  
+  # Get PR details
+  PR_URL=$(gh pr view "$PR_NUMBER" --json url --jq .url)
+  PR_HEAD_REF=$(gh pr view "$PR_NUMBER" --json headRefName --jq .headRefName)
 fi
-
-# Get PR details
-PR_URL=$(gh pr view "$PR_NUMBER" --json url --jq .url)
-PR_HEAD_REF=$(gh pr view "$PR_NUMBER" --json headRefName --jq .headRefName)
 
 echo "Dispatching agent for PR #$PR_NUMBER ($PR_URL)"
 echo "Branch: $PR_HEAD_REF"
 echo "dsh version: $PREVIOUS_VERSION -> $DSH_VERSION"
 
+# Export variables for envsubst
+export PREVIOUS_VERSION DSH_VERSION PR_HEAD_REF
+
 # Build the agent prompt with variable substitution
-AGENT_PROMPT=$(envsubst <<'PROMPT_EOF'
+AGENT_PROMPT=$(envsubst <<PROMPT_EOF
 Goal: Review ACP compatibility with the bundled dsh upgrade from ${PREVIOUS_VERSION} to ${DSH_VERSION} and push any necessary fixes directly to this PR branch.
 
 ## Tasks
@@ -115,6 +125,21 @@ API_PAYLOAD=$(jq -n \
     autoCreatePR: false,
     name: $name
   }')
+
+# Dry run mode: print payload and exit
+if [ "${DRY_RUN:-0}" = "1" ]; then
+  echo "=== DRY RUN MODE ==="
+  echo "Would POST to: https://api.cursor.com/v1/agents"
+  echo ""
+  echo "=== API Payload ==="
+  echo "$API_PAYLOAD" | jq .
+  echo ""
+  echo "=== Prompt Preview (first 20 lines) ==="
+  echo "$AGENT_PROMPT" | head -20
+  echo ""
+  echo "Would post PR comment on #$PR_NUMBER"
+  exit 0
+fi
 
 # Make the API request with separate status and body capture
 HTTP_RESPONSE=$(mktemp)
