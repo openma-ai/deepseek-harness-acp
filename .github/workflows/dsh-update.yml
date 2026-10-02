@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '17 */6 * * *'
   workflow_dispatch:
+    inputs:
+      review_pr:
+        description: 'PR number to review (skips version check, dispatches agent only)'
+        required: false
+        type: number
 
 concurrency:
   group: dsh-update
@@ -18,6 +23,7 @@ jobs:
   update:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    if: ${{ !inputs.review_pr }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -50,6 +56,7 @@ jobs:
         run: npm install --package-lock-only --ignore-scripts --no-audit --no-fund
       - name: Open upgrade PR and run CI
         if: steps.version.outputs.changed == 'true'
+        id: pr
         env:
           GH_TOKEN: ${{ github.token }}
           UPDATE_BRANCH: codex/bump-dsh-${{ steps.version.outputs.version }}
@@ -68,9 +75,38 @@ jobs:
             git push origin "$UPDATE_BRANCH"
           fi
           if [ "$(gh pr list --state all --head "$UPDATE_BRANCH" --json number --jq length)" != 0 ]; then
+            echo "pr_exists=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           printf 'Updates bundled dsh from `%s` to `%s` and refreshes the last three release/RC profile checks.\n\nLockfile updates: development %s; runtime %s. CI must pass before merging. This PR does not bump or release the ACP package.\n' "$PREVIOUS_VERSION" "$DSH_VERSION" "$DEV_LOCK" "$RUNTIME_LOCK" > "$RUNNER_TEMP/dsh-pr.md"
           gh pr create --base main --head "$UPDATE_BRANCH" --title "chore: upgrade bundled dsh to $DSH_VERSION" --body-file "$RUNNER_TEMP/dsh-pr.md"
           # GITHUB_TOKEN-created PRs do not trigger pull_request workflows.
           gh workflow run ci.yml --ref "$UPDATE_BRANCH"
+          echo "pr_created=true" >> "$GITHUB_OUTPUT"
+      - name: Dispatch Cursor cloud agent for compatibility review
+        if: steps.version.outputs.changed == 'true' && steps.pr.outputs.pr_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          PR_NUMBER=$(gh pr view "codex/bump-dsh-${{ steps.version.outputs.version }}" --json number --jq .number)
+          bash scripts/dispatch-cursor-review.sh \
+            "$PR_NUMBER" \
+            "https://github.com/${{ github.repository }}" \
+            "${{ steps.version.outputs.version }}" \
+            "${{ steps.version.outputs.previous }}"
+  
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: ${{ inputs.review_pr }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Dispatch Cursor cloud agent for existing PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          bash scripts/dispatch-cursor-review.sh \
+            "${{ inputs.review_pr }}" \
+            "https://github.com/${{ github.repository }}"

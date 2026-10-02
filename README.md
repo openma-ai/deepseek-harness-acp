@@ -355,6 +355,21 @@ same-version tarballs; `link:` avoids both.)
 }
 ```
 
+### Automated compatibility review
+
+When `.github/workflows/dsh-update.yml` opens a new bundled-dsh upgrade PR, it automatically dispatches a Cursor cloud agent to review ACP compatibility with the new dsh version. The agent:
+
+- Reads dsh release notes and API changes between versions
+- Tests the ACP adapter with the new dsh version
+- Pushes fixes directly to the PR branch if needed
+- Posts a verdict comment on the PR (safe to merge / safe after fixes / not safe)
+
+This requires the `CURSOR_API_KEY` organization or repository secret (a Cursor API key from the Cursor Dashboard). If the secret is not configured, the workflow skips the agent dispatch with a warning and leaves the PR open for manual review.
+
+The agent uses the [Cursor Cloud Agents API v1](https://cursor.com/docs/cloud-agent/api/endpoints) with `workOnCurrentBranch: true` to push directly to the PR's head branch without creating a new branch or PR.
+
+To manually test the review workflow on an existing PR, trigger the workflow via Actions → Update bundled dsh → Run workflow and provide the PR number. The dispatch logic lives in `scripts/dispatch-cursor-review.sh`.
+
 ## License
 
 Apache-2.0.
