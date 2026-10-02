@@ -77,7 +77,6 @@ jobs:
           # GITHUB_TOKEN-created PRs do not trigger pull_request workflows.
           gh workflow run ci.yml --ref "$UPDATE_BRANCH"
           echo "pr_created=true" >> "$GITHUB_OUTPUT"
-          gh pr view "$UPDATE_BRANCH" --json url --jq .url >> "$GITHUB_OUTPUT"
       - name: Dispatch Cursor cloud agent for compatibility review
         if: steps.version.outputs.changed == 'true' && steps.pr.outputs.pr_created == 'true'
         env:
@@ -86,7 +85,6 @@ jobs:
           UPDATE_BRANCH: codex/bump-dsh-${{ steps.version.outputs.version }}
           DSH_VERSION: ${{ steps.version.outputs.version }}
           PREVIOUS_VERSION: ${{ steps.version.outputs.previous }}
-          PR_URL: ${{ steps.pr.outputs.url }}
         run: |
           set -euo pipefail
           
