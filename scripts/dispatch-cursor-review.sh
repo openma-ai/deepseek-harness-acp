@@ -15,21 +15,21 @@ REPO_URL="$2"
 DSH_VERSION="${3:-[new version]}"
 PREVIOUS_VERSION="${4:-[previous version]}"
 
-if [ -z "${CURSOR_API_KEY:-}" ]; then
-  echo "::warning::CURSOR_API_KEY not set. Skipping automated compatibility review."
-  exit 0
-fi
-
-# In dry run mode, allow stub values for gh CLI results
+# Dry run prints the payload and does not call gh or the Cursor API.
+# A missing key skips only a real dispatch.
 if [ "${DRY_RUN:-0}" = "1" ]; then
   PR_URL="${PR_URL:-https://github.com/example/repo/pull/$PR_NUMBER}"
   PR_HEAD_REF="${PR_HEAD_REF:-cursor/test-branch}"
 else
+  if [ -z "${CURSOR_API_KEY:-}" ]; then
+    echo "::warning::CURSOR_API_KEY not set. Skipping automated compatibility review."
+    exit 0
+  fi
   if [ -z "${GH_TOKEN:-}" ] && [ -z "${GITHUB_TOKEN:-}" ]; then
     echo "::error::GH_TOKEN or GITHUB_TOKEN required for gh CLI"
     exit 1
   fi
-  
+
   # Get PR details
   PR_URL=$(gh pr view "$PR_NUMBER" --json url --jq .url)
   PR_HEAD_REF=$(gh pr view "$PR_NUMBER" --json headRefName --jq .headRefName)
@@ -39,11 +39,9 @@ echo "Dispatching agent for PR #$PR_NUMBER ($PR_URL)"
 echo "Branch: $PR_HEAD_REF"
 echo "dsh version: $PREVIOUS_VERSION -> $DSH_VERSION"
 
-# Export variables for envsubst
-export PREVIOUS_VERSION DSH_VERSION PR_HEAD_REF
-
-# Build the agent prompt with variable substitution
-AGENT_PROMPT=$(envsubst <<PROMPT_EOF
+# Quoted heredoc so the shell does not expand $ or backticks. jq inserts the
+# three values literally; envsubst would expand $VAR inside a branch name or version.
+PROMPT_TEMPLATE=$(cat <<'PROMPT_EOF'
 Goal: Review ACP compatibility with the bundled dsh upgrade from ${PREVIOUS_VERSION} to ${DSH_VERSION} and push any necessary fixes directly to this PR branch.
 
 ## Tasks
@@ -65,7 +63,7 @@ Goal: Review ACP compatibility with the bundled dsh upgrade from ${PREVIOUS_VERS
    - Profile boot and Cordis tree composition
 
 3. **Test the adapter**: Where feasible, exercise the ACP adapter over stdio:
-   - Start \`dsh-acp\` (standalone or via profile)
+   - Start `dsh-acp` (standalone or via profile)
    - Send basic ACP requests (initialize, session/new, simple prompts)
    - Verify tool calls, streaming, and session persistence work
    - Check that the adapter starts without errors
@@ -77,9 +75,9 @@ Goal: Review ACP compatibility with the bundled dsh upgrade from ${PREVIOUS_VERS
    - Commit fixes with clear messages
    - Push directly to this PR branch (no force push, no new branches)
 
-5. **Run tests**: Execute \`npm test\` to ensure the test suite passes. If tests fail due to your changes, fix them.
+5. **Run tests**: Execute `npm test` to ensure the test suite passes. If tests fail due to your changes, fix them.
 
-6. **Ensure CI runs**: After pushing fixes, verify CI is running. If the push didn't trigger CI (unlikely but possible), manually trigger it with \`gh workflow run ci.yml --ref ${PR_HEAD_REF}\`.
+6. **Ensure CI runs**: After pushing fixes, verify CI is running. If the push didn't trigger CI (unlikely but possible), manually trigger it with `gh workflow run ci.yml --ref ${PR_HEAD_REF}`.
 
 7. **Post a verdict**: Comment on this PR with your assessment:
    - **Safe to merge**: No compatibility issues found, or all issues fixed and tests pass
@@ -104,6 +102,22 @@ Release notes for dsh ${DSH_VERSION} should be available at:
 - npm: https://www.npmjs.com/package/@deepseek-ai/dsh?activeTab=versions
 PROMPT_EOF
 )
+
+# Swap placeholders for sentinels before inserting values so a value that
+# itself contains ${...} or another placeholder is not expanded again.
+AGENT_PROMPT=$(jq -nr \
+  --arg previous "$PREVIOUS_VERSION" \
+  --arg version "$DSH_VERSION" \
+  --arg branch "$PR_HEAD_REF" \
+  --arg template "$PROMPT_TEMPLATE" \
+  'def swap($src; $dst): split($src) | join($dst);
+   $template
+   | swap("${PREVIOUS_VERSION}"; "\u0001P\u0001")
+   | swap("${DSH_VERSION}"; "\u0001D\u0001")
+   | swap("${PR_HEAD_REF}"; "\u0001B\u0001")
+   | swap("\u0001P\u0001"; $previous)
+   | swap("\u0001D\u0001"; $version)
+   | swap("\u0001B\u0001"; $branch)')
 
 # Build the API request payload with jq
 API_PAYLOAD=$(jq -n \
