@@ -216,7 +216,7 @@ export async function apply(ctx: Context, config: AppConfig): Promise<void> {
         // historical fixed defaults when no explicit selection was given.
         const bridge = anyCtx.plugin(acpBridge, {
             provider: settings.provider ?? "deepseek-official",
-            model: settings.model ?? "deepseek-v4-flash",
+            model: settings.model ?? "deepseek-flash",
             models: settings.models,
             ...(settings.maxTokens !== undefined ? { maxTokens: settings.maxTokens } : {}),
             permissionMode: settings.permissionMode,

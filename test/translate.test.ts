@@ -255,6 +255,47 @@ describe("SessionProjection streaming", () => {
         ]);
     });
 
+    it("streams dsh 0.2 assistant-stream frames before the assembled message", () => {
+        const p = new SessionProjection();
+        expect(p.onAssistantStream({
+            type: "chunk",
+            attemptId: "missed",
+            chunk: { type: "text-delta", index: 0, text: "nope" },
+        })).toEqual([]);
+        expect(p.onAssistantStream({ type: "start", attemptId: "a1", turn: 4, step: 1 })).toEqual([]);
+        expect(p.onAssistantStream({
+            type: "chunk",
+            attemptId: "a1",
+            chunk: { type: "text-delta", index: 0, text: "He" },
+        })).toEqual([
+            {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "He" },
+                messageId: "4:1",
+            },
+        ]);
+        expect(p.onAssistantStream({
+            type: "chunk",
+            attemptId: "a1",
+            chunk: { type: "text-delta", index: 0, text: "llo" },
+        })[0]).toMatchObject({ content: { text: "llo" }, messageId: "4:1" });
+        expect(p.onEvent(
+            event("assistant/message", {
+                turn: 4,
+                step: 1,
+                message: { content: [{ type: "text", text: "Hello" }] },
+            }),
+        )).toEqual([
+            {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "" },
+                messageId: "4:1",
+                _meta: { dsh: { event: "assistant_message" } },
+            },
+        ]);
+        expect(p.onAssistantStream({ type: "end", attemptId: "a1" })).toEqual([]);
+    });
+
     it("streams reasoning deltas as thought chunks", () => {
         const p = new SessionProjection();
         const updates = p.onEvent(

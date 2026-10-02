@@ -114,7 +114,7 @@ export function resolveSettings(argv: string[]): Settings {
 
     const model = stringFlag(parsed, "model") ?? envString("DSH_MODEL");
     const modelsRaw = stringFlag(parsed, "models") ?? envString("DSH_ACP_MODELS");
-    const models = (modelsRaw !== undefined ? modelsRaw.split(",") : ["deepseek-v4-flash", "deepseek-v4-pro"])
+    const models = (modelsRaw !== undefined ? modelsRaw.split(",") : ["deepseek-flash", "deepseek-v4-pro"])
         .map((entry) => entry.trim())
         .filter((entry) => entry.length > 0);
 
@@ -182,9 +182,10 @@ Options:
                               dsh on PATH, npm root -g)
   --bundle <package-dir>      Add a dsh bundle layer to the agent tree (repeatable)
   --provider <route>          Provider route (DSH_PROVIDER, default deepseek-official)
-  --model <id>                Default model (DSH_MODEL, default deepseek-v4-flash)
+  --model <id>                Default model (DSH_MODEL; otherwise the Host default,
+                              currently deepseek-flash)
   --models <a,b,...>          Selectable models for the session "Model" option
-                              (DSH_ACP_MODELS, default deepseek-v4-flash,deepseek-v4-pro)
+                              (DSH_ACP_MODELS, default deepseek-flash,deepseek-v4-pro)
   --max-tokens <n>            Per-request output-token cap (DSH_MAX_TOKENS)
   --permission-mode <mode>    read-only | workspace-write | danger-full-access
                               (DSH_PERMISSION_MODE; otherwise use the Host default)
