@@ -161,6 +161,16 @@ interface StoredHeader {
     id: SessionId;
     cwd?: string;
     createdAt?: number;
+    /**
+     * Coarse classification written by DSH when the session is a subagent
+     * child. The Web sidebar hides rows carrying this value.
+     */
+    origin?: string;
+}
+
+/** A persisted subagent child is not an ACP-visible session. */
+function isSubagentHeader(header: { origin?: string } | undefined): boolean {
+    return header?.origin === "subagent";
 }
 
 /** Read-only title lookup; alpha handles must close even if reading fails. */
@@ -827,16 +837,34 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         return record;
     };
 
+    const storedHeaders = async (): Promise<StoredHeader[]> => {
+        const persistence = requirePersistence();
+        return (await persistence.list() as unknown as readonly (StoredHeader | { header: StoredHeader })[])
+            .map((entry) => "header" in entry ? entry.header : entry);
+    };
+
+    /**
+     * Subagent children stay in the shared session store so the Web sidebar
+     * can hide them, but ACP clients must not list, load, resume, or silently
+     * restore them as ordinary sessions.
+     */
+    const assertAcpVisibleSession = async (sessionId: string): Promise<void> => {
+        const header = (await storedHeaders()).find((item) => String(item.id) === sessionId);
+        if (isSubagentHeader(header)) throw invalidParams(`session is a subagent child: ${sessionId}`);
+    };
+
     /**
      * The session record, restored from the persisted log when the process
      * no longer holds it live. Zed keeps threads across agent restarts and
      * may prompt an old session without `session/load` first; recovering
      * silently (no history replay — the client already renders it) beats
-     * failing the turn with `unknown session`.
+     * failing the turn with `unknown session`. A persisted subagent child is
+     * refused before that restore so it is not promoted into an ACP session.
      */
     const requireOrRestoreSession = async (sessionId: string): Promise<SessionRecord> => {
         const record = sessions.get(sessionId);
         if (record !== undefined) return record;
+        await assertAcpVisibleSession(sessionId);
         logWarn(`restoring session ${sessionId} from the persisted log`);
         try {
             return await restoreSession(sessionId, { replay: false });
@@ -2051,6 +2079,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 validateAdditionalDirectories(params.additionalDirectories);
                 syncMcpServers(params.mcpServers, params.cwd);
                 requirePersistence();
+                await assertAcpVisibleSession(params.sessionId);
                 const record = await restoreSession(params.sessionId, { replay: true, cwd: params.cwd });
                 const options = await configOptions(record);
                 return {
@@ -2066,6 +2095,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 validateAdditionalDirectories(params.additionalDirectories);
                 syncMcpServers(params.mcpServers, params.cwd);
                 requirePersistence();
+                await assertAcpVisibleSession(params.sessionId);
                 const record = await restoreSession(params.sessionId, { replay: false, cwd: params.cwd });
                 const options = await configOptions(record);
                 return {
@@ -2077,12 +2107,11 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
                 assertOpen();
                 const persistence = requirePersistence();
-                const headers = (await persistence.list() as unknown as readonly (StoredHeader | { header: StoredHeader })[])
-                    .map((entry) => "header" in entry ? entry.header : entry);
+                const headers = await storedHeaders();
                 headers.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
-                const filtered = params.cwd !== undefined && params.cwd !== null
+                const filtered = (params.cwd !== undefined && params.cwd !== null
                     ? headers.filter((header) => header.cwd === params.cwd)
-                    : headers;
+                    : headers).filter((header) => !isSubagentHeader(header));
                 const page = filtered.slice(0, 100);
                 const withTitles = await Promise.allSettled(
                     page.slice(0, 20).map(async (header) => {
