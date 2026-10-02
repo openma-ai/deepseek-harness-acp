@@ -9,7 +9,8 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { zstdDecompressSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import { createServer, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
@@ -30,6 +31,25 @@ function mockModelStream(text: string, path: string | undefined): string {
         { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
         { type: "content_block_stop", index: 0 },
         { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } },
+        { type: "message_stop" },
+    ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+}
+
+function mockSubagentToolStream(name: "subagent" | "subagent_fork"): string {
+    return [
+        { type: "message_start", message: { usage: { input_tokens: 10, output_tokens: 0 } } },
+        {
+            type: "content_block_start",
+            index: 0,
+            content_block: {
+                type: "tool_use",
+                id: `call-${name}`,
+                name,
+                input: { description: `${name} child`, prompt: "Reply as the child", run_in_background: false },
+            },
+        },
+        { type: "content_block_stop", index: 0 },
+        { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 3 } },
         { type: "message_stop" },
     ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
 }
@@ -715,6 +735,103 @@ describe("live tool output", () => {
             rmSync(workspace, { recursive: true, force: true });
         }
     }, 90_000);
+});
+
+function persistedSessionHeaders(sessionRoot: string): Array<Record<string, unknown>> {
+    const headers: Array<Record<string, unknown>> = [];
+    const walk = (dir: string): void => {
+        if (!existsSync(dir)) return;
+        for (const name of readdirSync(dir)) {
+            const path = join(dir, name);
+            if (statSync(path).isDirectory()) {
+                walk(path);
+                continue;
+            }
+            if (!name.endsWith(".jsonl") && !name.endsWith(".jsonl.zstd")) continue;
+            const bytes = readFileSync(path);
+            const text = name.endsWith(".zstd") ? zstdDecompressSync(bytes).toString("utf8") : bytes.toString("utf8");
+            const line = text.split("\n").find((entry) => entry.length > 0);
+            if (line !== undefined) headers.push(JSON.parse(line) as Record<string, unknown>);
+        }
+    };
+    walk(join(sessionRoot, "home"));
+    return headers;
+}
+
+describe("subagent session origin", () => {
+    it("keeps child sessions out of the ACP session list and refuses to open them", async () => {
+        const sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-subagent-origin-"));
+        const workspace = mkdtempSync(join(tmpdir(), "dsh-acp-subagent-origin-ws-"));
+        let parentTurns = 0;
+        const provider = createServer(async (request, response) => {
+            let body = "";
+            for await (const chunk of request) body += String(chunk);
+            const payload = JSON.parse(body) as { system?: unknown; messages?: unknown };
+            const system = typeof payload.system === "string" ? payload.system : "";
+            const transcript = system + JSON.stringify(payload.messages ?? []);
+            response.writeHead(200, { "content-type": "text/event-stream" });
+            if (system.startsWith("Create a concise title")) {
+                response.end(mockModelStream("Origin probe", request.url));
+                return;
+            }
+            if (transcript.includes("You are a delegated subagent")) {
+                response.end(mockModelStream("CHILD", request.url));
+                return;
+            }
+            parentTurns += 1;
+            const tool = parentTurns === 1 ? "subagent" : parentTurns === 3 ? "subagent_fork" : undefined;
+            response.end(tool === undefined ? mockModelStream("parent done", request.url) : mockSubagentToolStream(tool));
+        });
+        await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
+        const address = provider.address() as { port: number };
+        const client = new AcpTestClient(sessionRoot, workspace, undefined, {
+            DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}`,
+            DSH_PERMISSION_MODE: "danger-full-access",
+        });
+        try {
+            await client.request("initialize", { protocolVersion: 1 }, 60_000);
+            const { sessionId } = await client.request("session/new", { cwd: workspace, mcpServers: [] }) as { sessionId: string };
+            await client.request("session/prompt", {
+                sessionId,
+                prompt: [{ type: "text", text: "Delegate with the subagent tool." }],
+            }, 90_000);
+            await client.request("session/prompt", {
+                sessionId,
+                prompt: [{ type: "text", text: "Delegate with the subagent_fork tool." }],
+            }, 90_000);
+
+            const headers = persistedSessionHeaders(sessionRoot);
+            const children = headers.filter((header) => header["parentSession"] === sessionId);
+            expect(children).toHaveLength(2);
+            expect(children.every((header) => header["origin"] === "subagent" && header["delegationDepth"] === 1)).toBe(true);
+            expect(children.map((header) => header["isSeeded"]).sort()).toEqual([false, true]);
+
+            const listed = await client.request("session/list", { cwd: workspace }) as {
+                sessions: Array<{ sessionId: string }>;
+            };
+            const listedIds = listed.sessions.map((session) => session.sessionId);
+            expect(listedIds).toContain(sessionId);
+            for (const child of children) expect(listedIds).not.toContain(child["id"]);
+
+            for (const child of children) {
+                const childId = String(child["id"]);
+                await expect(client.request("session/load", { sessionId: childId, cwd: workspace, mcpServers: [] }))
+                    .rejects.toThrow(/subagent child/);
+                await expect(client.request("session/resume", { sessionId: childId, cwd: workspace, mcpServers: [] }))
+                    .rejects.toThrow(/subagent child/);
+                await expect(client.request("session/prompt", {
+                    sessionId: childId,
+                    prompt: [{ type: "text", text: "open the child" }],
+                })).rejects.toThrow(/subagent child/);
+            }
+        } finally {
+            await client.close();
+            provider.closeAllConnections();
+            await new Promise<void>((resolve) => provider.close(() => resolve()));
+            rmSync(sessionRoot, { recursive: true, force: true });
+            rmSync(workspace, { recursive: true, force: true });
+        }
+    }, 120_000);
 });
 
 describe("dsh-acp server (e2e smoke)", () => {
