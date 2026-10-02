@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '17 */6 * * *'
   workflow_dispatch:
+    inputs:
+      review_pr:
+        description: 'PR number to review (skips version check, dispatches agent only)'
+        required: false
+        type: number
 
 concurrency:
   group: dsh-update
@@ -18,6 +23,7 @@ jobs:
   update:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    if: ${{ !inputs.review_pr }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -82,134 +88,25 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
-          UPDATE_BRANCH: codex/bump-dsh-${{ steps.version.outputs.version }}
-          DSH_VERSION: ${{ steps.version.outputs.version }}
-          PREVIOUS_VERSION: ${{ steps.version.outputs.previous }}
         run: |
-          set -euo pipefail
-          
-          if [ -z "${CURSOR_API_KEY:-}" ]; then
-            echo "::warning::CURSOR_API_KEY secret not configured. Skipping automated compatibility review."
-            echo "The maintainer can add this secret to enable automated agent dispatch."
-            exit 0
-          fi
-          
-          REPO_URL="https://github.com/${{ github.repository }}"
-          
-          # Get the PR URL for the newly created PR
-          PR_URL=$(gh pr view "$UPDATE_BRANCH" --json url --jq .url)
-          
-          # Build the agent prompt
-          read -r -d '' AGENT_PROMPT <<'EOF' || true
-          Goal: Review ACP compatibility with the bundled dsh upgrade from $PREVIOUS_VERSION to $DSH_VERSION and push any necessary fixes directly to this PR branch.
-          
-          ## Tasks
-          
-          1. **Read release context**: Fetch and read dsh release notes, changelogs, and API diffs between $PREVIOUS_VERSION and $DSH_VERSION. Focus on:
-             - Breaking changes to session/agent APIs
-             - Changes to model IDs, options, or parameters
-             - Tool output format changes
-             - Permission/sandbox modifications
-             - Profile/plugin lifecycle changes
-          
-          2. **Analyze ACP adapter usage**: Search this codebase for every dsh API this adapter uses:
-             - Session create/load/resume lifecycle
-             - Agent composition and model catalog
-             - Tool calls and display terminals
-             - Permission presets and sandboxing
-             - MCP server mounting
-             - Credential store access
-             - Profile boot and Cordis tree composition
-          
-          3. **Test the adapter**: Where feasible, exercise the ACP adapter over stdio:
-             - Start `dsh-acp` (standalone or via profile)
-             - Send basic ACP requests (initialize, session/new, simple prompts)
-             - Verify tool calls, streaming, and session persistence work
-             - Check that the adapter starts without errors
-          
-          4. **Fix breakages**: If you find incompatibilities:
-             - Update imports, API calls, or type signatures as needed
-             - Add compatibility shims if the adapter must support multiple dsh versions
-             - Update tests to cover the changes
-             - Commit fixes with clear messages
-             - Push directly to this PR branch (no force push, no new branches)
-          
-          5. **Run tests**: Execute `npm test` to ensure the test suite passes. If tests fail due to your changes, fix them.
-          
-          6. **Ensure CI runs**: After pushing fixes, verify CI is running. If the push didn't trigger CI (unlikely but possible), manually trigger it with `gh workflow run ci.yml --ref $UPDATE_BRANCH`.
-          
-          7. **Post a verdict**: Comment on this PR with your assessment:
-             - **Safe to merge**: No compatibility issues found, or all issues fixed and tests pass
-             - **Safe after fixes**: Issues found and fixed; human should verify the fixes before merging
-             - **Not safe**: Breaking changes that require human design decisions
-             
-             Include in your comment:
-             - Summary of API changes reviewed
-             - Any fixes you made (with commit SHAs)
-             - What a human should test in a real ACP client (Zed, Backchat, etc.)
-             - Link to test results
-          
-          ## Guidelines
-          
-          - Never bump the ACP package version (this PR only upgrades the bundled dsh)
-          - Never merge the PR or enable auto-merge
-          - Push commits normally; do not force push
-          - If you're uncertain about a fix, document the tradeoffs in the PR comment and mark as "Not safe"
-          
-          Release notes for dsh $DSH_VERSION should be available at:
-          - GitHub: https://github.com/deepseek-ai/deepseek-harness/releases
-          - npm: https://www.npmjs.com/package/@deepseek-ai/dsh?activeTab=versions
-          EOF
-          
-          # Substitute variables in the prompt
-          AGENT_PROMPT=$(echo "$AGENT_PROMPT" | sed "s/\$PREVIOUS_VERSION/$PREVIOUS_VERSION/g; s/\$DSH_VERSION/$DSH_VERSION/g; s/\$UPDATE_BRANCH/$UPDATE_BRANCH/g")
-          
-          # Create the agent via Cursor API v1
-          API_RESPONSE=$(curl -f -s -S --request POST \
-            --url https://api.cursor.com/v1/agents \
-            --user "${CURSOR_API_KEY}:" \
-            --header 'Content-Type: application/json' \
-            --data @- <<JSON_PAYLOAD || echo '{"error": true}'
-          {
-            "prompt": {
-              "text": $(printf '%s' "$AGENT_PROMPT" | jq -R -s .)
-            },
-            "repos": [
-              {
-                "url": "$REPO_URL",
-                "prUrl": "$PR_URL"
-              }
-            ],
-            "workOnCurrentBranch": true,
-            "autoCreatePR": false,
-            "name": "Review dsh $DSH_VERSION compatibility"
-          }
-          JSON_PAYLOAD
-          )
-          
-          if echo "$API_RESPONSE" | jq -e .error > /dev/null 2>&1; then
-            echo "::error::Failed to launch Cursor cloud agent. API call returned an error."
-            echo "API Response: $API_RESPONSE"
-            echo "The PR is still open; manual review is required."
-            exit 0
-          fi
-          
-          AGENT_ID=$(echo "$API_RESPONSE" | jq -r '.agent.id')
-          AGENT_URL=$(echo "$API_RESPONSE" | jq -r '.agent.url')
-          
-          echo "Launched Cursor cloud agent: $AGENT_URL"
-          
-          # Post a comment on the PR with the agent link
-          gh pr comment "$UPDATE_BRANCH" --body "🤖 **Automated compatibility review launched**
-
-          A Cursor cloud agent is reviewing ACP compatibility with dsh $DSH_VERSION.
-
-          **Agent:** $AGENT_URL
-
-          The agent will:
-          - Review dsh release notes and API changes
-          - Test the ACP adapter with the new dsh version
-          - Push fixes directly to this branch if needed
-          - Post a verdict comment when complete
-
-          You can monitor progress at the agent link above."
+          PR_NUMBER=$(gh pr view "codex/bump-dsh-${{ steps.version.outputs.version }}" --json number --jq .number)
+          bash scripts/dispatch-cursor-review.sh \
+            "$PR_NUMBER" \
+            "https://github.com/${{ github.repository }}" \
+            "${{ steps.version.outputs.version }}" \
+            "${{ steps.version.outputs.previous }}"
+  
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: ${{ inputs.review_pr }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Dispatch Cursor cloud agent for existing PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          bash scripts/dispatch-cursor-review.sh \
+            "${{ inputs.review_pr }}" \
+            "https://github.com/${{ github.repository }}"
