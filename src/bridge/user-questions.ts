@@ -14,6 +14,8 @@ import {
     type UserQuestionService,
 } from "@deepseek-ai/dsh-user-questions";
 
+import { logDebug, logWarn } from "../log.ts";
+
 const META_KEY = "dsh.userQuestions";
 
 function fieldName(index: number): string {
@@ -145,13 +147,60 @@ export function answerFromElicitation(
     };
 }
 
+function abortedQuestionError(signal: AbortSignal): UserQuestionError {
+    const reason = signal.reason;
+    if (reason instanceof UserQuestionError) return reason;
+    const message = reason instanceof Error ? reason.message : "ask_user_question was aborted";
+    return new UserQuestionError(message, "ASK_ABORTED");
+}
+
+/**
+ * Ask over ACP form elicitation.
+ *
+ * Timed questions (`askTimed`) abort `request.signal` when the foreground
+ * wait ends. The elicitation RPC itself cannot be withdrawn, so a timeout
+ * rejects this promise immediately and a later accept is reported through
+ * `onLateAnswer` for the continued-question path.
+ */
 export async function askUserQuestionsOverAcp(
     request: AskUserQuestionRequest,
     sessionId: string,
     create: (request: CreateElicitationRequest) => Promise<CreateElicitationResponse>,
+    onLateAnswer?: (answer: AskUserQuestionAnswer) => void,
 ): Promise<AskUserQuestionAnswer> {
-    const response = await create(questionsToElicitation(request.questions, sessionId));
-    const answer = answerFromElicitation(request.questions, response);
+    const signal = request.signal;
+    if (signal?.aborted) throw abortedQuestionError(signal);
+    const responsePromise = create(questionsToElicitation(request.questions, sessionId));
+    if (signal === undefined) return answerOrCancel(request.questions, await responsePromise);
+
+    let onAbort: (() => void) | undefined;
+    const aborted = new Promise<never>((_, reject) => {
+        onAbort = () => reject(abortedQuestionError(signal));
+        signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+        return await Promise.race([
+            responsePromise.then((response) => answerOrCancel(request.questions, response)),
+            aborted,
+        ]);
+    } catch (error) {
+        if (signal.aborted && onLateAnswer !== undefined) {
+            void responsePromise.then((response) => {
+                const answer = answerFromElicitation(request.questions, response);
+                if (answer !== undefined) onLateAnswer(answer);
+            }, () => undefined);
+        }
+        throw error;
+    } finally {
+        if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
+    }
+}
+
+function answerOrCancel(
+    questions: AskUserQuestionItem[],
+    response: CreateElicitationResponse,
+): AskUserQuestionAnswer {
+    const answer = answerFromElicitation(questions, response);
     if (answer === undefined) {
         throw new UserQuestionError("the user cancelled ask_user_question", "ASK_CANCELLED");
     }
@@ -197,12 +246,32 @@ export function installAcpUserQuestionProvider(
                 const sessionId = route?.sessionIdForRequest(request);
                 if (route === undefined || sessionId === undefined) continue;
                 if (!route.formSupported()) {
+                    // A timed ask with no form UI is unclaimed. askTimed waits
+                    // out NO_PROVIDER and returns pending; failing immediately
+                    // would skip that deadline.
+                    if (request.wait?.timed === true) {
+                        throw new UserQuestionError(
+                            "the ACP client does not support form elicitation",
+                            "NO_PROVIDER",
+                        );
+                    }
                     throw new UserQuestionError(
                         "the ACP client does not support form elicitation",
                         "CLIENT_UNSUPPORTED",
                     );
                 }
-                return askUserQuestionsOverAcp(request, sessionId, route.create);
+                return askUserQuestionsOverAcp(request, sessionId, route.create, (answer) => {
+                    const agent = request.agent;
+                    const callId = request.wait?.callId;
+                    if (agent === undefined || callId === undefined) return;
+                    try {
+                        if (!service.answer(agent, callId, answer)) {
+                            logDebug("late user-question answer arrived after the question closed");
+                        }
+                    } catch (error: unknown) {
+                        logWarn(`late user-question answer failed: ${String(error)}`);
+                    }
+                });
             }
             if (next !== undefined) return next();
             throw new UserQuestionError(

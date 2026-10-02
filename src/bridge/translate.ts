@@ -441,6 +441,8 @@ export class SessionProjection {
 
     private streamedText = new Set<string>();
     private streamedReasoning = new Set<string>();
+    /** `agent/assistant-stream` attempt id → the durable turn/step it belongs to. */
+    private streamAttempts = new Map<string, { turn: number; step: number }>();
     /** Structured tool values observed live before DSH omits them from its durable event. */
     private toolResultValues = new Map<string, unknown>();
     /** Live bytes already sent for each tool, used to avoid replaying them at settlement. */
@@ -542,10 +544,58 @@ export class SessionProjection {
             : updates.map((update) => this.withSubagentAttribution(update));
     }
 
+    /**
+     * Project one live `agent/assistant-stream` frame.
+     *
+     * dsh 0.2 publishes token deltas on this process-local event. The durable
+     * `assistant/chunk` log event is no longer written; `assistant/message`
+     * still arrives at the end of the attempt and is deduped against text
+     * already streamed here. Frames for an attempt whose `start` was missed
+     * are ignored.
+     */
+    onAssistantStream(frame: {
+        type?: unknown;
+        attemptId?: unknown;
+        turn?: unknown;
+        step?: unknown;
+        chunk?: unknown;
+    }): SessionUpdate[] {
+        const updates = this.projectAssistantStream(frame);
+        return this.subagent === undefined
+            ? updates
+            : updates.map((update) => this.withSubagentAttribution(update));
+    }
+
+    private projectAssistantStream(frame: {
+        type?: unknown;
+        attemptId?: unknown;
+        turn?: unknown;
+        step?: unknown;
+        chunk?: unknown;
+    }): SessionUpdate[] {
+        const attemptId = typeof frame.attemptId === "string" ? frame.attemptId : undefined;
+        if (frame.type === "start") {
+            if (attemptId !== undefined && typeof frame.turn === "number" && typeof frame.step === "number") {
+                this.streamAttempts.set(attemptId, { turn: frame.turn, step: frame.step });
+            }
+            return [];
+        }
+        if (frame.type === "end") {
+            if (attemptId !== undefined) this.streamAttempts.delete(attemptId);
+            return [];
+        }
+        if (frame.type !== "chunk" || attemptId === undefined) return [];
+        const located = this.streamAttempts.get(attemptId);
+        if (located === undefined) return [];
+        return this.onChunk({ turn: located.turn, step: located.step, chunk: frame.chunk });
+    }
+
     /** Project one event before optional subagent attribution is attached. */
     private projectEvent(event: HarnessEvent): SessionUpdate[] {
         const data = event.data ?? {};
         switch (event.type) {
+            // Historical logs and older hosts. dsh 0.2 live deltas use
+            // `agent/assistant-stream` (see onAssistantStream).
             case "assistant/chunk":
                 return this.onChunk(data);
             case "tool-call-chunks":

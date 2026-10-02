@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { CreateElicitationRequest, CreateElicitationResponse } from "@agentclientprotocol/sdk";
 import { Context } from "@deepseek-ai/cordis";
 import UserQuestionService, {
+    UserQuestionError,
     type UserQuestionService as UserQuestionServiceType,
 } from "@deepseek-ai/dsh-user-questions";
 import type {
@@ -21,6 +22,7 @@ type UserQuestionBridge = {
         request: AskUserQuestionRequest,
         sessionId: string,
         create: (request: CreateElicitationRequest) => Promise<CreateElicitationResponse>,
+        onLateAnswer?: (answer: AskUserQuestionAnswer) => void,
     ) => Promise<AskUserQuestionAnswer>;
     createElicitation?: (
         connection: {
@@ -173,6 +175,27 @@ describe("ACP user-question elicitation", () => {
         expect(sent).toEqual([request]);
     });
 
+    it("rejects a timed elicitation when the wait signal aborts, then delivers a late accept", async () => {
+        const controller = new AbortController();
+        const timeout = new UserQuestionError("ask_user_question timed out before the user answered", "ASK_TIMED_OUT");
+        let finish: ((response: CreateElicitationResponse) => void) | undefined;
+        const late: AskUserQuestionAnswer[] = [];
+        const pending = subject.askUserQuestionsOverAcp?.(
+            {
+                questions: [{ id: "confirm", question: "Continue?" }],
+                signal: controller.signal,
+            },
+            "s1",
+            () => new Promise((resolve) => { finish = resolve; }),
+            (answer) => { late.push(answer); },
+        );
+        controller.abort(timeout);
+        await expect(pending).rejects.toMatchObject({ code: "ASK_TIMED_OUT" });
+        finish?.({ action: "accept", content: { question_0: "yes" } });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(late).toEqual([{ answers: [{ id: "confirm", selected: [], custom: "yes" }] }]);
+    });
+
     it("turns a cancelled elicitation into the user-question cancellation error", async () => {
         const promise = subject.askUserQuestionsOverAcp?.(
             { questions: [{ id: "confirm", question: "Continue?" }] },
@@ -201,6 +224,29 @@ describe("ACP user-question elicitation", () => {
             await expect(ctx.userQuestions.ask({ questions: [{ id: "web", question: "Where?" }] }))
                 .resolves.toEqual({ answers: [{ id: "web", selected: [], custom: "web" }] });
         } finally { dispose(); await ctx.fiber.dispose(); }
+    });
+
+    it("leaves a timed question unclaimed when the client has no form elicitation", async () => {
+        const ctx = new Context();
+        const fiber = ctx.plugin(UserQuestionService);
+        await fiber;
+        const dispose = subject.installAcpUserQuestionProvider?.(ctx.userQuestions, {
+            formSupported: () => false,
+            sessionIdForRequest: () => "s1",
+            create: async () => ({ action: "accept", content: {} }),
+        });
+        try {
+            await expect(ctx.userQuestions.ask({
+                questions: [{ id: "confirm", question: "Continue?" }],
+                wait: { callId: "call-1" as never, timed: true },
+            })).rejects.toMatchObject({ code: "NO_PROVIDER" });
+            await expect(ctx.userQuestions.ask({
+                questions: [{ id: "confirm", question: "Continue?" }],
+            })).rejects.toMatchObject({ code: "CLIENT_UNSUPPORTED" });
+        } finally {
+            dispose?.();
+            await fiber.dispose();
+        }
     });
 
     it("registers the ACP client as the active user-questions provider", async () => {

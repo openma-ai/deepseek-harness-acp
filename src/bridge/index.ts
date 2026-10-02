@@ -111,6 +111,7 @@ import { AcpRpc, muxAcpStream } from "./rpc.ts";
 import type { TuiClientAdvertisement } from "./tui-client.ts";
 import * as tuiClientPlugin from "./tui-client-plugin.ts";
 import * as userQuestionsPlugin from "./user-questions-plugin.ts";
+import { substituteUnavailableModel } from "./model-catalog.ts";
 import { presetDisplayName, type PresetRow } from "./presets.ts";
 export {
     answerFromElicitation,
@@ -505,6 +506,57 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         }
         liveCatalog = found;
         return found;
+    };
+
+    /**
+     * Persisted and configured ids that a dsh upgrade removed.
+     *
+     * A listed successor wins, including when the official adapter would still
+     * describe the old id and pass it through. An id the adapter refuses and
+     * that has no successor falls back to that provider's first live model.
+     * An unlisted id the adapter can still describe is left alone.
+     */
+    const resolvedModels = new Map<string, string>();
+    ctx.on("llm/adapters-updated", () => {
+        resolvedModels.clear();
+    });
+    const resolveUsableModel = async (provider: string, model: string): Promise<string> => {
+        const key = `${provider}\0${model}`;
+        const cached = resolvedModels.get(key);
+        if (cached !== undefined) return cached;
+        const catalog = await discoverModels();
+        let described = catalog.some((entry) => entry.provider === provider && entry.model === model);
+        if (!described) {
+            try {
+                await llm.resolveModelInfo(provider, model);
+                described = true;
+            } catch (error: unknown) {
+                logDebug(`resolveModelInfo(${provider}/${model}) failed: ${String(error)}`);
+                described = false;
+            }
+        }
+        const decision = substituteUnavailableModel(provider, model, catalog, described);
+        if (decision.replaced && decision.reason !== undefined) logWarn(decision.reason);
+        resolvedModels.set(key, decision.model);
+        return decision.model;
+    };
+
+    const reconcileModel = async (record: SessionRecord): Promise<void> => {
+        // The live selection prefers the logged request header over routeOf,
+        // so a persisted removed id has to be read from there.
+        const selection = ensureSelection(record);
+        const selected = selection?.current;
+        const route = selected ?? routeOf(record);
+        if (route.provider === undefined || route.model === undefined) return;
+        const usable = await resolveUsableModel(route.provider, route.model);
+        if (usable === route.model) return;
+        record.model = usable;
+        if (selection === undefined) return;
+        selection.current = {
+            provider: route.provider,
+            model: usable,
+            ...(selected?.reasoningEffort !== undefined ? { reasoningEffort: selected.reasoningEffort } : {}),
+        };
     };
 
     ctx.on("llm/adapters-updated", () => {
@@ -1216,6 +1268,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
 
     /** The model-select entries: adapter directory first, then static config. */
     const modelChoices = async (record: SessionRecord): Promise<{ value: string; name: string }[]> => {
+        await reconcileModel(record);
         const seen = new Set<string>();
         const options: { value: string; name: string }[] = [];
         const push = (value: string, name: string): void => {
@@ -1777,6 +1830,22 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         }
     });
 
+    // dsh 0.2 emits token deltas here. Durable `assistant/chunk` events are
+    // no longer appended; the final `assistant/message` still dedupes text
+    // that this stream already published.
+    ctx.on("agent/assistant-stream", ({ agent, frame }) => {
+        const sessionId = String(agent.session.id);
+        const record = ownedRecord(agent);
+        if (record !== undefined) {
+            for (const update of record.projection.onAssistantStream(frame)) notify(sessionId, update);
+            return;
+        }
+        const child = subagentByChild.get(sessionId);
+        if (child !== undefined && clientSubagentTranscript) {
+            for (const update of child.projection.onAssistantStream(frame)) notify(child.rootSessionId, update);
+        }
+    });
+
     ctx.on("agent/inbox/claimed", ({ agent, message, turn }) => {
         const record = ownedRecord(agent);
         const inflight = record?.inflight;
@@ -2191,6 +2260,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 }
 
                 record.cancelled = false;
+                await reconcileModel(record);
                 const message = createUserMessage({
                     content: converted.blocks,
                     source: { kind: "user" },

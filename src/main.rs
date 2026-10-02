@@ -40,7 +40,7 @@ OPTIONS:
       --session-root <dir>  session JSONL root (default: ~/.dsh-tui/sessions)
       --session-id <id>     resume/continue a durable session id
       --provider <id>       provider route (default: deepseek-official)
-      --model <id>          model id (default: $DSH_MODEL or deepseek-v4-flash)
+      --model <id>          model id (default: $DSH_MODEL or deepseek-flash)
       --max-tokens <n>      per-request output token cap
       --base-url <url>      sets DEEPSEEK_BASE_URL for the runtime
       --api-key <key>       sets DEEPSEEK_API_KEY for the runtime
@@ -81,7 +81,7 @@ fn parse_args() -> Result<Args> {
         session_root: None,
         session_id: None,
         provider: "deepseek-official".into(),
-        model: std::env::var("DSH_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".into()),
+        model: std::env::var("DSH_MODEL").unwrap_or_else(|_| "deepseek-flash".into()),
         max_tokens: None,
         base_url: None,
         api_key: None,
