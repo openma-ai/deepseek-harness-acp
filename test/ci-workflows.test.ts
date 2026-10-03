@@ -16,6 +16,8 @@ interface Workflow {
         steps?: Array<{
             name?: string;
             run?: string;
+            uses?: string;
+            with?: Record<string, unknown>;
             env?: Record<string, unknown>;
         }>;
     }>;
@@ -77,5 +79,35 @@ describe("release provenance", () => {
         expect(guardCommands).toContain(
             'bash scripts/verify-release-tag.sh "$GITHUB_SHA" origin/main',
         );
+    });
+});
+
+describe("release check", () => {
+    it("lists unreleased pull requests from ci.yml without checking a tag", () => {
+        const job = readWorkflow("ci.yml").jobs?.["release-check"];
+        const steps = job?.steps ?? [];
+        const checkout = steps.find((step) => step.uses === "actions/checkout@v5");
+        const check = steps.find((step) => step.run === "node scripts/release-check.mjs");
+        const fetch = steps.find((step) => step.run?.includes("git fetch --tags --force origin"));
+
+        expect(job?.["timeout-minutes"]).toBe(5);
+        expect(checkout?.with?.["fetch-depth"]).toBe(0);
+        expect(checkout?.with?.["fetch-tags"]).toBe(true);
+        expect(fetch?.run).toContain("github.base_ref");
+        expect(check?.env?.["RELEASE_LABELS"]).toContain("pull_request.labels");
+        expect(steps.some((step) => step.run?.includes("release-check.mjs --tag"))).toBe(false);
+    });
+
+    it("checks release notes on the tag before npm publish and still generates them", () => {
+        const jobs = readWorkflow("release.yml").jobs;
+        const steps = jobs?.["release-check"]?.steps ?? [];
+        const publishSteps = jobs?.["publish"]?.steps ?? [];
+        const publishRun = publishSteps.map((step) => step.run ?? "").join("\n");
+
+        expect(jobs?.["release-check"]?.needs).toBe("verify-tag");
+        expect(steps.some((step) => step.run?.includes("node scripts/release-check.mjs --tag"))).toBe(true);
+        expect(jobs?.["publish"]?.needs).toContain("release-check");
+        expect(publishRun).toContain("npm publish");
+        expect(publishRun).toContain('gh release create "$GITHUB_REF_NAME" *.tgz --generate-notes --verify-tag $PRERELEASE');
     });
 });

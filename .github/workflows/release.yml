@@ -127,8 +127,33 @@ jobs:
         shell: bash
         run: node scripts/standalone-smoke.mjs artifact/*.tgz
 
+  # Refuse the tag before npm publish when the generated or published release
+  # notes omit a pull request merged since the previous v* tag, or when the
+  # version, lockfile, README pin, and tag disagree. Minor and major bumps
+  # need release:minor / release:major. publish still creates the GitHub
+  # Release with --generate-notes; this job does not tag or publish.
+  release-check:
+    name: release check
+    needs: verify-tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write # generate-notes preview; the Release is created later by publish
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          ref: ${{ github.sha }}
+      - name: Fetch tags
+        run: git fetch --tags --force origin
+      - name: Check tag, versions, and release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/release-check.mjs --tag
+
   publish:
-    needs: [test, dsh-compatibility, standalone]
+    needs: [test, dsh-compatibility, standalone, release-check]
     runs-on: ubuntu-latest
     permissions:
       id-token: write # npm OIDC trusted publishing

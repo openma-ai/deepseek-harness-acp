@@ -106,3 +106,34 @@ jobs:
         run: npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP"
       - name: Exercise the installed dsh profile
         run: npm exec -- node scripts/profile-smoke.mjs "$RUNNER_TEMP/dsh-host/node_modules/@deepseek-ai/dsh/lib/bin.js" "$RUNNER_TEMP/openma-deepseek-harness-acp-$(node -p "require('./package.json').version").tgz"
+
+  # One non-blocking notice listing pull requests merged since the last v* tag.
+  # A pull request that changes package.json version must keep the lockfile (and
+  # any README pin of this package) in sync, and must stay a patch unless it is
+  # labeled release:minor or release:major. Release notes are checked on the tag.
+  release-check:
+    name: release check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Fetch the base branch and tags
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-recurse-submodules origin "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+          else
+            git fetch --no-recurse-submodules origin "+refs/heads/${{ github.ref_name }}:refs/remotes/origin/${{ github.ref_name }}"
+          fi
+          git fetch --tags --force origin
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Check unreleased pull requests and version bumps
+        env:
+          RELEASE_LABELS: ${{ github.event_name == 'pull_request' && join(github.event.pull_request.labels.*.name, ',') || '' }}
+        run: node scripts/release-check.mjs
