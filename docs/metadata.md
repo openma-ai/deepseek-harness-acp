@@ -30,15 +30,28 @@ extension disabled.
 | `clientCapabilities._meta.dsh.cordis.protocol` | literal `0` | Negotiates the private `_dsh/cordis/*` TUI Client plane. Both peers must advertise the same protocol. |
 | `clientCapabilities.auth._meta.gateway` | literal `true` | Requests advertisement of the custom gateway authentication method. |
 
-The adapter advertises the Cordis protocol in the initialize response:
+The adapter advertises the Cordis protocol and inclusive session fork in the
+initialize response. The objects are deep-merged under `agentCapabilities._meta`;
+neither replaces the other.
 
 ```json
 {
   "agentCapabilities": {
+    "sessionCapabilities": {
+      "fork": {}
+    },
     "_meta": {
       "dsh": {
         "cordis": {
           "protocol": 0
+        }
+      },
+      "jetbrains": {
+        "air": {
+          "fork": {
+            "version": 1,
+            "inclusive": true
+          }
         }
       }
     }
@@ -48,6 +61,55 @@ The adapter advertises the Cordis protocol in the initialize response:
 
 `_meta.dsh.cordis.protocol` only negotiates the package-private TUI plane. It
 does not synchronize Cordis plugin ids, services, or fibers between processes.
+
+`agentCapabilities._meta.jetbrains.air.fork` is a nested object, the same path
+the client uses on `session/fork` requests. It is not a flat dotted key.
+`version` is `1` and `inclusive` is `true`: a message fork keeps the selected
+assistant message. The capability is advertised only together with
+`sessionCapabilities.fork: {}`.
+
+## `session/fork` request metadata
+
+`session/fork` with no `jetbrains.air.fork` block copies the source session's
+committed log into a new session. The source session is not modified.
+
+When the client sends `_meta.jetbrains.air.fork`, the adapter cuts the copy at
+one persisted top-level assistant message:
+
+```json
+{
+  "jetbrains": {
+    "air": {
+      "fork": {
+        "version": 1,
+        "messageId": "1:0",
+        "messageFingerprint": "sha256:<64 lowercase hex>",
+        "messageOccurrence": 1
+      }
+    }
+  }
+}
+```
+
+| Field | Required | Rule |
+|---|---|---|
+| `version` | yes | Must be `1`. Any other value, or a non-object block, is JSON-RPC `-32602` with message `Unsupported jetbrains.air.fork version`. The adapter does not fall back to a whole-session fork. |
+| `messageId` | yes | Trimmed non-empty string. This is the ACP `messageId` on `agent_message_chunk` (`<turn>:<step>`). A client segment id `<id>:segment:<n>` is also tried as `<id>`. |
+| `messageFingerprint` | no | When present, `sha256:` plus the SHA-256 hex of the assistant message's UTF-8 text (the `agent_message_chunk` texts for that id, in order; no thoughts, no tool output). |
+| `messageOccurrence` | no | Positive safe integer, default `1`. 1-based index among assistant messages with the same fingerprint, in log order. |
+
+Lookup order:
+
+1. Exact `messageId`, then the id with a trailing `:segment:<n>` removed.
+2. If that message's fingerprint does not match a provided fingerprint, the id is treated as a miss.
+3. With a fingerprint: one matching assistant message wins; otherwise the `messageOccurrence` match wins.
+4. Otherwise `-32602`: `Fork point message <messageId> was not found in session <sessionId>`. No silent whole-session fork.
+
+Only completed `assistant/message` events in the source log are candidates. A
+running turn's in-flight stream is ignored. Subagent child sessions are not
+forkable. The new session's `session/load` replay ends at the selected
+assistant message. Tool-call blocks on that message are dropped, because their
+results are logged after the message; earlier tool calls and results stay.
 
 ## Authentication metadata
 

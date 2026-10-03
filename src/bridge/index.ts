@@ -15,6 +15,8 @@
  *   session modes, model switching via session config options
  * - `session/resume` without transcript replay, `session/load` with full
  *   history replay from JSONL persistence, `session/list` from the same store
+ * - `session/fork` (`unstable_forkSession`): a new session with the source
+ *   log, or an inclusive cut at one persisted assistant message
  */
 
 import { randomUUID } from "node:crypto";
@@ -31,6 +33,8 @@ import {
     type AuthMethod,
     type CancelNotification,
     type CloseSessionRequest,
+    type ForkSessionRequest,
+    type ForkSessionResponse,
     type InitializeRequest,
     type InitializeResponse,
     type ListSessionsRequest,
@@ -59,7 +63,7 @@ import type { Context } from "@deepseek-ai/cordis";
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import { ReasoningEffortId, type createUserMessage, type errorChain } from "@deepseek-ai/dsh-llm";
-import type { SessionId, SessionEvent } from "@deepseek-ai/dsh-session";
+import { buildForkSeed, SessionLogOffset, SessionSeq, type SessionEvent, type SessionId } from "@deepseek-ai/dsh-session";
 import type { foldSessionTitle } from "@deepseek-ai/dsh-session-title";
 import type { setSandboxMode } from "@deepseek-ai/dsh-sandbox-policy";
 import type { SandboxMode } from "@deepseek-ai/dsh-sandbox";
@@ -91,6 +95,14 @@ import {
 } from "../auth.ts";
 import { openLocalAuthPage, startLocalAuthPage } from "../auth-page.ts";
 import { logDebug, logWarn } from "../log.ts";
+import {
+    acpInclusiveForkCapabilityMeta,
+    inclusiveHistoryPrefix,
+    locateForkPoint,
+    parseForkRequest,
+    type ForkLogEvent,
+    type JetbrainsAirForkRequest,
+} from "./fork.ts";
 import { buildReplay, buildResumeMetadata } from "./history.ts";
 import { LatestPublication } from "./latest-publication.ts";
 import {
@@ -965,6 +977,84 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         ensureSelection(record);
         queueMicrotask(() => publishCommands(sessionId));
         return record;
+    };
+
+    /**
+     * Committed session log for a fork. A running turn contributes only
+     * assistant messages already appended; the live token stream is not a
+     * fork point. Subagent children are refused before this read.
+     */
+    const readForkSource = async (
+        sessionId: string,
+    ): Promise<{ events: readonly SessionEvent[]; header: { cwd?: string; origin?: string; agentPreset?: string } }> => {
+        await assertAcpVisibleSession(sessionId);
+        const live = sessions.get(sessionId);
+        if (live !== undefined) {
+            return {
+                events: readSessionEvents(live.agent.session) as readonly SessionEvent[],
+                header: live.agent.session.header,
+            };
+        }
+        const header = (await storedHeaders()).find((item) => String(item.id) === sessionId);
+        if (header === undefined) throw invalidParams(`unknown session: ${sessionId}`);
+        try {
+            return {
+                events: await readStoredEvents(sessionPersistence, SessionId(sessionId)),
+                header,
+            };
+        } catch (error: unknown) {
+            throw invalidParams(`unknown session: ${sessionId} (${errorChain(error)})`);
+        }
+    };
+
+    const lastRequestRoute = (
+        events: readonly ForkLogEvent[],
+    ): { provider?: string; model?: string } => {
+        for (let index = events.length - 1; index >= 0; index -= 1) {
+            const event = events[index];
+            if (event?.type !== "request/header" || event.data === null || typeof event.data !== "object") continue;
+            const header = (event.data as { header?: unknown }).header;
+            if (header === null || typeof header !== "object") continue;
+            const config = (header as { config?: unknown }).config;
+            if (config === null || typeof config !== "object") continue;
+            const provider = (config as { provider?: unknown }).provider;
+            const model = (config as { model?: unknown }).model;
+            return {
+                ...(typeof provider === "string" && provider.length > 0 ? { provider } : {}),
+                ...(typeof model === "string" && model.length > 0 ? { model } : {}),
+            };
+        }
+        return {};
+    };
+
+    /**
+     * Build the child seed. Message fork cuts at the assistant message and
+     * drops that message's own tool calls (results are logged after it).
+     * Whole-session fork copies the committed log, including an open tail
+     * that `buildForkSeed` closes.
+     */
+    const forkSeedFor = (
+        events: readonly SessionEvent[],
+        request: JetbrainsAirForkRequest | undefined,
+        sessionId: string,
+    ): { seed: SessionEvent[]; inherited: ReturnType<typeof SessionLogOffset>; kept: readonly ForkLogEvent[] } => {
+        const kept = request === undefined
+            ? events
+            : inclusiveHistoryPrefix(events, locateForkPoint(events, request, sessionId).index);
+        if (kept.length === 0) {
+            return { seed: [], inherited: SessionLogOffset(0), kept };
+        }
+        const prefix = structuredClone(kept) as SessionEvent[];
+        const boundary = prefix.length - 1;
+        const last = prefix[boundary];
+        if (last === undefined || Number(last.seq) !== boundary) {
+            throw internalError("cannot fork: session log seqs are not contiguous");
+        }
+        return {
+            seed: buildForkSeed(prefix, SessionSeq(boundary)),
+            inherited: SessionLogOffset(boundary + 1),
+            kept,
+        };
     };
 
     const assertOpen = (): void => {
@@ -1950,7 +2040,11 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     _meta: { steering: { supported: true } },
                     agentInfo: { name: "dsh-acp", title: "DeepSeek Harness", version: VERSION },
                     agentCapabilities: {
-                        _meta: { dsh: { cordis: { ...CORDIS_CAPABILITY } } },
+                        // Deep-merge: dsh.cordis and the inclusive fork capability stay siblings.
+                        _meta: {
+                            dsh: { cordis: { ...CORDIS_CAPABILITY } },
+                            ...acpInclusiveForkCapabilityMeta(),
+                        },
                         loadSession: true,
                         promptCapabilities: {
                             image: attachmentIngestOf(ctx.get("attachments")) !== undefined,
@@ -1961,7 +2055,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                         // mcp-client's second transport. Legacy SSE does not.
                         mcpCapabilities: { http: true, sse: false },
                         auth: { logout: {} },
-                        sessionCapabilities: { list: {}, resume: {} },
+                        sessionCapabilities: { list: {}, resume: {}, fork: {} },
                     },
                     authMethods: advertisedAuthMethods(
                         providers,
@@ -2083,6 +2177,81 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 const record = await restoreSession(params.sessionId, { replay: true, cwd: params.cwd });
                 const options = await configOptions(record);
                 return {
+                    modes: modeState(record),
+                    ...(options.length > 0 ? { configOptions: options } : {}),
+                };
+            },
+
+            async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+                assertOpen();
+                await requireCredential(config.provider);
+                validateCwd(params.cwd);
+                validateAdditionalDirectories(params.additionalDirectories);
+                syncMcpServers(params.mcpServers, params.cwd);
+                // Invalid fork meta fails before a missing session can hide it,
+                // and never degrades into a whole-session copy.
+                const request = parseForkRequest(params._meta);
+                const source = await readForkSource(params.sessionId);
+                const seeded = forkSeedFor(source.events, request, params.sessionId);
+                const route = lastRequestRoute(seeded.kept);
+                const live = sessions.get(params.sessionId);
+                const model = route.model ?? (live !== undefined ? routeOf(live).model : undefined);
+                const provider = route.provider ?? (live !== undefined ? routeOf(live).provider : undefined);
+                const presets = presetsService();
+                let presetId: string | undefined;
+                try {
+                    presetId = (await presets.resolve(presetFromLog(source.header, seeded.kept))).id;
+                } catch (error: unknown) {
+                    throw internalError(`cannot fork session ${params.sessionId}: ${errorChain(error)}`);
+                }
+                const sessionId = SessionId(randomUUID());
+                let handle: Awaited<ReturnType<typeof agents.create>>;
+                try {
+                    handle = await agents.create({
+                        sessionId,
+                        meta: {
+                            cwd: params.cwd,
+                            parentSession: SessionId(params.sessionId),
+                            isSeeded: true,
+                            ...(presetId !== undefined ? { agentPreset: presetId } : {}),
+                        },
+                        inheritedEventCount: seeded.inherited,
+                        seed: seeded.seed,
+                        agentOptions: agentOptionsFor(model, provider),
+                        ...(presetSetup(presets, presetId) !== undefined
+                            ? { setup: presetSetup(presets, presetId) }
+                            : {}),
+                    } as Parameters<typeof agents.create>[0]);
+                } catch (error: unknown) {
+                    throw internalError(`cannot fork session ${params.sessionId}: ${errorChain(error)}`);
+                }
+                if (closed) {
+                    await handle.dispose();
+                    throw internalError("connection closed during session/fork");
+                }
+                const childId = String(sessionId);
+                const record = registerRecord(
+                    childId,
+                    handle.agent,
+                    () => handle.dispose(),
+                    model,
+                    config.permissionMode ?? (permissionService().defaultPreset as SandboxMode),
+                );
+                if (provider !== undefined) record.provider = provider;
+                if (presetId !== undefined) record.preset = presetId;
+                const recordedMode = currentPermission(record);
+                if (
+                    recordedMode !== undefined &&
+                    recordedMode !== record.modeId &&
+                    permissionService().names.includes(recordedMode)
+                ) {
+                    applyMode(record, childId, recordedMode);
+                }
+                ensureSelection(record);
+                queueMicrotask(() => publishCommands(childId));
+                const options = await configOptions(record);
+                return {
+                    sessionId: childId,
                     modes: modeState(record),
                     ...(options.length > 0 ? { configOptions: options } : {}),
                 };

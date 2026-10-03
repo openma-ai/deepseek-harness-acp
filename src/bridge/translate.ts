@@ -293,6 +293,14 @@ function extractMessageTexts(message: unknown): MessageTexts {
     return { text: texts.join(""), reasoning: reasoning.join("") };
 }
 
+/**
+ * Text the client sees for one assistant message: `agent_message_chunk` text
+ * in order. Thoughts and tool output are not part of the fingerprint.
+ */
+export function visibleAssistantText(message: unknown): string {
+    return extractMessageTexts(message).text;
+}
+
 // ---------------------------------------------------------------------------
 // Plan (todo) mapping
 // ---------------------------------------------------------------------------
