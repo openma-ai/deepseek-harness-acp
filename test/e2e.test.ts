@@ -8,6 +8,7 @@
  * the credential gate without ever dialing a provider.
  */
 
+import { createHash } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { zstdDecompressSync } from "node:zlib";
@@ -867,7 +868,11 @@ describe("dsh-acp server (e2e smoke)", () => {
         expect(capabilities["loadSession"]).toBe(true);
         expect(capabilities["promptCapabilities"]).toMatchObject({ embeddedContext: true, image: true });
         expect(capabilities["auth"]).toEqual({ logout: {} });
-        expect(capabilities["_meta"]).toMatchObject({ dsh: { cordis: { protocol: 0 } } });
+        expect(capabilities["sessionCapabilities"]).toMatchObject({ list: {}, resume: {}, fork: {} });
+        expect(capabilities["_meta"]).toMatchObject({
+            dsh: { cordis: { protocol: 0 } },
+            jetbrains: { air: { fork: { version: 1, inclusive: true } } },
+        });
         const methods = result["authMethods"] as Array<Record<string, unknown>>;
         expect(methods.length).toBeGreaterThanOrEqual(1);
         expect(methods.every((method) => method["type"] === undefined || method["type"] === "agent")).toBe(true);
@@ -1710,4 +1715,330 @@ describe("ACP steering extension", () => {
         expect(calls).toHaveLength(start + 1);
     }, 60_000);
 
+});
+
+function messageFingerprint(text: string): string {
+    return `sha256:${createHash("sha256").update(text, "utf8").digest("hex")}`;
+}
+
+function isTitleRequest(body: string): boolean {
+    try {
+        const payload = JSON.parse(body) as { system?: unknown; messages?: Array<{ content?: unknown }> };
+        return (typeof payload.system === "string" && payload.system.startsWith("Create a concise title"))
+            || (typeof payload.messages?.[0]?.content === "string"
+                && payload.messages[0].content.startsWith("Create a concise title"));
+    } catch {
+        return false;
+    }
+}
+
+function scriptedReply(body: string): string {
+    const markers = ["FORK_ONE", "FORK_TWO", "FORK_THREE", "FORK_AFTER", "FORK_SOURCE_AGAIN"] as const;
+    const replies: Record<(typeof markers)[number], string> = {
+        FORK_ONE: "Same",
+        FORK_TWO: "Second",
+        FORK_THREE: "Same",
+        FORK_AFTER: "Continued",
+        FORK_SOURCE_AGAIN: "Source still open",
+    };
+    let bestAt = -1;
+    let best = "UNEXPECTED";
+    for (const marker of markers) {
+        const at = body.lastIndexOf(marker);
+        if (at >= bestAt) {
+            bestAt = at;
+            best = replies[marker];
+        }
+    }
+    return bestAt < 0 ? "UNEXPECTED" : best;
+}
+
+function assistantMessages(updates: Array<Record<string, unknown>>): Array<{ messageId: string; text: string }> {
+    const textById = new Map<string, string>();
+    const order: string[] = [];
+    for (const update of updates) {
+        if (update["sessionUpdate"] !== "agent_message_chunk") continue;
+        const messageId = update["messageId"];
+        if (typeof messageId !== "string" || messageId.length === 0) continue;
+        const text = (update["content"] as { text?: string } | undefined)?.text ?? "";
+        if (text.length === 0) continue;
+        if (!textById.has(messageId)) order.push(messageId);
+        textById.set(messageId, `${textById.get(messageId) ?? ""}${text}`);
+    }
+    return order.map((messageId) => ({ messageId, text: textById.get(messageId) ?? "" }));
+}
+
+function updatesSince(
+    client: AcpTestClient,
+    sessionId: string,
+    start: number,
+): Array<Record<string, unknown>> {
+    return client.notifications.slice(start).flatMap((notification) => {
+        if (notification.method !== "session/update" || notification.params["sessionId"] !== sessionId) return [];
+        const update = notification.params["update"];
+        return update !== null && typeof update === "object" ? [update as Record<string, unknown>] : [];
+    });
+}
+
+function userTexts(updates: Array<Record<string, unknown>>): string[] {
+    return updates.flatMap((update) => {
+        if (update["sessionUpdate"] !== "user_message_chunk") return [];
+        const text = (update["content"] as { text?: string } | undefined)?.text;
+        return typeof text === "string" && text.length > 0 ? [text] : [];
+    });
+}
+
+describe("inclusive session/fork against a local mock model", () => {
+    let client: AcpTestClient;
+    let sessionRoot: string;
+    let workspace: string;
+    let provider: Server;
+    const promptBodies: string[] = [];
+
+    beforeAll(async () => {
+        sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-fork-sessions-"));
+        workspace = mkdtempSync(join(tmpdir(), "dsh-acp-fork-workspace-"));
+        provider = createServer(async (request, response) => {
+            let body = "";
+            for await (const chunk of request) body += String(chunk);
+            response.writeHead(200, { "content-type": "text/event-stream" });
+            if (isTitleRequest(body)) {
+                response.end(mockModelStream("Fork title", request.url));
+                return;
+            }
+            promptBodies.push(body);
+            response.end(mockModelStream(scriptedReply(body), request.url));
+        });
+        await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
+        const address = provider.address();
+        if (address === null || typeof address === "string") throw new Error("missing mock port");
+        client = new AcpTestClient(sessionRoot, workspace, undefined, {
+            DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}`,
+        });
+    });
+
+    afterAll(async () => {
+        await client.close();
+        await new Promise<void>((resolve) => provider.close(() => resolve()));
+        rmSync(sessionRoot, { recursive: true, force: true });
+        rmSync(workspace, { recursive: true, force: true });
+    });
+
+    it("forks a whole session and an inclusive message, and rejects an unknown point", async () => {
+        const initialized = await client.request("initialize", { protocolVersion: 1 }) as {
+            agentCapabilities: {
+                sessionCapabilities?: { fork?: unknown };
+                _meta?: { dsh?: { cordis?: { protocol?: number } }; jetbrains?: { air?: { fork?: unknown } } };
+            };
+        };
+        expect(initialized.agentCapabilities.sessionCapabilities?.fork).toEqual({});
+        expect(initialized.agentCapabilities._meta?.dsh?.cordis).toEqual({ protocol: 0 });
+        expect(initialized.agentCapabilities._meta?.jetbrains?.air?.fork).toEqual({ version: 1, inclusive: true });
+
+        const created = await client.request("session/new", { cwd: workspace, mcpServers: [] }) as {
+            sessionId: string;
+            modes: { currentModeId: string };
+            configOptions?: unknown[];
+        };
+        const sessionId = created.sessionId;
+        expect(created.modes.currentModeId).toBeTruthy();
+        expect(created.configOptions?.length).toBeGreaterThan(0);
+
+        await expect(client.request("session/fork", {
+            sessionId,
+            cwd: workspace,
+            additionalDirectories: [join(workspace, "other-root")],
+            mcpServers: [],
+        })).rejects.toMatchObject({
+            code: -32602,
+            message: expect.stringContaining("additionalDirectories is not supported"),
+        });
+
+        const prompts = ["FORK_ONE tell me one", "FORK_TWO tell me two", "FORK_THREE tell me three"];
+        for (const text of prompts) {
+            await expect(client.request("session/prompt", {
+                sessionId,
+                prompt: [{ type: "text", text }],
+            })).resolves.toMatchObject({ stopReason: "end_turn" });
+        }
+        const original = assistantMessages(client.updatesFor(sessionId));
+        expect(original.map((message) => message.text)).toEqual(["Same", "Second", "Same"]);
+        const second = original[1];
+        expect(second).toBeDefined();
+
+        const whole = await client.request("session/fork", {
+            sessionId,
+            cwd: workspace,
+            mcpServers: [],
+        }) as { sessionId: string; modes: { currentModeId: string }; configOptions?: unknown[] };
+        expect(whole.sessionId).not.toBe(sessionId);
+        expect(whole.modes.currentModeId).toBeTruthy();
+        expect(whole.configOptions?.length).toBeGreaterThan(0);
+
+        const inclusive = await client.request("session/fork", {
+            sessionId,
+            cwd: workspace,
+            mcpServers: [],
+            _meta: {
+                jetbrains: {
+                    air: {
+                        fork: {
+                            version: 1,
+                            messageId: second!.messageId,
+                            messageFingerprint: messageFingerprint(second!.text),
+                            messageOccurrence: 1,
+                        },
+                    },
+                },
+            },
+        }) as { sessionId: string; modes: unknown; configOptions?: unknown[] };
+        expect(inclusive.sessionId).not.toBe(sessionId);
+        expect(inclusive.sessionId).not.toBe(whole.sessionId);
+        expect(inclusive.modes).toBeTruthy();
+        expect(inclusive.configOptions?.length).toBeGreaterThan(0);
+
+        const secondSame = await client.request("session/fork", {
+            sessionId,
+            cwd: workspace,
+            mcpServers: [],
+            _meta: {
+                jetbrains: {
+                    air: {
+                        fork: {
+                            version: 1,
+                            messageId: `${second!.messageId}:segment:0`,
+                            messageFingerprint: messageFingerprint("Same"),
+                            messageOccurrence: 2,
+                        },
+                    },
+                },
+            },
+        }) as { sessionId: string };
+        expect(secondSame.sessionId).not.toBe(sessionId);
+
+        await expect(client.request("session/fork", {
+            sessionId,
+            cwd: workspace,
+            mcpServers: [],
+            _meta: {
+                jetbrains: {
+                    air: {
+                        fork: {
+                            version: 1,
+                            messageId: "missing-point",
+                            messageFingerprint: messageFingerprint("no such reply"),
+                        },
+                    },
+                },
+            },
+        })).rejects.toMatchObject({
+            code: -32602,
+            message: expect.stringContaining("Fork point message missing-point was not found in session"),
+        });
+
+        await expect(client.request("session/fork", {
+            sessionId,
+            cwd: workspace,
+            mcpServers: [],
+            _meta: { jetbrains: { air: { fork: { version: 2, messageId: second!.messageId } } } },
+        })).rejects.toMatchObject({
+            code: -32602,
+            message: expect.stringContaining("Unsupported jetbrains.air.fork version"),
+        });
+
+        await expect(client.request("session/fork", {
+            sessionId: "11111111-1111-4111-8111-111111111111",
+            cwd: workspace,
+            mcpServers: [],
+        })).rejects.toMatchObject({
+            code: -32602,
+            message: expect.stringContaining("unknown session"),
+        });
+
+        const listed = await client.request("session/list", { cwd: workspace }) as {
+            sessions: Array<{ sessionId: string }>;
+        };
+        const listedIds = listed.sessions.map((session) => session.sessionId);
+        expect(listedIds).toEqual(expect.arrayContaining([sessionId, whole.sessionId, inclusive.sessionId, secondSame.sessionId]));
+
+        await expect(client.request("session/load", {
+            sessionId: inclusive.sessionId,
+            cwd: workspace,
+            mcpServers: [],
+        })).resolves.toMatchObject({ modes: expect.any(Object) });
+        const replay = assistantMessages(client.updatesFor(inclusive.sessionId));
+        expect(replay.map((message) => message.text)).toEqual(["Same", "Second"]);
+        expect(replay.at(-1)?.messageId).toBe(second!.messageId);
+        const replayUsers = userTexts(client.updatesFor(inclusive.sessionId));
+        expect(replayUsers.some((text) => text.includes("FORK_ONE"))).toBe(true);
+        expect(replayUsers.some((text) => text.includes("FORK_TWO"))).toBe(true);
+        expect(replayUsers.some((text) => text.includes("FORK_THREE"))).toBe(false);
+
+        const beforeContinue = promptBodies.length;
+        await expect(client.request("session/prompt", {
+            sessionId: inclusive.sessionId,
+            prompt: [{ type: "text", text: "FORK_AFTER continue" }],
+        })).resolves.toMatchObject({ stopReason: "end_turn" });
+        expect(assistantMessages(client.updatesFor(inclusive.sessionId)).map((message) => message.text)).toEqual([
+            "Same",
+            "Second",
+            "Continued",
+        ]);
+        const continued = promptBodies[beforeContinue];
+        expect(continued).toBeDefined();
+        expect(continued).toContain("FORK_TWO");
+        expect(continued).toContain("Second");
+        expect(continued).not.toContain("FORK_THREE");
+
+        await expect(client.request("session/load", {
+            sessionId: whole.sessionId,
+            cwd: workspace,
+            mcpServers: [],
+        })).resolves.toMatchObject({ modes: expect.any(Object) });
+        expect(assistantMessages(client.updatesFor(whole.sessionId)).map((message) => message.text)).toEqual([
+            "Same",
+            "Second",
+            "Same",
+        ]);
+        await expect(client.request("session/resume", {
+            sessionId: whole.sessionId,
+            cwd: workspace,
+            mcpServers: [],
+        })).resolves.toMatchObject({ modes: expect.any(Object) });
+        await expect(client.request("session/prompt", {
+            sessionId: whole.sessionId,
+            prompt: [{ type: "text", text: "/status" }],
+        })).resolves.toMatchObject({ stopReason: "end_turn" });
+
+        await expect(client.request("session/load", {
+            sessionId: secondSame.sessionId,
+            cwd: workspace,
+            mcpServers: [],
+        })).resolves.toMatchObject({ modes: expect.any(Object) });
+        expect(assistantMessages(client.updatesFor(secondSame.sessionId)).map((message) => message.text)).toEqual([
+            "Same",
+            "Second",
+            "Same",
+        ]);
+        expect(userTexts(client.updatesFor(secondSame.sessionId)).some((text) => text.includes("FORK_THREE"))).toBe(true);
+
+        const sourceReplayAt = client.notifications.length;
+        await expect(client.request("session/load", {
+            sessionId,
+            cwd: workspace,
+            mcpServers: [],
+        })).resolves.toMatchObject({ modes: expect.any(Object) });
+        expect(assistantMessages(updatesSince(client, sessionId, sourceReplayAt)).map((message) => message.text)).toEqual([
+            "Same",
+            "Second",
+            "Same",
+        ]);
+        const beforeSource = promptBodies.length;
+        await expect(client.request("session/prompt", {
+            sessionId,
+            prompt: [{ type: "text", text: "FORK_SOURCE_AGAIN still here" }],
+        })).resolves.toMatchObject({ stopReason: "end_turn" });
+        expect(promptBodies[beforeSource]).toContain("FORK_THREE");
+        expect(assistantMessages(client.updatesFor(sessionId)).at(-1)?.text).toBe("Source still open");
+    }, 180_000);
 });
