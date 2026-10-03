@@ -2,7 +2,10 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it as vitestIt } from "vitest";
+
+// Windows CI git init/commit is slow; this file builds several temporary repositories.
+const it = (name, fn) => vitestIt(name, fn, 60_000);
 import { fileURLToPath } from "node:url";
 import {
     classifyBump,
