@@ -10,11 +10,11 @@
 
 import { spawnSync } from "node:child_process";
 
-import { HarnessNotFoundError, resolveHost } from "./harness.ts";
+import { HarnessCompatibilityError, HarnessNotFoundError, resolveHost } from "./harness.ts";
 import { bootAcpProfile, type BootedContext } from "./profile-boot.ts";
 import { runLogin } from "./login.ts";
-import { logDebug, logError, logInfo } from "./log.ts";
-import { HELP_TEXT, resolveSettings, SettingsError } from "./settings.ts";
+import { logError, logInfo } from "./log.ts";
+import { explicitDshPath, HELP_TEXT, resolveSettings, SettingsError } from "./settings.ts";
 import { VERSION } from "./version.ts";
 
 const NAME = "@openma/deepseek-harness-acp";
@@ -35,10 +35,10 @@ async function main(): Promise<void> {
         // key lands in the shared harness credential store.
         let booted: BootedContext;
         try {
-            const host = resolveHost(undefined);
+            const host = resolveHost(explicitDshPath(argv));
             booted = await bootAcpProfile(host, { serve: false });
         } catch (error: unknown) {
-            if (error instanceof HarnessNotFoundError) {
+            if (error instanceof HarnessNotFoundError || error instanceof HarnessCompatibilityError) {
                 logError(error.message);
                 process.exitCode = 1;
                 return;
@@ -46,9 +46,21 @@ async function main(): Promise<void> {
             throw error;
         }
         try {
+            // login's own parser treats leftover positionals as the key —
+            // strip the already-consumed host selection flags first.
+            const loginArgv: string[] = [];
+            for (let i = 1; i < argv.length; i += 1) {
+                const arg = argv[i];
+                if (arg === "--dsh-path") {
+                    i += 1;
+                    continue;
+                }
+                if (arg !== undefined && arg.startsWith("--dsh-path=")) continue;
+                if (arg !== undefined) loginArgv.push(arg);
+            }
             process.exitCode = await runLogin(
                 booted as unknown as Parameters<typeof runLogin>[0],
-                argv.slice(1),
+                loginArgv,
             );
         } finally {
             await booted.fiber.dispose().catch(() => undefined);
@@ -85,7 +97,9 @@ async function main(): Promise<void> {
     let ctx: { fiber: { dispose(): Promise<void> } };
     try {
         const host = resolveHost(settings.dshPath);
-        logDebug(`harness host: ${host.base} via ${host.source} (${host.version ?? "unknown version"})`);
+        // Always visible on stderr: the resolved runtime is the first thing a
+        // user needs to know when ambient dsh installs exist (issue #157).
+        logInfo(`harness host: @deepseek-ai/dsh ${host.dshVersion ?? "unknown version"} via ${host.source} (${host.base})`);
         if (process.env["DSH_ACP_COMPOSE"] === "spine") {
             logError(
                 "DSH_ACP_COMPOSE=spine is no longer supported: the ACP bridge injects dsh-base services (credentials, models, permissions, presets). Unset DSH_ACP_COMPOSE to use the profile engine.",
@@ -104,7 +118,7 @@ async function main(): Promise<void> {
         });
         ctx = booted;
     } catch (error: unknown) {
-        if (error instanceof HarnessNotFoundError) {
+        if (error instanceof HarnessNotFoundError || error instanceof HarnessCompatibilityError) {
             logError(error.message);
             process.exitCode = 1;
             return;

@@ -10,11 +10,11 @@
 
 import { createHash } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { zstdDecompressSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import { createServer, type Server, type ServerResponse } from "node:http";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const ROOT = join(import.meta.dirname, "..");
@@ -108,7 +108,10 @@ class AcpTestClient {
             // Host-default tests must not inherit the developer shell's
             // explicit per-process override.
             DSH_PERMISSION_MODE: undefined,
-            ...(dshPath !== undefined ? { DSH_PATH: dshPath } : {}),
+            // The dev checkout's own node_modules is the explicit host for
+            // e2e; without it the launcher would (correctly) use only the
+            // packaged runtime, which isn't installed in a checkout.
+            DSH_PATH: dshPath ?? ROOT,
             ...(envPatch ?? {}),
         };
         for (const [key, value] of Object.entries(env)) if (value === undefined) delete env[key];
@@ -870,7 +873,16 @@ describe("dsh-acp server (e2e smoke)", () => {
         expect(capabilities["auth"]).toEqual({ logout: {} });
         expect(capabilities["sessionCapabilities"]).toMatchObject({ list: {}, resume: {}, fork: {} });
         expect(capabilities["_meta"]).toMatchObject({
-            dsh: { cordis: { protocol: 0 } },
+            dsh: {
+                cordis: { protocol: 0 },
+                // The resolved runtime identity — the client can display which
+                // dsh actually booted (issue #157); this e2e host came from DSH_PATH.
+                runtime: {
+                    version: "0.2.0-rc.2",
+                    source: `--dsh-path/DSH_PATH (${ROOT})`,
+                    base: expect.any(String),
+                },
+            },
             jetbrains: { air: { fork: { version: 1, inclusive: true } } },
         });
         const methods = result["authMethods"] as Array<Record<string, unknown>>;
@@ -1333,6 +1345,79 @@ describe.skipIf(HOST_TREE === undefined)("dsh-acp against a standalone host inst
         })) as Record<string, unknown>;
         expect(status["stopReason"]).toBe("end_turn");
     }, 120_000);
+});
+
+// Harness selection (Martty issue #157): ambient dsh installs must never
+// hijack the runtime, and an explicit out-of-range selection is refused
+// with a message naming version, source and supported range.
+describe("harness selection", () => {
+    function spawnLauncher(env: Record<string, string | undefined>): Promise<{ code: number; stderr: string }> {
+        const merged: Record<string, string | undefined> = {
+            ...process.env,
+            DEEPSEEK_API_KEY: "sk-test-e2e-not-a-real-key",
+            ...env,
+        };
+        for (const [key, value] of Object.entries(merged)) if (value === undefined) delete merged[key];
+        return new Promise((resolve, reject) => {
+            const child = spawn(process.execPath, ["--import", "tsx", "src/bin.ts"], {
+                cwd: ROOT,
+                env: merged as Record<string, string>,
+                stdio: ["ignore", "ignore", "pipe"],
+            });
+            let stderr = "";
+            child.stderr.on("data", (chunk: string) => {
+                stderr += chunk;
+            });
+            child.on("error", reject);
+            child.on("exit", (code) => resolve({ code: code ?? -1, stderr }));
+        });
+    }
+
+    it("uses the bundled runtime even with a stale dsh on PATH — never the ambient one", async () => {
+        const ambient = mkdtempSync(join(tmpdir(), "dsh-acp-ambient-"));
+        const stalePkg = join(ambient, "prefix", "lib", "node_modules", "@deepseek-ai");
+        mkdirSync(join(stalePkg, "dsh", "lib"), { recursive: true });
+        writeFileSync(join(stalePkg, "dsh", "package.json"), JSON.stringify({ name: "@deepseek-ai/dsh", version: "0.1.1-rc.2" }));
+        writeFileSync(join(stalePkg, "dsh", "lib", "bin.js"), "// stale launcher");
+        mkdirSync(join(stalePkg, "dsh-agent"), { recursive: true });
+        writeFileSync(join(stalePkg, "dsh-agent", "package.json"), JSON.stringify({ name: "@deepseek-ai/dsh-agent", version: "0.1.1-rc.2" }));
+        mkdirSync(join(ambient, "prefix", "bin"), { recursive: true });
+        symlinkSync(join(stalePkg, "dsh", "lib", "bin.js"), join(ambient, "prefix", "bin", "dsh"));
+        try {
+            const result = await spawnLauncher({
+                DSH_PATH: undefined,
+                DSH_ACP_HOST: undefined,
+                PATH: `${join(ambient, "prefix", "bin")}${delimiter}${process.env["PATH"] ?? ""}`,
+            });
+            // The dev checkout has no packaged runtime, so the launcher must
+            // fail on the bundled probe alone — proving the stale dsh on PATH
+            // was never consulted (its version must not appear anywhere).
+            expect(result.code).not.toBe(0);
+            expect(result.stderr).toContain("bundled standalone runtime");
+            expect(result.stderr).not.toContain("0.1.1-rc.2");
+        } finally {
+            rmSync(ambient, { recursive: true, force: true });
+        }
+    }, 60_000);
+
+    it("refuses an explicit out-of-range dsh path, naming version, source and supported range", async () => {
+        const stale = mkdtempSync(join(tmpdir(), "dsh-acp-stale-"));
+        const scope = join(stale, "node_modules", "@deepseek-ai");
+        mkdirSync(join(scope, "dsh"), { recursive: true });
+        writeFileSync(join(scope, "dsh", "package.json"), JSON.stringify({ name: "@deepseek-ai/dsh", version: "0.1.1-rc.2" }));
+        mkdirSync(join(scope, "dsh-agent"), { recursive: true });
+        writeFileSync(join(scope, "dsh-agent", "package.json"), JSON.stringify({ name: "@deepseek-ai/dsh-agent", version: "0.1.1-rc.2" }));
+        try {
+            const result = await spawnLauncher({ DSH_PATH: stale });
+            expect(result.code).not.toBe(0);
+            expect(result.stderr).toContain("incompatible DeepSeek Harness");
+            expect(result.stderr).toContain("0.1.1-rc.2");
+            expect(result.stderr).toContain(stale);
+            expect(result.stderr).toContain("0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2");
+        } finally {
+            rmSync(stale, { recursive: true, force: true });
+        }
+    }, 60_000);
 });
 
 // Only fixed backends participate in cross-process ownership. Older hosts

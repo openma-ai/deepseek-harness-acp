@@ -1,18 +1,26 @@
 /**
  * DeepSeek Harness host discovery and module loading.
  *
- * dsh-acp prefers a user-provided DeepSeek Harness and falls back to the
- * immutable runtime shipped as an opaque asset in the standalone package.
- * The embedded Cordis plugin never imports this module or the private runtime.
+ * The standalone launcher uses exactly one DeepSeek Harness installation:
+ *   - an explicit selection — `--dsh-path` / `DSH_PATH` / `DSH_ACP_HOST`: a
+ *     `dsh` binary path, the `@deepseek-ai/dsh` package directory, an npm
+ *     prefix, or any directory whose `node_modules` carries the
+ *     `@deepseek-ai` scope (the literal value {@link BUNDLED_HOST} names the
+ *     packaged runtime explicitly);
+ *   - otherwise, the package's own integrity-checked, cached standalone
+ *     runtime — always, no matter who launched the process.
  *
- * Resolution order:
- *   1. `--dsh-path` / `DSH_PATH` — a `dsh` binary path, the `@deepseek-ai/dsh`
- *      package directory, an npm prefix, or any directory whose
- *      `node_modules` carries the `@deepseek-ai` scope.
- *   2. `./node_modules` of the invoking directory.
- *   3. `dsh` on PATH — the normal case after `npm install -g @deepseek-ai/dsh`.
- *   4. The global npm root (`npm root -g`).
- *   5. The package's integrity-checked, cached standalone runtime.
+ * Implicit discovery (a `dsh` on PATH, in the invoking directory, or in
+ * global npm) is deliberately absent: an unrelated or stale install must
+ * never hijack the runtime an embedder shipped (Martty issue #157). When
+ * dsh-acp is mounted as a Cordis plugin instead — Martty's plugin-mode
+ * launch — `src/plugin.ts` makes the mounting host the runtime, checking it
+ * against the same range.
+ *
+ * Every selected installation is checked against the `@deepseek-ai/dsh`
+ * version range declared in `peerDependencies`; an out-of-range selection
+ * fails with a message naming the version found, where it came from, and
+ * the supported range.
  *
  * Modules are imported from the resolved tree with Node's ascending
  * `node_modules` walk, honoring package `exports` maps (including subpaths
@@ -21,13 +29,21 @@
  * never split across two cordis copies.
  */
 
-import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
-import { pathToFileURL, fileURLToPath } from "node:url";
+import { dirname, join, resolve, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 
+import { dshVersionSupported, refusalMessage, supportedDshRange } from "./compat.ts";
 import { logDebug } from "./log.ts";
 import { resolveVendoredRuntime } from "./runtime.ts";
+
+export { supportedDshRange };
+
+/**
+ * The explicit `--dsh-path`/`DSH_PATH`/`DSH_ACP_HOST` value that names the
+ * packaged standalone runtime — also the default when nothing is selected.
+ */
+export const BUNDLED_HOST = "bundled";
 
 /** A resolved DeepSeek Harness installation. */
 export interface HarnessHost {
@@ -35,6 +51,8 @@ export interface HarnessHost {
     base: string;
     /** Version of the anchor package the host was validated against. */
     version: string | undefined;
+    /** Version of the `@deepseek-ai/dsh` launcher, checked for compatibility. */
+    dshVersion: string | undefined;
     /** How the host was found (for diagnostics). */
     source: string;
 }
@@ -43,17 +61,36 @@ export class HarnessNotFoundError extends Error {
     constructor(probed: string[]) {
         super(
             [
-                "could not find a DeepSeek Harness installation.",
+                "could not find a usable DeepSeek Harness runtime.",
                 "",
                 "The bundled DeepSeek Harness runtime is missing or invalid.",
                 "Reinstall @openma/deepseek-harness-acp, or point it at an existing installation:",
                 "    DSH_PATH=/path/to/dsh dsh-acp        (dsh binary, package dir, or npm root)",
                 "",
-                probed.length > 0 ? `Probed:\n${probed.map((p) => `    ${p}`).join("\n")}` : "",
+                probed.length > 0 ? `Looked at:\n${probed.map((p) => `    ${p}`).join("\n")}` : "",
             ]
                 .join("\n")
                 .trimEnd(),
         );
+    }
+}
+
+/** A discovered installation outside the supported `@deepseek-ai/dsh` range. */
+export class HarnessCompatibilityError extends Error {
+    constructor(
+        public readonly host: HarnessHost,
+        public readonly supported: string,
+    ) {
+        super(
+            [
+                refusalMessage(host.dshVersion ?? "unknown version", host.source, supported),
+                "",
+                "Upgrade it (npm install -g @deepseek-ai/dsh@latest), remove it,",
+                "or use the packaged runtime instead:",
+                "    dsh-acp --dsh-path bundled",
+            ].join("\n"),
+        );
+        this.name = "HarnessCompatibilityError";
     }
 }
 
@@ -92,7 +129,7 @@ function hostAt(base: string, source: string): HarnessHost | undefined {
     const anchor = packageDirFrom(base, ANCHOR);
     const launcher = packageDirFrom(base, PROFILE_LAUNCHER);
     if (anchor === undefined || launcher === undefined) return undefined;
-    return { base: resolve(base), version: versionOf(anchor), source };
+    return { base: resolve(base), version: versionOf(anchor), dshVersion: versionOf(launcher), source };
 }
 
 /** Interpret an explicit --dsh-path/DSH_PATH value (binary, package dir, prefix…). */
@@ -124,64 +161,32 @@ function hostFromExplicit(explicit: string): HarnessHost | undefined {
     return undefined;
 }
 
-function hostFromPathLookup(): HarnessHost | undefined {
-    const pathEnv = process.env["PATH"] ?? "";
-    for (const dir of pathEnv.split(delimiter)) {
-        if (dir.length === 0) continue;
-        const candidate = join(dir, "dsh");
-        if (!existsSync(candidate)) continue;
-        try {
-            const real = realpathSync(candidate);
-            const host = hostAt(dirname(real), `dsh on PATH (${candidate})`);
-            if (host !== undefined) return host;
-        } catch {
-            continue;
-        }
-    }
-    return undefined;
-}
-
-function hostFromGlobalNpm(): HarnessHost | undefined {
-    try {
-        const root = execFileSync("npm", ["root", "-g"], { encoding: "utf8", timeout: 10_000 }).trim();
-        if (root.length > 0 && isAbsolute(root)) return hostAt(root, `npm root -g (${root})`);
-    } catch {
-        // npm unavailable; fine.
-    }
-    return undefined;
-}
-
 /**
- * Find a harness installation.
+ * Resolve the single DeepSeek Harness installation this process uses.
  *
- * @throws HarnessNotFoundError with the probed locations when nothing matches.
+ * An explicit selection is validated and compatibility-checked; with no
+ * selection (or the literal {@link BUNDLED_HOST}) the packaged runtime is
+ * the only host — ambient installs are never consulted.
+ *
+ * @throws HarnessNotFoundError when the selection names nothing usable.
+ * @throws HarnessCompatibilityError when it names an out-of-range install.
  */
 export function resolveHost(explicit?: string): HarnessHost {
-    const probed: string[] = [];
-    if (explicit !== undefined) {
+    if (explicit !== undefined && explicit !== BUNDLED_HOST) {
         const host = hostFromExplicit(explicit);
-        if (host !== undefined) return host;
-        probed.push(`--dsh-path/DSH_PATH: ${explicit}`);
+        if (host !== undefined) {
+            if (!dshVersionSupported(host.dshVersion)) throw new HarnessCompatibilityError(host, supportedDshRange());
+            return host;
+        }
         // An explicit path that does not resolve is an error, not a fallback:
         // silently using another installation would be worse than failing.
-        throw new HarnessNotFoundError(probed);
+        throw new HarnessNotFoundError([`--dsh-path/DSH_PATH: ${explicit}`]);
     }
-    const local = hostAt(process.cwd(), `invoking directory (${process.cwd()})`);
-    if (local !== undefined) return local;
-    probed.push(`invoking directory: ${process.cwd()}`);
-    const onPath = hostFromPathLookup();
-    if (onPath !== undefined) return onPath;
-    probed.push("dsh on PATH");
-    const globalNpm = hostFromGlobalNpm();
-    if (globalNpm !== undefined) return globalNpm;
-    probed.push("npm root -g");
     const vendored = resolveVendoredRuntime();
-    if (vendored !== undefined) {
-        const host = hostAt(vendored, "bundled standalone runtime");
-        if (host !== undefined) return host;
-    }
-    probed.push("bundled standalone runtime");
-    throw new HarnessNotFoundError(probed);
+    const host = vendored === undefined ? undefined : hostAt(vendored, "bundled standalone runtime");
+    if (host === undefined) throw new HarnessNotFoundError(["bundled standalone runtime"]);
+    if (!dshVersionSupported(host.dshVersion)) throw new HarnessCompatibilityError(host, supportedDshRange());
+    return host;
 }
 
 // ---------------------------------------------------------------------------

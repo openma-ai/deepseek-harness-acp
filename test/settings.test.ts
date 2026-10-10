@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { resolveSettings, SettingsError } from "../src/settings.ts";
+import { explicitDshPath, resolveSettings, SettingsError } from "../src/settings.ts";
 
 const ENV_KEYS = [
+    "DSH_PATH",
+    "DSH_ACP_HOST",
     "DSH_MODEL",
     "DSH_PROVIDER",
     "DSH_ACP_MODELS",
@@ -59,6 +61,20 @@ describe("resolveSettings", () => {
         expect(settings.bundles).toEqual(["/plugins/creator", "/plugins/team-policy"]);
         expect(settings.permissionMode).toBe("read-only");
         expect(settings.thinking).toBe(false);
+    });
+
+    it("resolves the explicit harness selection: flag, DSH_ACP_HOST, then DSH_PATH", () => {
+        expect(explicitDshPath([])).toBeUndefined();
+        process.env["DSH_PATH"] = "/env/dsh";
+        expect(explicitDshPath([])).toBe("/env/dsh");
+        expect(resolveSettings([]).dshPath).toBe("/env/dsh");
+        process.env["DSH_ACP_HOST"] = "bundled";
+        expect(explicitDshPath([])).toBe("bundled");
+        expect(resolveSettings([]).dshPath).toBe("bundled");
+        expect(explicitDshPath(["--dsh-path", "/flag/dsh"])).toBe("/flag/dsh");
+        expect(explicitDshPath(["--dsh-path=/eq/dsh"])).toBe("/eq/dsh");
+        expect(explicitDshPath(["--other", "--dsh-path=/late/dsh"])).toBe("/late/dsh");
+        expect(resolveSettings(["--dsh-path", "/flag/dsh"]).dshPath).toBe("/flag/dsh");
     });
 
     it("rejects invalid values loudly", () => {

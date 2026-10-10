@@ -21,7 +21,29 @@ for (const name of ["dsh-cordis-host-runner", "dsh-agent-presets"]) {
     if (name === "dsh-agent-presets") mkdirSync(join(packageRoot, "presets"));
 }
 writeFileSync(join(legacyHost, "host.js"), "");
-afterAll(() => rmSync(legacyHost, { recursive: true, force: true }));
+
+// A host dsh outside the supported range: plugin mode must refuse it with a
+// clear message rather than failing deep inside the composition (#157).
+const staleHost = mkdtempSync(join(tmpdir(), "dsh-acp-stale-host-"));
+mkdirSync(join(staleHost, "node_modules", "@deepseek-ai", "dsh"), { recursive: true });
+writeFileSync(
+    join(staleHost, "node_modules", "@deepseek-ai", "dsh", "package.json"),
+    JSON.stringify({ name: "@deepseek-ai/dsh", version: "0.1.1-rc.2" }),
+);
+writeFileSync(join(staleHost, "host.js"), "");
+// A host dsh whose manifest carries no parseable version: refused as unknown.
+const versionlessHost = mkdtempSync(join(tmpdir(), "dsh-acp-versionless-host-"));
+mkdirSync(join(versionlessHost, "node_modules", "@deepseek-ai", "dsh"), { recursive: true });
+writeFileSync(
+    join(versionlessHost, "node_modules", "@deepseek-ai", "dsh", "package.json"),
+    JSON.stringify({ name: "@deepseek-ai/dsh" }),
+);
+writeFileSync(join(versionlessHost, "host.js"), "");
+afterAll(() => {
+    rmSync(legacyHost, { recursive: true, force: true });
+    rmSync(staleHost, { recursive: true, force: true });
+    rmSync(versionlessHost, { recursive: true, force: true });
+});
 
 describe("embeddable ACP Host plugin", () => {
     it.each(["current", "legacy"] as const)("resolves %s Host preset capabilities", async (generation) => {
@@ -83,6 +105,81 @@ describe("embeddable ACP Host plugin", () => {
         expect(names.some((name) => name.includes("dsh-tool-subagent"))).toBe(generation === "current");
         expect(services.has("acpServer")).toBe(true);
         expect(bases).toEqual(Array(generation === "current" ? 7 : 2).fill(hostBase));
+    });
+
+    it("refuses a host dsh outside the supported range, naming version, source and range", async () => {
+        const services = new Map<string, unknown>();
+        const ctx = {
+            baseUrl: pathToFileURL(join(staleHost, "host.js")).href,
+            get(name: string) {
+                return services.get(name);
+            },
+            loader: {
+                async import() {
+                    throw new Error("no mount should be attempted for an incompatible host");
+                },
+                unwrapExports(exports: unknown) {
+                    return exports;
+                },
+            },
+            async plugin() {
+                throw new Error("no mount should be attempted for an incompatible host");
+            },
+        };
+        const plugin = await import("../src/plugin.ts");
+        await expect(plugin.apply(ctx as never)).rejects.toThrow(/incompatible DeepSeek Harness/);
+        await expect(plugin.apply(ctx as never)).rejects.toThrow(/0\.1\.1-rc\.2/);
+        await expect(plugin.apply(ctx as never)).rejects.toThrow(/0\.1\.7-rc\.2 \|\| 0\.2\.0-rc\.1 \|\| 0\.2\.0-rc\.2/);
+        await expect(plugin.apply(ctx as never)).rejects.toThrow(/dsh plugin host/);
+    });
+
+    it("reports an unversioned host dsh as 'unknown version' in the refusal", async () => {
+        const services = new Map<string, unknown>();
+        const ctx = {
+            baseUrl: pathToFileURL(join(versionlessHost, "host.js")).href,
+            get(name: string) {
+                return services.get(name);
+            },
+            loader: {
+                async import() {
+                    throw new Error("no mount should be attempted for an incompatible host");
+                },
+                unwrapExports(exports: unknown) {
+                    return exports;
+                },
+            },
+            async plugin() {
+                throw new Error("no mount should be attempted for an incompatible host");
+            },
+        };
+        const plugin = await import("../src/plugin.ts");
+        await expect(plugin.apply(ctx as never)).rejects.toThrow(/unknown version/);
+        await expect(plugin.apply(ctx as never)).rejects.toThrow(/incompatible DeepSeek Harness/);
+    });
+
+    it("falls back to the module's own url when the context carries no baseUrl", async () => {
+        const services = new Map<string, unknown>();
+        const ctx = {
+            get(name: string) {
+                return services.get(name);
+            },
+            loader: {
+                async import(specifier: string) {
+                    throw new Error(`stop after the gate: ${specifier}`);
+                },
+                unwrapExports(exports: unknown) {
+                    return exports;
+                },
+            },
+            async plugin() {
+                throw new Error("stop after the gate");
+            },
+        };
+        const plugin = await import("../src/plugin.ts");
+        // baseUrl is absent: the check anchors on import.meta.url, which
+        // resolves this repo's supported @deepseek-ai/dsh — so the failure
+        // comes from the mount path, never the compatibility refusal.
+        await expect(plugin.apply(ctx as never)).rejects.not.toThrow(/incompatible DeepSeek Harness/);
     });
 
     it("mounts only the ACP server when the surface already provides agentPresets and dynamicCordisRunner", async () => {

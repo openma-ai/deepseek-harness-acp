@@ -2,19 +2,12 @@
 
 import { registerHooks } from "node:module";
 
-import { HarnessNotFoundError, hostModuleUrl, resolveHost } from "./harness.ts";
+import { HarnessCompatibilityError, HarnessNotFoundError, hostModuleUrl, resolveHost } from "./harness.ts";
 import { logError } from "./log.ts";
-import { HELP_TEXT } from "./settings.ts";
+import { explicitDshPath, HELP_TEXT } from "./settings.ts";
 import { VERSION } from "./version.ts";
 
 const NAME = "@openma/deepseek-harness-acp";
-
-function explicitDshPath(argv: string[]): string | undefined {
-    const index = argv.indexOf("--dsh-path");
-    if (index >= 0) return argv[index + 1];
-    const env = process.env["DSH_PATH"];
-    return env !== undefined && env.length > 0 ? env : undefined;
-}
 
 async function bootstrap(): Promise<void> {
     const argv = process.argv.slice(2);
@@ -31,7 +24,7 @@ async function bootstrap(): Promise<void> {
     try {
         host = resolveHost(explicitDshPath(argv));
     } catch (error: unknown) {
-        if (error instanceof HarnessNotFoundError) {
+        if (error instanceof HarnessNotFoundError || error instanceof HarnessCompatibilityError) {
             logError(error.message);
             process.exitCode = 1;
             return;

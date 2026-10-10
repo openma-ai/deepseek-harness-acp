@@ -32,7 +32,10 @@ extension disabled.
 
 The adapter advertises the Cordis protocol and inclusive session fork in the
 initialize response. The objects are deep-merged under `agentCapabilities._meta`;
-neither replaces the other.
+neither replaces the other. `_meta.dsh.runtime` identifies the DeepSeek
+Harness installation actually in use (`{base, version, source}`), so clients
+can display which dsh booted; it is present on the standalone and plugin
+mounts and absent only where no host identity was provided.
 
 ```json
 {
@@ -44,6 +47,11 @@ neither replaces the other.
       "dsh": {
         "cordis": {
           "protocol": 0
+        },
+        "runtime": {
+          "version": "0.2.0-rc.2",
+          "source": "bundled standalone runtime",
+          "base": "/home/user/.cache/dsh-acp/0.2.0-rc.2-a1b2c3d4e5f6"
         }
       },
       "jetbrains": {

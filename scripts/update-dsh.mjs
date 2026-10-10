@@ -21,6 +21,9 @@ const matrix = versions.slice(0, latestIndex + 1).filter((version) => supported.
 if (matrix.length !== 3) throw new Error("Need three published release/RC versions");
 const previous = manifest.dshAcp.standaloneDsh;
 manifest.dshAcp.standaloneDsh = latest;
+// The declared compatibility range is the union of the tested matrix —
+// src/harness.ts and src/plugin.ts enforce it at resolution/mount time.
+manifest.peerDependencies["@deepseek-ai/dsh"] = matrix.join(" || ");
 for (const name of Object.keys(manifest.devDependencies)) {
     if (name === "@deepseek-ai/dsh" || name.startsWith("@deepseek-ai/dsh-")) manifest.devDependencies[name] = latest;
 }

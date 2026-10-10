@@ -296,6 +296,20 @@ function authRequired(detail: string): RequestError {
     return RequestError.authRequired(undefined, detail);
 }
 
+/** Runtime identity provided by the standalone launcher; absent in profile mounts. */
+export function dshAcpRuntimeOf(
+    host: unknown,
+): { base: string; version: string | undefined; source: string } | undefined {
+    if (typeof host !== "object" || host === null) return undefined;
+    const record = host as { base?: unknown; version?: unknown; source?: unknown };
+    if (typeof record.base !== "string" || typeof record.source !== "string") return undefined;
+    return {
+        base: record.base,
+        version: typeof record.version === "string" ? record.version : undefined,
+        source: record.source,
+    };
+}
+
 const MODE_LABELS: Record<SandboxMode, { name: string; description: string }> = {
     "read-only": { name: "Read-only", description: "Bash and file mutations are denied by the sandbox" },
     "workspace-write": {
@@ -2041,8 +2055,16 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     agentInfo: { name: "dsh-acp", title: "DeepSeek Harness", version: VERSION },
                     agentCapabilities: {
                         // Deep-merge: dsh.cordis and the inclusive fork capability stay siblings.
+                        // dsh.runtime carries the resolved host identity so clients
+                        // can display which dsh booted (standalone provides it;
+                        // absent when mounted inside a dsh profile).
                         _meta: {
-                            dsh: { cordis: { ...CORDIS_CAPABILITY } },
+                            dsh: {
+                                cordis: { ...CORDIS_CAPABILITY },
+                                ...(dshAcpRuntimeOf(ctx.get("dshAcpHost")) !== undefined
+                                    ? { runtime: dshAcpRuntimeOf(ctx.get("dshAcpHost")) }
+                                    : {}),
+                            },
                             ...acpInclusiveForkCapabilityMeta(),
                         },
                         loadSession: true,

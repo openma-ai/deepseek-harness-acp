@@ -16,6 +16,7 @@ import { pathToFileURL } from "node:url";
 
 import type { Context } from "@deepseek-ai/cordis";
 
+import { dshVersionAt, dshVersionSupported, refusalMessage, supportedDshRange } from "./compat.ts";
 import * as bridge from "./bridge/index.ts";
 import * as server from "./server.ts";
 import type { Config } from "./server.ts";
@@ -131,6 +132,31 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     // Preset health checks walk ctx.baseUrl on disk, bypassing import hooks.
     const hostBase = ctx.get("dshAcpHostBaseUrl");
     const hostCtx = typeof hostBase === "string" ? ctx.extend({ baseUrl: hostBase }) : ctx;
+    // Compatibility gate (issue #157): when mounted by a host dsh (Martty's
+    // plugin-mode path), that host is the runtime — refuse it with a clear
+    // message when it is outside the supported range instead of failing deep
+    // inside the composition. The standalone path already passed resolveHost's
+    // own gate, so this re-check is a consistent no-op there.
+    const hostDsh = dshVersionAt(String(hostCtx.baseUrl ?? import.meta.url));
+    if (hostDsh !== undefined && !dshVersionSupported(hostDsh.version)) {
+        throw new Error(
+            [
+                refusalMessage(hostDsh.version ?? "unknown version", `dsh plugin host (${hostDsh.base})`, supportedDshRange()),
+                "Upgrade the hosting dsh (npm install -g @deepseek-ai/dsh@latest),",
+                "or run dsh-acp standalone with --dsh-path bundled.",
+            ].join("\n"),
+        );
+    }
+    // Publish the runtime identity for `_meta.dsh.runtime` in the initialize
+    // response so clients can show which dsh is in use. The standalone boot
+    // provides it earlier; plugin mounts fill it here.
+    if (hostDsh !== undefined && ctx.get("dshAcpHost") === undefined) {
+        (ctx as unknown as { provide?: (service: string, value: unknown) => void }).provide?.("dshAcpHost", {
+            base: hostDsh.base,
+            version: hostDsh.version,
+            source: `dsh plugin host (${hostDsh.base})`,
+        });
+    }
     // Newer shipped presets require this Host settings owner; older hosts
     // do not export it and keep their existing delegation behavior.
     const modelSettings = "@deepseek-ai/dsh-tool-subagent/model-selection-settings";

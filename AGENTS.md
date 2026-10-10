@@ -21,4 +21,7 @@
   `src/bridge/` is the ACP ↔ harness session bridge; `cordis.patch.yml` is
   the bundle patch mounted by `dsh plugin add`.
 - Tests: `DSH_ACP_TEST_HOST=/tmp/dsh-probe npm test` (needs a dsh host tree).
-- The user's installed dsh always outranks the vendored fallback.
+- Standalone always uses the vendored runtime unless a harness is named
+  explicitly (`--dsh-path`/`DSH_PATH`/`DSH_ACP_HOST`, or `bundled`);
+  PATH/invoking-dir/global installs are never probed. Plugin mode uses the
+  mounting host dsh. Both are checked against the `peerDependencies` range.

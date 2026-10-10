@@ -334,6 +334,14 @@ export async function bootAcpProfile(
         (hostCtx) => {
             (hostCtx as BootedContext).provide(launchEnvKey, launchEnvironment);
             (hostCtx as BootedContext).provide("dshAcpHostBaseUrl", bareModuleBaseUrl);
+            // Resolved runtime identity, projected to ACP clients through
+            // `agentCapabilities._meta.dsh.runtime` so embedders (Martty
+            // /status) can show which dsh actually booted (issue #157).
+            (hostCtx as BootedContext).provide("dshAcpHost", {
+                base: host.base,
+                version: host.dshVersion ?? host.version,
+                source: host.source,
+            });
             (hostCtx as BootedContext).provide("dshAcpSavePermission", (mode: string) => writeStandalonePermission(home, mode));
             (hostCtx as BootedContext).provide("dshAcpSaveModel", (model: Parameters<typeof writeStandaloneModel>[1]) => writeStandaloneModel(home, model));
             // Explicit Host-service rows bypass the ACP plugin's fallback mount.
