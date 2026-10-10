@@ -119,10 +119,13 @@ describe("resolveHost", () => {
         expect(host.version).toBe(SUPPORTED_VERSION);
     });
 
-    it("fails loudly with installation guidance when the explicit path has no harness", () => {
+    it("fails loudly naming the configured source when the explicit path has no harness", () => {
         const root = makeTree();
         expect(() => resolveHost(root)).toThrow(HarnessNotFoundError);
-        expect(() => resolveHost(root)).toThrow(/Reinstall @openma\/deepseek-harness-acp/);
+        // The refusal names the explicit path, not the bundled runtime.
+        expect(() => resolveHost(root)).toThrow(/--dsh-path\/DSH_PATH is missing or invalid/);
+        expect(() => resolveHost(root)).toThrow(root);
+        expect(() => resolveHost(root)).toThrow(/--dsh-path bundled/);
     });
 
     it("rejects a partial module tree that has dsh-agent but not the dsh profile launcher", () => {

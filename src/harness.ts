@@ -58,19 +58,31 @@ export interface HarnessHost {
 }
 
 export class HarnessNotFoundError extends Error {
-    constructor(probed: string[]) {
+    constructor(probed: string[], explicit?: string) {
         super(
-            [
-                "could not find a usable DeepSeek Harness runtime.",
-                "",
-                "The bundled DeepSeek Harness runtime is missing or invalid.",
-                "Reinstall @openma/deepseek-harness-acp, or point it at an existing installation:",
-                "    DSH_PATH=/path/to/dsh dsh-acp        (dsh binary, package dir, or npm root)",
-                "",
-                probed.length > 0 ? `Looked at:\n${probed.map((p) => `    ${p}`).join("\n")}` : "",
-            ]
-                .join("\n")
-                .trimEnd(),
+            explicit !== undefined
+                ? [
+                      "could not find a usable DeepSeek Harness runtime.",
+                      "",
+                      "The DeepSeek Harness named by --dsh-path/DSH_PATH is missing or invalid:",
+                      `    ${explicit}`,
+                      "Point it at an existing installation (dsh binary, package dir, or npm root),",
+                      "or use the packaged runtime instead:",
+                      "    dsh-acp --dsh-path bundled",
+                  ].join("\n")
+                : [
+                      "could not find a usable DeepSeek Harness runtime.",
+                      "",
+                      "The bundled DeepSeek Harness runtime is missing or invalid.",
+                      "Reinstall @openma/deepseek-harness-acp, or point it at an existing installation:",
+                      "    DSH_PATH=/path/to/dsh dsh-acp        (dsh binary, package dir, or npm root)",
+                      "",
+                      probed.length > 0
+                          ? `Looked at:\n${probed.map((p) => `    ${p}`).join("\n")}`
+                          : "",
+                  ]
+                      .join("\n")
+                      .trimEnd(),
         );
     }
 }
@@ -180,7 +192,7 @@ export function resolveHost(explicit?: string): HarnessHost {
         }
         // An explicit path that does not resolve is an error, not a fallback:
         // silently using another installation would be worse than failing.
-        throw new HarnessNotFoundError([`--dsh-path/DSH_PATH: ${explicit}`]);
+        throw new HarnessNotFoundError([`--dsh-path/DSH_PATH: ${explicit}`], explicit);
     }
     const vendored = resolveVendoredRuntime();
     const host = vendored === undefined ? undefined : hostAt(vendored, "bundled standalone runtime");
