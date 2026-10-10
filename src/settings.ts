@@ -194,8 +194,8 @@ Options:
   --dsh-path <path|bundled>   DeepSeek Harness installation: the dsh binary, its
                               package dir, any dir carrying node_modules/@deepseek-ai,
                               or 'bundled' for the packaged runtime only
-                              (DSH_ACP_HOST, DSH_PATH; auto-detected when unset — own tree,
-                              ./node_modules, dsh on PATH, npm root -g)
+                              (DSH_ACP_HOST, DSH_PATH; default: the packaged runtime —
+                              ambient installs are never probed)
   --bundle <package-dir>      Add a dsh bundle layer to the agent tree (repeatable)
   --provider <route>          Provider route (DSH_PROVIDER, default deepseek-official)
   --model <id>                Default model (DSH_MODEL; otherwise the Host default,

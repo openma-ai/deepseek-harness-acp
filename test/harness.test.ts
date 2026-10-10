@@ -210,7 +210,7 @@ describe("resolveHost compatibility checks", () => {
         expect(() => resolveHost(root)).toThrow(HarnessCompatibilityError);
         expect(() => resolveHost(root)).toThrow(new RegExp(STALE_VERSION.replaceAll(".", "\\.")));
         expect(() => resolveHost(root)).toThrow(/supported versions:/);
-        expect(() => resolveHost(root)).toThrow(new RegExp(root.replaceAll("/", "\\/")));
+        expect(() => resolveHost(root)).toThrow(root);
     });
 
     it("reports the supported range from package metadata", () => {

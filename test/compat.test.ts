@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -64,13 +64,14 @@ describe("dshVersionAt", () => {
     it("reports the launcher version and package dir resolvable from an anchor", () => {
         const root = makeTree();
         const dir = writeDsh(root, { name: "@deepseek-ai/dsh", version: "0.2.0-rc.2" });
-        expect(dshVersionAt(join(root, "probe.mjs"))).toEqual({ version: "0.2.0-rc.2", base: dir });
+        // Module resolution realpaths the package dir (macOS /var → /private/var).
+        expect(dshVersionAt(join(root, "probe.mjs"))).toEqual({ version: "0.2.0-rc.2", base: realpathSync(dir) });
     });
 
     it("reports an unknown version when the manifest carries no string version", () => {
         const root = makeTree();
         const dir = writeDsh(root, { name: "@deepseek-ai/dsh" });
-        expect(dshVersionAt(join(root, "probe.mjs"))).toEqual({ version: undefined, base: dir });
+        expect(dshVersionAt(join(root, "probe.mjs"))).toEqual({ version: undefined, base: realpathSync(dir) });
     });
 
     it("returns undefined when no @deepseek-ai/dsh resolves from the anchor", () => {

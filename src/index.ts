@@ -19,8 +19,7 @@ import { VERSION } from "./version.ts";
 
 const NAME = "@openma/deepseek-harness-acp";
 
-async function main(): Promise<void> {
-    const argv = process.argv.slice(2);
+export async function main(argv: string[] = process.argv.slice(2)): Promise<void> {
     if (argv.includes("--version")) {
         console.log(`${NAME} ${VERSION}`);
         return;
@@ -50,13 +49,13 @@ async function main(): Promise<void> {
             // strip the already-consumed host selection flags first.
             const loginArgv: string[] = [];
             for (let i = 1; i < argv.length; i += 1) {
-                const arg = argv[i];
+                const arg = argv[i]!;
                 if (arg === "--dsh-path") {
                     i += 1;
                     continue;
                 }
-                if (arg !== undefined && arg.startsWith("--dsh-path=")) continue;
-                if (arg !== undefined) loginArgv.push(arg);
+                if (arg.startsWith("--dsh-path=")) continue;
+                loginArgv.push(arg);
             }
             process.exitCode = await runLogin(
                 booted as unknown as Parameters<typeof runLogin>[0],
@@ -147,7 +146,3 @@ async function main(): Promise<void> {
     process.on("SIGTERM", () => shutdown(143));
 }
 
-main().catch((error: unknown) => {
-    logError(error instanceof Error ? (error.stack ?? error.message) : String(error));
-    process.exit(1);
-});

@@ -42,10 +42,12 @@ async function bootstrap(): Promise<void> {
     });
 
     const cli = import.meta.url.endsWith(".ts") ? "./index.ts" : "./index.js";
-    await import(cli);
+    const mod = (await import(cli)) as { main(argv?: string[]): Promise<void> };
+    await mod.main(argv);
 }
 
-bootstrap().catch((error: unknown) => {
+/** Awaitable bootstrap for tests; binaries observe the usual exit paths. */
+export const ready: Promise<void> = bootstrap().catch((error: unknown) => {
     logError(error instanceof Error ? (error.stack ?? error.message) : String(error));
     process.exit(1);
 });
