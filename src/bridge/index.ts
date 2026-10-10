@@ -82,11 +82,14 @@ import { VERSION } from "../version.ts";
 import {
     advertisedAuthMethods,
     apiKeyFromAuthenticate,
+    clientSupportsUrlElicitation,
     credentialBaseUrlName,
     credentialEnvNames,
     gatewayFromAuthenticate,
+    isApiKeyAuthMethod,
     isBrowserAuthMethod,
     isGatewayAuthMethod,
+    isTerminalAuthMethod,
     primaryCredentialName,
     providerFromAuthMethodId,
     shouldOfferLocalAuthPage,
@@ -94,6 +97,8 @@ import {
     type ProviderRoute,
 } from "../auth.ts";
 import { openLocalAuthPage, startLocalAuthPage } from "../auth-page.ts";
+import { AuthLoginCancelled, runBrowserLogin } from "./auth-flow.ts";
+import { RequestIdTracker, tapRequestIds } from "./request-ids.ts";
 import { logDebug, logWarn } from "../log.ts";
 import {
     acpInclusiveForkCapabilityMeta,
@@ -217,6 +222,11 @@ export interface AcpBridgeConfig {
     /** Runtime-only transport override; production uses stdio. */
     stream?: Stream;
     /**
+     * Environment for the browser-login gate (`shouldOfferLocalAuthPage`) and
+     * auth-method advertisement; tests substitute a production-looking env.
+     */
+    env?: NodeJS.ProcessEnv;
+    /**
      * Host functions resolved from the DeepSeek Harness installation. The
      * standalone CLI injects these; bundle/profile mounts omit them and the
      * bridge imports its own copies (src/bridge/self-harness.ts).
@@ -292,8 +302,30 @@ function internalError(detail: string): RequestError {
     return RequestError.internalError(undefined, detail);
 }
 
-function authRequired(detail: string): RequestError {
-    return RequestError.authRequired(undefined, detail);
+/**
+ * Native auth slash commands are never advertised or delivered over ACP (the
+ * claude-agent-acp `UNSUPPORTED_COMMANDS` contract): the client owns the
+ * login surface through the advertised auth methods, and a typed `/login` or
+ * `/logout` ends the turn with auth_required so it can show its auth UI — it
+ * must never reach the model or change credentials.
+ */
+const NATIVE_AUTH_COMMANDS = new Set(["login", "logout"]);
+
+/** Per-provider entry pushed in `_auth/status_update`. */
+interface AuthStatusProvider {
+    providerId: string;
+    name?: string;
+    /** How the credential is supplied: stored key, gateway key+URL, or ambient env. */
+    kind: "api_key" | "gateway" | "environment" | "other";
+    /** The credential-store name backing the credential (never its value). */
+    label: string;
+}
+
+/** `_auth/status_update` payload: which providers are usable, via which method. */
+interface AuthStatus {
+    kind: "none" | "authenticated";
+    label: string;
+    providers: AuthStatusProvider[];
 }
 
 /** Runtime identity provided by the standalone launcher; absent in profile mounts. */
@@ -344,6 +376,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     const harness = config.harness ?? (await import("./self-harness.ts")).selfHarness();
     const { createUserMessage, errorChain, sessionId: SessionId, foldSessionTitle, setSandboxMode } = harness;
     const SANDBOX_MODES = harness.sandboxModes;
+    const bridgeEnv = config.env ?? process.env;
     const sessions = new Map<string, SessionRecord>();
     const commandPublications = new LatestPublication();
     interface LiveSubagent {
@@ -368,6 +401,16 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     /** Explicit interaction semantics negotiated from ACP client `_meta`. */
     let clientInteractionMode: AcpInteractionMode | undefined;
     const tuiClient: TuiClientAdvertisement = { advertised: false };
+    /** Client capabilities as of initialize; drives auth-method advertisement. */
+    let clientAuthCapabilities: ClientAuthCapabilities | undefined;
+    /** Live provider routes as of the latest `llm.listProviders()` success. */
+    let latestProviders: ProviderRoute[] = [];
+    /** Inbound JSON-RPC ids for request-scoped url elicitation. */
+    const requestIds = new RequestIdTracker();
+    /** Sequence for url-elicitation ids opened by browser login. */
+    let authPageSeq = 0;
+    /** Last pushed `_auth/status_update` payload, deduplicated by JSON. */
+    let lastAuthStatus: string | undefined;
     const rpc = new AcpRpc();
     const findAgent = (agentId: string): Agent | undefined => {
         const fromRegistry = agents.get(agentId as never);
@@ -805,18 +848,31 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         try {
             const raw = llm.listProviders();
             if (!Array.isArray(raw)) return [];
-            return raw.flatMap((entry) => {
+            const routes = raw.flatMap((entry) => {
                 if (!entry || typeof entry !== "object") return [];
                 const id = (entry as { id?: unknown }).id;
                 if (typeof id !== "string" || id.length === 0) return [];
                 const name = (entry as { name?: unknown }).name;
                 return [{ id, ...(typeof name === "string" && name.length > 0 ? { name } : {}) }];
             });
+            latestProviders = routes;
+            return routes;
         } catch (error: unknown) {
             logDebug(`listProviders failed: ${String(error)}`);
             return [];
         }
     };
+
+    /**
+     * auth_required carrying the methods the client can render as a picker —
+     * recomputed from the live provider routes and declared client
+     * capabilities, so the error always lists what initialize advertised.
+     */
+    const authError = (detail: string): RequestError =>
+        RequestError.authRequired(
+            { authMethods: advertisedAuthMethods(latestProviders, clientAuthCapabilities, bridgeEnv) as AuthMethod[] },
+            detail,
+        );
 
     const credentialPresent = async (provider?: string): Promise<boolean> => {
         const names = credentialEnvNames(provider).filter((name) => !name.endsWith("_BASE_URL"));
@@ -832,8 +888,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
 
     const requireCredential = async (provider?: string): Promise<void> => {
         if (await credentialPresent(provider)) return;
-        throw authRequired(
-            "no credential found for this provider: call authenticate with `_meta[\"api-key\"].apiKey` or `_meta.gateway`, use the browser method, run `dsh-acp login`, or save a key in the dsh Web UI (Settings → Models)",
+        throw authError(
+            "no credential found for this provider: call authenticate with `_meta[\"api-key\"].apiKey` or `_meta.gateway`, pick an advertised auth method, run `dsh-acp login`, or save a key in the dsh Web UI (Settings → Models)",
         );
     };
 
@@ -1592,6 +1648,9 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         const seen = new Set(list.map((command) => command.name));
         try {
             for (const descriptor of commandRuntime.list(record.agent)) {
+                // Auth commands are never advertised over ACP, even when a
+                // composition registers one (claude-agent-acp UNSUPPORTED_COMMANDS).
+                if (NATIVE_AUTH_COMMANDS.has(descriptor.name)) continue;
                 if (seen.has(descriptor.name)) continue;
                 seen.add(descriptor.name);
                 list.push({
@@ -1625,6 +1684,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             });
             for (const skill of skills) {
                 if (skill.invocation.userInvocable !== true) continue;
+                if (NATIVE_AUTH_COMMANDS.has(skill.name)) continue;
                 if (seen.has(skill.name)) continue;
                 seen.add(skill.name);
                 list.push({
@@ -1729,15 +1789,123 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         await credentials.set(credentialRef(credentialBaseUrlName(provider)), baseUrl);
     };
 
-    const logoutStored = async (): Promise<void> => {
-        const routes = await listProviderRoutes();
-        const providers = routes.length > 0 ? routes.map((route) => route.id) : [config.provider];
-        for (const provider of providers) {
+    /**
+     * Scoped ACP logout: clears the stored key and gateway base-URL of one
+     * provider — the configured route, or the one named by `logout`'s
+     * `_meta.provider` — never every provider's credentials.
+     */
+    const logoutScopedProvider = async (provider: string | undefined): Promise<void> => {
+        for (const name of new Set([primaryCredentialName(provider), credentialBaseUrlName(provider)])) {
             try {
-                await credentials.unset(credentialRef(primaryCredentialName(provider)));
+                await credentials.unset(credentialRef(name));
             } catch (error: unknown) {
                 logWarn(`credential unset failed: ${String(error)}`);
             }
+        }
+    };
+
+    /** Routes to report on: the live directory, else the one configured route. */
+    const authStatusRoutes = async (): Promise<ProviderRoute[]> => {
+        if (latestProviders.length > 0) return latestProviders;
+        const routes = await listProviderRoutes();
+        return routes.length > 0 ? routes : [{ id: config.provider ?? "deepseek-official" }];
+    };
+
+    /** Which providers are usable and through which method — no secret values. */
+    const computeAuthStatus = async (): Promise<AuthStatus> => {
+        const providers: AuthStatusProvider[] = [];
+        for (const route of await authStatusRoutes()) {
+            const credentialName = primaryCredentialName(route.id);
+            let info: { configured: boolean; source?: string };
+            try {
+                info = await credentials.describe(credentialRef(credentialName));
+            } catch (error: unknown) {
+                logWarn(`auth status describe failed for ${route.id}: ${String(error)}`);
+                continue;
+            }
+            if (!info.configured) continue;
+            let baseUrlConfigured = false;
+            try {
+                baseUrlConfigured = (
+                    await credentials.describe(credentialRef(credentialBaseUrlName(route.id)))
+                ).configured;
+            } catch (error: unknown) {
+                logDebug(`auth status base-url describe failed for ${route.id}: ${String(error)}`);
+            }
+            providers.push({
+                providerId: route.id,
+                ...(route.name !== undefined ? { name: route.name } : {}),
+                kind: baseUrlConfigured
+                    ? "gateway"
+                    : info.source === "env"
+                      ? "environment"
+                      : "api_key",
+                label: credentialName,
+            });
+        }
+        providers.sort((a, b) => a.providerId.localeCompare(b.providerId));
+        const label =
+            providers.length === 0
+                ? "Not logged in"
+                : providers.length === 1 && providers[0] !== undefined
+                  ? `${providers[0].name ?? providers[0].providerId} · ${providers[0].label}`
+                  : `${providers.length} providers`;
+        return {
+            kind: providers.length > 0 ? "authenticated" : "none",
+            label,
+            providers,
+        };
+    };
+
+    /** Push `_auth/status_update` when the credential picture changed since the last push. */
+    const publishAuthStatus = async (): Promise<void> => {
+        if (closed) return;
+        const status = await computeAuthStatus();
+        const json = JSON.stringify(status);
+        if (json === lastAuthStatus) return;
+        lastAuthStatus = json;
+        try {
+            await conn.extNotification("_auth/status_update", { authStatus: status });
+        } catch (error: unknown) {
+            logDebug(`_auth/status_update failed: ${String(error)}`);
+        }
+    };
+
+    // The terminal login, the Web UI, or a re-authenticate can change the
+    // store outside this connection: republish on any credential update.
+    ctx.on("credentials/reference-updated", () => {
+        void publishAuthStatus().catch((error: unknown) => {
+            logDebug(`auth status republish failed: ${String(error)}`);
+        });
+    });
+
+    /** Browser login through url elicitation (src/bridge/auth-flow.ts). */
+    const runBridgeBrowserLogin = async (provider: string | undefined): Promise<void> => {
+        const credentialName = primaryCredentialName(provider);
+        authPageSeq += 1;
+        try {
+            await runBrowserLogin(
+                {
+                    createElicitation: (request) => conn.createElicitation(request),
+                    completeElicitation: (params) => conn.completeElicitation(params),
+                    startPage: (options) => startLocalAuthPage(options),
+                    openPage: (url) => openLocalAuthPage(url),
+                    saveCredential: (key) => saveCredential(provider, key),
+                    requestId: requestIds.latestFor("authenticate"),
+                    provider,
+                    elicitationId: `dsh-acp-auth-${authPageSeq}`,
+                    logDebug,
+                },
+                credentialName,
+            );
+        } catch (error: unknown) {
+            if (error instanceof AuthLoginCancelled) {
+                throw authError("browser login was cancelled by the client");
+            }
+            if (error instanceof RequestError) throw error;
+            throw authError(
+                `browser login did not complete: ${errorChain(error)} — supply the key with authenticate \`_meta["api-key"].apiKey\`, a gateway, or the terminal login method`,
+            );
         }
     };
 
@@ -2044,8 +2212,12 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 clientElicitationForm =
                     params.clientCapabilities?.elicitation?.form !== undefined &&
                     params.clientCapabilities.elicitation.form !== null;
+                clientAuthCapabilities = params.clientCapabilities as ClientAuthCapabilities | undefined;
                 tuiClient.advertised = advertisesCordis(capsMeta);
                 const providers = await listProviderRoutes();
+                // Clients ignore notifications arriving before this response;
+                // push the initial auth report right after it lands.
+                setTimeout(() => void publishAuthStatus(), 0);
                 return {
                     protocolVersion:
                         typeof requested === "number" && requested >= 1 && requested < PROTOCOL_VERSION
@@ -2057,7 +2229,10 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                         // Deep-merge: dsh.cordis and the inclusive fork capability stay siblings.
                         // dsh.runtime carries the resolved host identity so clients
                         // can display which dsh booted (standalone provides it;
-                        // absent when mounted inside a dsh profile).
+                        // absent when mounted inside a dsh profile). `authStatus`
+                        // announces that this agent pushes `_auth/status_update`
+                        // whenever the credential picture changes (the openma
+                        // auth-status convention).
                         _meta: {
                             dsh: {
                                 cordis: { ...CORDIS_CAPABILITY },
@@ -2065,6 +2240,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                                     ? { runtime: dshAcpRuntimeOf(ctx.get("dshAcpHost")) }
                                     : {}),
                             },
+                            authStatus: {},
                             ...acpInclusiveForkCapabilityMeta(),
                         },
                         loadSession: true,
@@ -2081,7 +2257,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     },
                     authMethods: advertisedAuthMethods(
                         providers,
-                        params.clientCapabilities as ClientAuthCapabilities | undefined,
+                        clientAuthCapabilities,
+                        bridgeEnv,
                     ) as AuthMethod[],
                 };
             },
@@ -2090,7 +2267,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 const gateway = gatewayFromAuthenticate(params);
                 if (isGatewayAuthMethod(params.methodId) || gateway.baseUrl) {
                     if (!gateway.baseUrl || !gateway.key) {
-                        throw authRequired(
+                        throw authError(
                             "authenticate gateway requires `_meta.gateway.baseUrl` and an Authorization header",
                         );
                     }
@@ -2099,6 +2276,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                         gateway.key,
                         gateway.baseUrl,
                     );
+                    await publishAuthStatus();
                     return;
                 }
                 const submitted = apiKeyFromAuthenticate(params);
@@ -2106,27 +2284,60 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     submitted.provider ?? providerFromAuthMethodId(params.methodId) ?? config.provider;
                 if (submitted.key) {
                     await saveCredential(provider, submitted.key);
+                    await publishAuthStatus();
                     return;
                 }
-                if (await credentialPresent(provider)) return;
-                if (isBrowserAuthMethod(params.methodId) && shouldOfferLocalAuthPage()) {
-                    const page = await startLocalAuthPage({
-                        credentialName: primaryCredentialName(provider),
-                    });
-                    openLocalAuthPage(page.url);
-                    try {
-                        const key = await page.completed;
-                        await saveCredential(provider, key);
-                        return;
-                    } finally {
-                        page.close();
-                    }
+                if (await credentialPresent(provider)) {
+                    await publishAuthStatus();
+                    return;
+                }
+                if (isTerminalAuthMethod(params.methodId)) {
+                    // Terminal methods are never sent to `authenticate` — the
+                    // client spawns the advertised command itself. A client
+                    // that sends one anyway gets the re-check above plus a
+                    // pointer at the out-of-band path.
+                    throw authError(
+                        "terminal login runs out of band: the client runs the advertised `dsh-acp login` command itself — run it, then retry authenticate or session/new",
+                    );
+                }
+                // Spec-compliant secret path without `_meta`: the api-key
+                // (or browser) method falls back to the local page whose URL
+                // the client receives through url elicitation.
+                if (
+                    (isBrowserAuthMethod(params.methodId) || isApiKeyAuthMethod(params.methodId)) &&
+                    clientSupportsUrlElicitation(clientAuthCapabilities) &&
+                    shouldOfferLocalAuthPage(bridgeEnv)
+                ) {
+                    await runBridgeBrowserLogin(provider);
+                    await publishAuthStatus();
+                    return;
+                }
+                if (isBrowserAuthMethod(params.methodId)) {
+                    throw authError(
+                        "browser login needs a client that supports URL elicitation: supply the key with authenticate `_meta[\"api-key\"].apiKey`, a gateway, or the terminal login method",
+                    );
                 }
                 await requireCredential(provider);
             },
 
-            async logout(_params: LogoutRequest): Promise<void> {
-                await logoutStored();
+            async logout(params: LogoutRequest): Promise<void> {
+                // Scoped to one provider: `_meta.provider` when sent, else the
+                // configured route or the first live route — never every
+                // provider's credentials.
+                const meta = params._meta;
+                const requested =
+                    meta !== null &&
+                    typeof meta === "object" &&
+                    typeof (meta as { provider?: unknown }).provider === "string"
+                        ? (meta as { provider: string }).provider.trim()
+                        : undefined;
+                const provider =
+                    (requested !== undefined && requested.length > 0 ? requested : undefined) ??
+                    config.provider ??
+                    defaultProvider() ??
+                    latestProviders[0]?.id;
+                await logoutScopedProvider(provider);
+                await publishAuthStatus();
             },
 
             async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
@@ -2396,6 +2607,20 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 }
                 if (converted.blocks.length === 0) throw invalidParams("empty prompt");
 
+                // Adapter-level slash commands never reach the model.
+                const trimmed = converted.displayText.trim();
+                const commandMatch = trimmed.match(/^\/(\w[\w-]*)\b/);
+
+                // Native auth commands are never delivered — not to the
+                // model, not to the harness registry, and not injected into a
+                // running turn. The turn ends with auth_required so the
+                // client shows its auth UI; typing them changes nothing.
+                if (commandMatch !== null && commandMatch[1] !== undefined && NATIVE_AUTH_COMMANDS.has(commandMatch[1])) {
+                    throw authError(
+                        `/${commandMatch[1]} is not available over ACP — authenticate with one of the advertised auth methods`,
+                    );
+                }
+
                 // ACP clients steer by issuing another session/prompt while
                 // the active one is still in flight. Queueing is client-side;
                 // the bridge must deliver an immediate second prompt to the
@@ -2419,9 +2644,6 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     return { stopReason: "end_turn" };
                 }
 
-                // Adapter-level slash commands never reach the model.
-                const trimmed = converted.displayText.trim();
-                const commandMatch = trimmed.match(/^\/(\w[\w-]*)\b/);
                 const respond = (text: string): PromptResponse => {
                     notify(params.sessionId, {
                         sessionUpdate: "agent_message_chunk",
@@ -2818,7 +3040,9 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
             Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>,
         );
-    const stream = muxAcpStream(raw, rpc);
+    // The tap records inbound request ids for request-scoped url elicitation
+    // (browser login during `authenticate`, which has no session).
+    const stream = muxAcpStream(tapRequestIds(raw, requestIds), rpc);
     conn = new AgentSideConnection(makeAgent, stream);
 
     void conn.closed

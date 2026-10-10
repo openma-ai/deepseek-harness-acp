@@ -5,10 +5,16 @@ import {
     advertisedAuthMethods,
     apiKeyAuthMethods,
     apiKeyFromAuthenticate,
+    clientSupportsTerminalAuth,
+    clientSupportsUrlElicitation,
+    credentialBaseUrlName,
     credentialEnvNames,
     gatewayFromAuthenticate,
+    isApiKeyAuthMethod,
+    isTerminalAuthMethod,
     parseLoginArgv,
     providerFromAuthMethodId,
+    terminalLaunchSpec,
 } from "../src/auth.ts";
 
 describe("ACP Agent Auth advertisement", () => {
@@ -48,42 +54,92 @@ describe("ACP Agent Auth advertisement", () => {
         ]);
     });
 
-    it("adds browser and gateway only when the client can use them", () => {
+    it("adds terminal, browser and gateway only when the client can use them", () => {
         expect(advertisedAuthMethods([], undefined, { NODE_ENV: "test" }).map((method) => method.id))
             .toEqual(["api-key"]);
         expect(
             advertisedAuthMethods([], { auth: { _meta: { gateway: true } } }, { NODE_ENV: "test" })
                 .map((method) => method.id),
         ).toEqual(["api-key", "gateway"]);
+        // Browser login is never local-only: without url elicitation the
+        // method is not offered, even on a desktop-like environment.
         expect(advertisedAuthMethods([], undefined, { NODE_ENV: "production" }).map((method) => method.id))
-            .toEqual(["api-key", "browser"]);
+            .toEqual(["api-key"]);
+        expect(
+            advertisedAuthMethods([], { elicitation: { url: {} } }, { NODE_ENV: "production" })
+                .map((method) => method.id),
+        ).toEqual(["api-key", "browser"]);
+        expect(
+            advertisedAuthMethods([], { auth: { terminal: true } }, { NODE_ENV: "production" })
+                .map((method) => method.id),
+        ).toEqual(["api-key", "terminal-login"]);
         expect(
             advertisedAuthMethods(
                 [],
-                { auth: { _meta: { gateway: true } } },
+                { auth: { terminal: true, _meta: { gateway: true } }, elicitation: { url: {} } },
                 { NODE_ENV: "production" },
             ).map((method) => method.id),
-        ).toEqual(["api-key", "browser", "gateway"]);
+        ).toEqual(["api-key", "terminal-login", "browser", "gateway"]);
         expect(
             advertisedAuthMethods(
                 [],
-                { auth: { _meta: { gateway: true } } },
+                { auth: { _meta: { gateway: true } }, elicitation: { url: {} } },
                 { NODE_ENV: "production", NO_BROWSER: "1" },
             ).map((method) => method.id),
         ).toEqual(["api-key", "gateway"]);
     });
 
-    it("keeps per-provider api-key methods in front of the shared browser and gateway methods", () => {
+    it("advertises a spec terminal method the client runs under its own command", () => {
+        const [method] = advertisedAuthMethods(
+            [],
+            { auth: { terminal: true } },
+            { NODE_ENV: "test" },
+        ).filter((candidate) => "type" in candidate && candidate.type === "terminal");
+        expect(method).toEqual({
+            type: "terminal",
+            id: "terminal-login",
+            name: "Log in with dsh-acp",
+            description: expect.stringContaining("dsh-acp login"),
+            args: ["login"],
+            env: {},
+        });
+    });
+
+    it("adds the Zed terminal-auth launch spec only when the client asks for it", () => {
+        const withSpec = advertisedAuthMethods(
+            [],
+            { _meta: { "terminal-auth": true } },
+            { NODE_ENV: "test" },
+        ).find((method) => method.id === "terminal-login");
+        expect(withSpec).toBeDefined();
+        const spec = (
+            withSpec as { _meta?: Record<string, { command: string; args: string[]; label: string }> } | undefined
+        )?._meta?.["terminal-auth"];
+        expect(spec).toBeDefined();
+        expect(spec?.label).toBe("dsh-acp login");
+        expect(spec?.args.at(-1)).toBe("login");
+    });
+
+    it("keeps per-provider api-key methods in front of the shared methods", () => {
         expect(
             advertisedAuthMethods(
                 [
                     { id: "deepseek-official", name: "DeepSeek" },
                     { id: "anthropic", name: "Anthropic" },
                 ],
-                { auth: { _meta: { gateway: true } } },
+                {
+                    auth: { terminal: true, _meta: { gateway: true } },
+                    elicitation: { url: {} },
+                },
                 { NODE_ENV: "production" },
             ).map((method) => method.id),
-        ).toEqual(["api-key:deepseek-official", "api-key:anthropic", "browser", "gateway"]);
+        ).toEqual([
+            "api-key:deepseek-official",
+            "api-key:anthropic",
+            "terminal-login",
+            "browser",
+            "gateway",
+        ]);
     });
 
     it("advertises Codex-shaped gateway metadata", () => {
@@ -129,6 +185,12 @@ describe("authenticate _meta and login argv", () => {
             providerName: "custom",
             key: "sk-gw",
         });
+        expect(
+            gatewayFromAuthenticate({
+                methodId: "gateway",
+                _meta: { gateway: { headers: { "x-api-key": "tok-42" } } },
+            }),
+        ).toEqual({ headers: { "x-api-key": "tok-42" }, key: "tok-42" });
     });
 
     it("maps method ids onto provider routes", () => {
@@ -151,6 +213,16 @@ describe("authenticate _meta and login argv", () => {
         expect(credentialEnvNames("deepseek-official")).toEqual(["DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL"]);
         expect(credentialEnvNames("anthropic")).toEqual(["ANTHROPIC_API_KEY"]);
         expect(credentialEnvNames("openai")).toEqual(["OPENAI_API_KEY"]);
+        expect(credentialEnvNames("moonshot")).toEqual(["MOONSHOT_API_KEY"]);
+    });
+
+    it("maps the current route to the harness base-URL credential name", () => {
+        expect(credentialBaseUrlName(undefined)).toBe("DEEPSEEK_BASE_URL");
+        expect(credentialBaseUrlName("deepseek-official")).toBe("DEEPSEEK_BASE_URL");
+        expect(credentialBaseUrlName("anthropic")).toBe("ANTHROPIC_BASE_URL");
+        expect(credentialBaseUrlName("openai")).toBe("OPENAI_BASE_URL");
+        expect(credentialBaseUrlName("openai-proxy")).toBe("OPENAI_BASE_URL");
+        expect(credentialBaseUrlName("moonshot")).toBe("MOONSHOT_BASE_URL");
     });
 });
 
@@ -197,5 +269,58 @@ describe("ACP bridge credential wiring", () => {
         expect(login).not.toContain("createRequire");
         expect(login).not.toContain("no writable credential store");
         expect(login).not.toContain('ctx.get("credentials")');
+    });
+});
+
+describe("auth method ids and client capabilities", () => {
+    it("classifies api-key and terminal method ids", () => {
+        expect(isApiKeyAuthMethod("api-key")).toBe(true);
+        expect(isApiKeyAuthMethod("api-key:anthropic")).toBe(true);
+        expect(isApiKeyAuthMethod("browser")).toBe(false);
+        expect(isApiKeyAuthMethod(undefined)).toBe(false);
+        expect(isTerminalAuthMethod("terminal-login")).toBe(true);
+        expect(isTerminalAuthMethod("terminal-login:anthropic")).toBe(true);
+        expect(isTerminalAuthMethod("api-key")).toBe(false);
+        expect(isTerminalAuthMethod(undefined)).toBe(false);
+    });
+
+    it("reads the terminal auth capability from auth.terminal or the Zed meta flag", () => {
+        expect(clientSupportsTerminalAuth(undefined)).toBe(false);
+        expect(clientSupportsTerminalAuth({})).toBe(false);
+        expect(clientSupportsTerminalAuth({ auth: {} })).toBe(false);
+        expect(clientSupportsTerminalAuth({ auth: { terminal: true } })).toBe(true);
+        expect(clientSupportsTerminalAuth({ _meta: { "terminal-auth": true } })).toBe(true);
+        expect(clientSupportsTerminalAuth({ _meta: { "terminal-auth": false } })).toBe(false);
+    });
+
+    it("reads url elicitation support only from a present capability object", () => {
+        expect(clientSupportsUrlElicitation(undefined)).toBe(false);
+        expect(clientSupportsUrlElicitation({})).toBe(false);
+        expect(clientSupportsUrlElicitation({ elicitation: null })).toBe(false);
+        expect(clientSupportsUrlElicitation({ elicitation: {} })).toBe(false);
+        expect(clientSupportsUrlElicitation({ elicitation: { url: null } })).toBe(false);
+        expect(clientSupportsUrlElicitation({ elicitation: { url: {} } })).toBe(true);
+        expect(clientSupportsUrlElicitation({ elicitation: { form: {}, url: {} } })).toBe(true);
+    });
+
+    it("builds the terminal-auth launch spec for the current process or the dsh-acp bin", () => {
+        const realArgv = process.argv;
+        try {
+            process.argv = ["/usr/bin/node", "/opt/dsh/dist/bin.js"];
+            expect(terminalLaunchSpec(["login"])).toEqual({
+                command: "/usr/bin/node",
+                args: ["/opt/dsh/dist/bin.js", "login"],
+            });
+            process.argv = ["/usr/bin/node"];
+            expect(terminalLaunchSpec(["login"])).toEqual({ command: "dsh-acp", args: ["login"] });
+            process.argv = ["/usr/bin/dsh-acp", "/opt/dsh/dist/bin.js"];
+            expect(terminalLaunchSpec(["login"])).toEqual({ command: "dsh-acp", args: ["login"] });
+            process.argv = ["/usr/bin/node", "/opt/dsh/config.yml"];
+            expect(terminalLaunchSpec(["login"])).toEqual({ command: "dsh-acp", args: ["login"] });
+            process.argv = [];
+            expect(terminalLaunchSpec(["login"])).toEqual({ command: "dsh-acp", args: ["login"] });
+        } finally {
+            process.argv = realArgv;
+        }
     });
 });
