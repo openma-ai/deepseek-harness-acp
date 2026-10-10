@@ -2287,18 +2287,19 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     await publishAuthStatus();
                     return;
                 }
-                if (await credentialPresent(provider)) {
-                    await publishAuthStatus();
-                    return;
-                }
+                // Terminal methods are never sent to `authenticate` — the
+                // client spawns the advertised command itself. A client that
+                // sends one anyway gets the same answer whether or not a
+                // credential is already present, so the out-of-band path
+                // cannot be mistaken for a successful terminal login.
                 if (isTerminalAuthMethod(params.methodId)) {
-                    // Terminal methods are never sent to `authenticate` — the
-                    // client spawns the advertised command itself. A client
-                    // that sends one anyway gets the re-check above plus a
-                    // pointer at the out-of-band path.
                     throw authError(
                         "terminal login runs out of band: the client runs the advertised `dsh-acp login` command itself — run it, then retry authenticate or session/new",
                     );
+                }
+                if (await credentialPresent(provider)) {
+                    await publishAuthStatus();
+                    return;
                 }
                 // Spec-compliant secret path without `_meta`: the api-key
                 // (or browser) method falls back to the local page whose URL

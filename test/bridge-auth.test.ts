@@ -413,6 +413,25 @@ describe("authenticate paths", () => {
         }
     });
 
+    it("still reports out-of-band for a terminal method when a credential is already present", async () => {
+        const { ctx, client, creds } = await boot();
+        creds.values.set("DEEPSEEK_API_KEY", { value: "sk-env", source: "env" });
+        try {
+            await client.request("initialize", {
+                protocolVersion: 1,
+                clientCapabilities: { auth: { terminal: true } },
+            });
+            const response = await client.request("authenticate", { methodId: "terminal-login" });
+            const error = response["error"] as { code: number; message?: string };
+            expect(error.code).toBe(-32000);
+            expect(error.message).toMatch(/out of band|dsh-acp login/);
+            const data = (error as { data?: { authMethods?: unknown[] } }).data;
+            expect(data?.authMethods).toBeInstanceOf(Array);
+        } finally {
+            await ctx.fiber.dispose();
+        }
+    });
+
     it("runs the browser login through url elicitation and saves the page submission", async () => {
         const { ctx, client, creds } = await boot();
         try {
