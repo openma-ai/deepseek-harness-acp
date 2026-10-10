@@ -6,7 +6,7 @@
  * projected to `_meta.dsh.runtime` (issue #157) — really executes.
  */
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -111,7 +111,7 @@ describe("bootAcpProfile", () => {
 
         const dshDir = join(host.base, "node_modules", "@deepseek-ai", "dsh");
         expect(ctx.provided.get("dshLaunchEnvironment")).toEqual({ STUB_ENV: true });
-        expect(ctx.provided.get("dshAcpHostBaseUrl")).toBe(pathToFileURL(dshDir + sep).href);
+        expect(ctx.provided.get("dshAcpHostBaseUrl")).toBe(pathToFileURL(realpathSync(dshDir) + sep).href);
         expect(ctx.provided.get("dshAcpHost")).toEqual({
             base: host.base,
             version: "0.2.0-rc.2",
@@ -158,7 +158,7 @@ describe("bootAcpProfile", () => {
         await patchContext?.(entry, async () => {
             nextCalled = true;
         });
-        expect(entry.ctx["baseUrl"]).toBe(pathToFileURL(dshDir + sep).href);
+        expect(entry.ctx["baseUrl"]).toBe(pathToFileURL(realpathSync(dshDir) + sep).href);
         expect(nextCalled).toBe(true);
 
         const other = { options: { name: "other-plugin" }, ctx: {} as Record<string, unknown> };
