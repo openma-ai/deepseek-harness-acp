@@ -2612,13 +2612,25 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 const trimmed = converted.displayText.trim();
                 const commandMatch = trimmed.match(/^\/(\w[\w-]*)\b/);
 
+                const respond = (text: string): PromptResponse => {
+                    notify(params.sessionId, {
+                        sessionUpdate: "agent_message_chunk",
+                        content: { type: "text", text },
+                    });
+                    return { stopReason: "end_turn" };
+                };
+
                 // Native auth commands are never delivered — not to the
                 // model, not to the harness registry, and not injected into a
-                // running turn. The turn ends with auth_required so the
-                // client shows its auth UI; typing them changes nothing.
+                // running turn (this check must precede the steer branch).
+                // The turn answers with a plain notice and end_turn — never
+                // auth_required, which is reserved for turns that genuinely
+                // lack a credential — and typing them changes nothing.
                 if (commandMatch !== null && commandMatch[1] !== undefined && NATIVE_AUTH_COMMANDS.has(commandMatch[1])) {
-                    throw authError(
-                        `/${commandMatch[1]} is not available over ACP — authenticate with one of the advertised auth methods`,
+                    return respond(
+                        commandMatch[1] === "login"
+                            ? "/login isn't available in this environment — use your client's sign-in (ACP auth methods)."
+                            : "/logout isn't available in this environment — use your client's sign-out (ACP logout).",
                     );
                 }
 
@@ -2645,13 +2657,6 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     return { stopReason: "end_turn" };
                 }
 
-                const respond = (text: string): PromptResponse => {
-                    notify(params.sessionId, {
-                        sessionUpdate: "agent_message_chunk",
-                        content: { type: "text", text },
-                    });
-                    return { stopReason: "end_turn" };
-                };
                 if (commandMatch?.[1] === "status") return respond(await statusText(record));
                 if (commandMatch?.[1] === "model") {
                     return respond(

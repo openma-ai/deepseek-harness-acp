@@ -248,8 +248,10 @@ The adapter writes credentials to the harness store. Missing credentials
 fail `session/new` and `session/prompt` with `auth_required` (`-32000`)
 carrying `data.authMethods` — the same advertised list — so the client can
 open its auth UI from any failure. Typing a native auth command
-(`/login`, `/logout`) ends the turn the same way; the commands are never
-advertised, never reach the model, and never change credentials.
+(`/login`, `/logout`) gets a plain "isn't available in this environment"
+reply pointing at the client's sign-in/sign-out and ends the turn — it is
+never advertised, never reaches the model, never changes credentials, and
+never returns `auth_required`.
 
 `logout` is scoped to one provider route — the one named by
 `_meta.provider`, or the active provider when omitted — and clears only

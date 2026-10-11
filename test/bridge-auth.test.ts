@@ -604,21 +604,32 @@ describe("scoped logout and switching", () => {
 });
 
 describe("native auth commands over ACP", () => {
-    it("ends /login and /logout with -32000 + data.authMethods without touching the model or credentials", async () => {
+    it("answers typed /login and /logout with a plain notice + end_turn, never reaching the model or credentials", async () => {
         const { ctx, client, creds, createdAgents } = await boot();
         creds.values.set("DEEPSEEK_API_KEY", { value: "sk-deep", source: "file" });
         try {
             await client.request("initialize", { protocolVersion: 1 });
             const created = await client.request("session/new", { cwd: "/ws", mcpServers: [] });
             const sessionId = (created["result"] as { sessionId: string }).sessionId;
-            for (const command of ["/login", "/logout"]) {
+            const cases: [string, RegExp][] = [
+                ["/login", /\/login isn't available.*sign-in/i],
+                ["/login with args", /\/login isn't available.*sign-in/i],
+                ["/logout", /\/logout isn't available.*sign-out/i],
+            ];
+            for (const [command, notice] of cases) {
                 const response = await client.request("session/prompt", {
                     sessionId,
                     prompt: [{ type: "text", text: command }],
                 });
-                const error = response["error"] as { code: number; data?: { authMethods?: unknown[] } };
-                expect(error.code).toBe(-32000);
-                expect(error.data?.authMethods).toBeInstanceOf(Array);
+                expect(response["error"]).toBeUndefined();
+                expect(response["result"]).toEqual({ stopReason: "end_turn" });
+                const chunk = await client.waitFor(
+                    (m) =>
+                        m["method"] === "session/update" &&
+                        JSON.stringify(m["params"]).includes("agent_message_chunk") &&
+                        notice.test(JSON.stringify(m["params"])),
+                );
+                expect(chunk).toBeDefined();
             }
             const agent = createdAgents[0];
             expect(agent?.followup).not.toHaveBeenCalled();
@@ -629,7 +640,7 @@ describe("native auth commands over ACP", () => {
         }
     });
 
-    it("ends /login typed during a running turn with auth_required, never steering it in", async () => {
+    it("answers /login typed during a running turn with the notice, never steering it in", async () => {
         const { ctx, client, creds, createdAgents } = await boot();
         creds.values.set("DEEPSEEK_API_KEY", { value: "sk-deep", source: "file" });
         try {
@@ -646,7 +657,8 @@ describe("native auth commands over ACP", () => {
                 sessionId,
                 prompt: [{ type: "text", text: "/login" }],
             });
-            expect((response["error"] as { code: number }).code).toBe(-32000);
+            expect(response["error"]).toBeUndefined();
+            expect(response["result"]).toEqual({ stopReason: "end_turn" });
             expect(createdAgents[0]?.steer).not.toHaveBeenCalled();
         } finally {
             await ctx.fiber.dispose();

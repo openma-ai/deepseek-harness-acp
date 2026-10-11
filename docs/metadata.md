@@ -233,10 +233,16 @@ credential references only; other providers' credentials are untouched.
 Every auth-related `-32000` (`auth_required`) — from `initialize`,
 `session/new`, `session/prompt`, or `authenticate` — carries
 `error.data.authMethods`, the same capability-filtered list `initialize`
-advertised, so the client can render its auth UI from any failure. Typing a
-native auth command (`/login`, `/logout`) ends the turn with this error
-instead of reaching the model; the commands are never in
-`availableCommands` and typing them does not change credentials.
+advertised, so the client can render its auth UI from any failure.
+
+Typing a native auth command (`/login`, `/logout`, with or without
+arguments) instead ends the turn normally: the adapter emits one
+`agent_message_chunk` saying the command isn't available in this
+environment — pointing at the client's sign-in (ACP auth methods) or
+sign-out (ACP `logout`) — and returns `stopReason: "end_turn"`.
+`auth_required` is never the answer to a typed auth command; the commands
+are never in `availableCommands`, never reach the model or the harness
+command registry, and typing them does not change credentials.
 
 ### `_auth/status_update` notification
 
