@@ -56,9 +56,27 @@ chosen by the surface.
 
 ### DSH compatibility
 
-The bundled runtime is **DSH `0.1.5-rc.1`**, including the upstream
-cross-process session write lock. Your installed DSH still takes precedence;
-use an updated host or the bundled runtime to get the fix.
+This release supports **`@deepseek-ai/dsh` `0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2`**,
+declared as a real semver range in `peerDependencies` and derived from the
+tested profile matrix (`runtime/compatibility.json`). The bundled runtime is
+**DSH `0.2.0-rc.2`**, including the upstream cross-process session write lock.
+
+Runtime selection has exactly two rules (Martty issue #157):
+
+- **Standalone** (`dsh-acp` bin): the packaged runtime is always used —
+  ambient installs in the invoking directory, on PATH, or in global npm are
+  never consulted. An explicit `--dsh-path`/`DSH_PATH`/`DSH_ACP_HOST`
+  (or the literal value `bundled`) selects an installation instead, and is
+  refused with a message naming the version found, its source, and the
+  supported range when it falls outside it.
+- **Plugin mode** (`dsh plugin add`, Martty launched as a dsh plugin): the
+  hosting dsh is the runtime, checked against the same range at mount time;
+  an out-of-range host fails with the same refusal message.
+
+The resolved runtime is always reported: the launcher logs
+`harness host: @deepseek-ai/dsh <version> via <source>` to stderr, and the
+`initialize` response carries `agentCapabilities._meta.dsh.runtime`
+(`{base, version, source}`) for clients to display.
 
 A competing load/resume returns a standard JSON-RPC error. Closing the
 session or exiting the owner process allows another process to resume it.
@@ -109,10 +127,10 @@ dsh-acp login        # interactive; or save the key in the dsh Web UI
 }
 ```
 
-The standalone binary finds DeepSeek Harness via `--dsh-path` / `DSH_PATH`,
-`./node_modules`, `dsh` on PATH, or `npm root -g`, then falls back to the exact
-runtime archived inside this package. DSH is only a wildcard optional peer for
-Host integration, never an npm-installed dependency: plugin mode uses the
+The standalone binary uses the runtime archived inside this package unless a
+harness is named explicitly via `--dsh-path` / `DSH_PATH` / `DSH_ACP_HOST`.
+DSH is an optional peer declared with a real semver range (see *DSH
+compatibility*), never an npm-installed dependency: plugin mode uses the
 Host's tree, while standalone maps the same imports to the private runtime.
 When a real `$DSH_HOME/profiles/acp` exists, that profile owns the composition.
 

@@ -11,7 +11,7 @@ import { join } from "node:path";
 import type { SandboxMode } from "@deepseek-ai/dsh-sandbox";
 
 export interface Settings {
-    /** Explicit DeepSeek Harness installation (DSH_PATH); auto-detected when unset. */
+    /** Explicit DeepSeek Harness installation (--dsh-path/DSH_ACP_HOST/DSH_PATH); auto-detected when unset. */
     dshPath: string | undefined;
     /** Additional dsh bundle layers, applied to the agent tree in argv order. */
     bundles: string[];
@@ -40,6 +40,21 @@ export class SettingsError extends Error {}
 function envString(name: string): string | undefined {
     const value = process.env[name];
     return value !== undefined && value.length > 0 ? value : undefined;
+}
+
+/**
+ * Explicit DeepSeek Harness selection, before settings parsing: the
+ * `--dsh-path <value>`/`--dsh-path=<value>` flag, then `DSH_ACP_HOST`, then
+ * `DSH_PATH`. The literal value `bundled` pins the packaged runtime (see
+ * BUNDLED_HOST in src/harness.ts); embedders set DSH_ACP_HOST=bundled so the
+ * auto-detection probes can never hijack their bundled install.
+ */
+export function explicitDshPath(argv: string[]): string | undefined {
+    for (const [i, arg] of argv.entries()) {
+        if (arg === "--dsh-path") return argv[i + 1];
+        if (arg.startsWith("--dsh-path=")) return arg.slice("--dsh-path=".length);
+    }
+    return envString("DSH_ACP_HOST") ?? envString("DSH_PATH");
 }
 
 interface ParsedArgs {
@@ -149,7 +164,7 @@ export function resolveSettings(argv: string[]): Settings {
     }
 
     return {
-        dshPath: stringFlag(parsed, "dsh-path") ?? envString("DSH_PATH"),
+        dshPath: stringFlag(parsed, "dsh-path") ?? envString("DSH_ACP_HOST") ?? envString("DSH_PATH"),
         bundles: parsed.bundles,
         provider: stringFlag(parsed, "provider") ?? envString("DSH_PROVIDER"),
         model,
@@ -176,10 +191,11 @@ Agent Client Protocol (ACP) stdio server for DeepSeek Harness. Speak ACP on
 stdin/stdout from an ACP client such as Zed; diagnostics go to stderr.
 
 Options:
-  --dsh-path <path>           DeepSeek Harness installation: the dsh binary, its
-                              package dir, or any dir carrying node_modules/@deepseek-ai
-                              (DSH_PATH; auto-detected when unset — own tree, ./node_modules,
-                              dsh on PATH, npm root -g)
+  --dsh-path <path|bundled>   DeepSeek Harness installation: the dsh binary, its
+                              package dir, any dir carrying node_modules/@deepseek-ai,
+                              or 'bundled' for the packaged runtime only
+                              (DSH_ACP_HOST, DSH_PATH; default: the packaged runtime —
+                              ambient installs are never probed)
   --bundle <package-dir>      Add a dsh bundle layer to the agent tree (repeatable)
   --provider <route>          Provider route (DSH_PROVIDER, default deepseek-official)
   --model <id>                Default model (DSH_MODEL; otherwise the Host default,
@@ -198,6 +214,8 @@ Options:
   --help                      Show this help
 
 Environment:
+  DSH_ACP_HOST                DeepSeek Harness installation (see --dsh-path);
+                              'bundled' pins the packaged runtime — set by embedders
   DSH_PATH                    DeepSeek Harness installation (see --dsh-path)
   DEEPSEEK_API_KEY            DeepSeek (or compatible) API credential
   DEEPSEEK_BASE_URL           OpenAI-compatible endpoint override

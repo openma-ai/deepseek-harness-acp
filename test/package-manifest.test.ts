@@ -20,12 +20,19 @@ describe("ACP package manifest", () => {
         };
         expect(manifest.dependencies).toEqual({
             "@agentclientprotocol/sdk": "1.4.0",
+            semver: "^7.8.5",
             tar: "7.5.22",
             yaml: "^2.9.1",
             zod: "4.4.3",
         });
         expect(manifest.dependencies).not.toHaveProperty("@deepseek-ai/dsh");
-        expect(manifest.peerDependencies).toEqual({ "@deepseek-ai/dsh": "*" });
+        // The declared compatibility range is a real semver union of the tested
+        // profile matrix (runtime/compatibility.json), enforced at resolution
+        // time by src/harness.ts and at mount time by src/plugin.ts.
+        const compatibility = JSON.parse(
+            readFileSync(join(import.meta.dirname, "../runtime/compatibility.json"), "utf8"),
+        ) as string[];
+        expect(manifest.peerDependencies).toEqual({ "@deepseek-ai/dsh": compatibility.join(" || ") });
         expect(manifest.peerDependenciesMeta).toEqual({
             "@deepseek-ai/dsh": { optional: true },
         });
