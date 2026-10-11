@@ -12,6 +12,7 @@ import {
     gatewayFromAuthenticate,
     isApiKeyAuthMethod,
     isTerminalAuthMethod,
+    looksLikeAuthFailure,
     parseLoginArgv,
     providerFromAuthMethodId,
     terminalLaunchSpec,
@@ -322,5 +323,15 @@ describe("auth method ids and client capabilities", () => {
         } finally {
             process.argv = realArgv;
         }
+    });
+});
+
+describe("looksLikeAuthFailure", () => {
+    it("matches provider auth failures and nothing else", () => {
+        expect(looksLikeAuthFailure("turn failed: Authentication Fails, Your api key: ****test is invalid")).toBe(true);
+        expect(looksLikeAuthFailure("401 Unauthorized")).toBe(true);
+        expect(looksLikeAuthFailure("no credential found for this provider")).toBe(true);
+        expect(looksLikeAuthFailure("turn failed: model returned malformed json")).toBe(false);
+        expect(looksLikeAuthFailure("turn failed: rate limit exceeded, retry later")).toBe(false);
     });
 });

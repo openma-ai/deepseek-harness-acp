@@ -312,3 +312,28 @@ function apiKeyFromHeaders(headers: Record<string, string> | undefined): string 
     const first = Object.values(headers).find((value) => value.trim().length > 0);
     return first?.trim();
 }
+
+const AUTH_FAILURE_PATTERNS = [
+    "authentication required",
+    "authentication fails",
+    "authentication failed",
+    "invalid api key",
+    "api key",
+    "apikey",
+    "unauthorized",
+    "no api key",
+    "no credential",
+    "401",
+    "403",
+];
+
+/**
+ * Heuristic: does a provider/harness error message mean the user must
+ * (re)authenticate? Turn failures that match are re-cast as ACP
+ * auth_required (-32000) so clients can open their auth UI instead of
+ * surfacing a bare internal error (openma-ai/Martty#160).
+ */
+export function looksLikeAuthFailure(message: string): boolean {
+    const lower = message.toLowerCase();
+    return AUTH_FAILURE_PATTERNS.some((pattern) => lower.includes(pattern));
+}

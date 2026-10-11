@@ -90,6 +90,7 @@ import {
     isBrowserAuthMethod,
     isGatewayAuthMethod,
     isTerminalAuthMethod,
+    looksLikeAuthFailure,
     primaryCredentialName,
     providerFromAuthMethodId,
     shouldOfferLocalAuthPage,
@@ -2124,7 +2125,11 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 // endings settle at whole-agent idle.
                 if (event.data.reason.kind === "error") {
                     record.inflight = undefined;
-                    inflight.reject(internalError(`turn failed: ${event.data.reason.error.message}`));
+                    const detail = `turn failed: ${event.data.reason.error.message}`;
+                    // A provider auth failure is auth_required (-32000) with
+                    // the advertised methods, not a bare internal error —
+                    // the client needs it to open its auth UI (issue #160).
+                    inflight.reject(looksLikeAuthFailure(detail) ? authError(detail) : internalError(detail));
                 }
             }
         }
@@ -2157,7 +2162,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         const inflight = record?.inflight;
         if (record === undefined || inflight === undefined || inflight.turn === turn) return;
         record.inflight = undefined;
-        inflight.reject(internalError(`turn failed: ${errorChain(error)}`));
+        const detail = `turn failed: ${errorChain(error)}`;
+        inflight.reject(looksLikeAuthFailure(detail) ? authError(detail) : internalError(detail));
     });
 
     // Permission requests: one-shot decisions, with an "always for this
