@@ -1,10 +1,16 @@
 /**
  * ACP authentication helpers shared by `dsh-acp login` and the stdio bridge.
  *
- * Three Agent Auth methods, matching the Codex `_meta` shapes:
+ * Auth methods, matching the claude-agent-acp capability-gated shape and the
+ * Codex/openma `_meta` conventions:
  * 1. `api-key` (or `api-key:<provider>`) — `_meta["api-key"].apiKey`
- * 2. `browser` — adapter opens a localhost page; the secret never travels ACP
- * 3. `gateway` — `_meta.gateway` `{ baseUrl, headers, providerName? }`,
+ * 2. `terminal-login` (`type: "terminal"`) — the client spawns `dsh-acp login`
+ *    itself; advertised when the client declares `auth.terminal` or
+ *    `_meta["terminal-auth"]`
+ * 3. `browser` — adapter serves a localhost page and hands its URL to the
+ *    client through ACP url elicitation; only offered when the client can see
+ *    the URL (`elicitation.url`) so the flow is never silently local-only
+ * 4. `gateway` — `_meta.gateway` `{ baseUrl, headers, providerName? }`,
  *    advertised only when the client opts in with
  *    `clientCapabilities.auth._meta.gateway === true`
  */
@@ -34,10 +40,22 @@ export interface GatewayAuthMethod {
     _meta: { gateway: { protocol: "openai"; restartRequired: "false" } };
 }
 
-export type AdvertisedAuthMethod = ApiKeyAuthMethod | BrowserAuthMethod | GatewayAuthMethod;
+export interface TerminalAuthMethod {
+    type: "terminal";
+    id: string;
+    name: string;
+    description: string;
+    args: string[];
+    env: Record<string, string>;
+    _meta?: Record<string, unknown>;
+}
+
+export type AdvertisedAuthMethod = ApiKeyAuthMethod | TerminalAuthMethod | BrowserAuthMethod | GatewayAuthMethod;
 
 export interface ClientAuthCapabilities {
-    auth?: { _meta?: Record<string, unknown> };
+    auth?: { terminal?: boolean; _meta?: Record<string, unknown> };
+    elicitation?: { url?: unknown; form?: unknown } | null;
+    _meta?: Record<string, unknown>;
 }
 
 const LOGIN_DESCRIPTION =
@@ -140,12 +158,53 @@ export function gatewayFromAuthenticate(params: {
     };
 }
 
+export function isApiKeyAuthMethod(methodId: string | undefined): boolean {
+    return methodId === "api-key" || (methodId?.startsWith("api-key:") ?? false);
+}
+
 export function isBrowserAuthMethod(methodId: string | undefined): boolean {
     return methodId === "browser";
 }
 
 export function isGatewayAuthMethod(methodId: string | undefined): boolean {
     return methodId === "gateway";
+}
+
+export const TERMINAL_AUTH_METHOD_ID = "terminal-login";
+
+export function isTerminalAuthMethod(methodId: string | undefined): boolean {
+    return methodId === TERMINAL_AUTH_METHOD_ID || (methodId?.startsWith(`${TERMINAL_AUTH_METHOD_ID}:`) ?? false);
+}
+
+/**
+ * `auth.terminal` (spec) or Zed's `_meta["terminal-auth"]` either one
+ * advertises the terminal login method; only the meta flag also fills the
+ * method's `_meta["terminal-auth"]` launch spec.
+ */
+export function clientSupportsTerminalAuth(caps: ClientAuthCapabilities | undefined | null): boolean {
+    return caps?.auth?.terminal === true || caps?._meta?.["terminal-auth"] === true;
+}
+
+/** Whether the client can be handed a login URL through `elicitation/create` `mode: "url"`. */
+export function clientSupportsUrlElicitation(caps: ClientAuthCapabilities | undefined | null): boolean {
+    const elicitation = caps?.elicitation;
+    if (elicitation === undefined || elicitation === null) return false;
+    return elicitation.url !== undefined && elicitation.url !== null;
+}
+
+/**
+ * The command a `_meta["terminal-auth"]` launch spec should run. The ACP
+ * terminal method itself stays command-agnostic — the client appends `args`
+ * to its own configured agent command — so the spec is only an optional
+ * convenience for clients that launch the spec verbatim.
+ */
+export function terminalLaunchSpec(args: string[]): { command: string; args: string[] } {
+    const argv0 = process.argv[0] ?? "node";
+    const argv1 = process.argv[1];
+    if (argv1 !== undefined && /node/.test(argv0) && /\.(m?js|ts)$/.test(argv1)) {
+        return { command: argv0, args: [argv1, ...args] };
+    }
+    return { command: "dsh-acp", args };
 }
 
 export function credentialBaseUrlName(provider: string | undefined): string {
@@ -161,7 +220,12 @@ export function advertisedAuthMethods(
     env: NodeJS.ProcessEnv = process.env,
 ): AdvertisedAuthMethod[] {
     const methods: AdvertisedAuthMethod[] = [...apiKeyAuthMethods(providers)];
-    if (shouldOfferLocalAuthPage(env)) methods.push(browserAuthMethod());
+    if (clientSupportsTerminalAuth(clientCapabilities)) methods.push(terminalAuthMethod(clientCapabilities));
+    // Browser login only when the client can see the page URL (ACP url
+    // elicitation): xdg-open alone leaves headless/SSH/WSL clients blind.
+    if (clientSupportsUrlElicitation(clientCapabilities) && shouldOfferLocalAuthPage(env)) {
+        methods.push(browserAuthMethod());
+    }
     if (clientCapabilities?.auth?._meta?.["gateway"] === true) methods.push(gatewayAuthMethod());
     return methods;
 }
@@ -195,11 +259,28 @@ export function shouldOfferLocalAuthPage(env: NodeJS.ProcessEnv = process.env): 
     return true;
 }
 
+function terminalAuthMethod(clientCapabilities: ClientAuthCapabilities | undefined | null): TerminalAuthMethod {
+    const method: TerminalAuthMethod = {
+        type: "terminal",
+        id: TERMINAL_AUTH_METHOD_ID,
+        name: "Log in with dsh-acp",
+        description: "Run `dsh-acp login` in a terminal to save an API key to the harness credential store",
+        args: ["login"],
+        env: {},
+    };
+    // Zed's `_meta["terminal-auth"]` contract adds a runnable launch spec;
+    // clients of plain `auth.terminal` spawn `dsh-acp login` themselves.
+    if (clientCapabilities?._meta?.["terminal-auth"] === true) {
+        method._meta = { "terminal-auth": { ...terminalLaunchSpec(["login"]), label: "dsh-acp login" } };
+    }
+    return method;
+}
+
 function browserAuthMethod(): BrowserAuthMethod {
     return {
         id: "browser",
         name: "Browser",
-        description: "Open a local sign-in page to save an API key. The secret never travels over ACP.",
+        description: "Save an API key through a local sign-in page whose URL is handed to the client. The secret never travels over ACP.",
     };
 }
 
@@ -230,4 +311,29 @@ function apiKeyFromHeaders(headers: Record<string, string> | undefined): string 
     }
     const first = Object.values(headers).find((value) => value.trim().length > 0);
     return first?.trim();
+}
+
+const AUTH_FAILURE_PATTERNS = [
+    "authentication required",
+    "authentication fails",
+    "authentication failed",
+    "invalid api key",
+    "api key",
+    "apikey",
+    "unauthorized",
+    "no api key",
+    "no credential",
+    "401",
+    "403",
+];
+
+/**
+ * Heuristic: does a provider/harness error message mean the user must
+ * (re)authenticate? Turn failures that match are re-cast as ACP
+ * auth_required (-32000) so clients can open their auth UI instead of
+ * surfacing a bare internal error (openma-ai/Martty#160).
+ */
+export function looksLikeAuthFailure(message: string): boolean {
+    const lower = message.toLowerCase();
+    return AUTH_FAILURE_PATTERNS.some((pattern) => lower.includes(pattern));
 }

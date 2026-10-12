@@ -224,19 +224,42 @@ stable capability, ownership, lifecycle, and fallback contract.
 ## Authentication
 
 No keys in editor config, no secrets pasted into chat. ACP clients follow
-the protocol: `initialize` advertises three **Agent Auth** methods.
+the protocol: `initialize` advertises the **Agent Auth** methods the client
+declared it can use.
 
-1. **API key** — `api-key`, or `api-key:<provider>` when more than one
-   route is live. The client may pass `_meta["api-key"].apiKey`.
-2. **Browser** — `browser`. The adapter opens a localhost sign-in page;
-   the secret never travels over ACP. Hidden when `NO_BROWSER` is set.
-3. **Custom gateway** — `gateway`, only when the client opts in with
+1. **API key** — `api-key`, or `api-key:<provider>` per live route. The
+   client may pass `_meta["api-key"].apiKey`.
+2. **Terminal** — `terminal-login`, when the client declares
+   `clientCapabilities.auth.terminal` (or `_meta["terminal-auth"]`). The
+   client runs the advertised `dsh-acp login` command itself — the adapter
+   never supplies a command path — and the saved key is picked up on the
+   next `authenticate` or `session/new`.
+3. **Browser** — `browser`, only when the client declares
+   `clientCapabilities.elicitation.url`. The adapter starts a localhost
+   sign-in page and hands its URL to the client through url elicitation —
+   headless, SSH, and WSL sessions all see the URL. The secret never
+   travels over ACP; the page's own timeout bounds the wait, and a decline
+   or cancel ends the flow with `auth_required` instead of hanging.
+4. **Custom gateway** — `gateway`, only when the client opts in with
    `clientCapabilities.auth._meta.gateway === true`. The client sends
    `_meta.gateway` `{ baseUrl, headers, providerName? }`.
 
 The adapter writes credentials to the harness store. Missing credentials
-fail `session/new` and `session/prompt` with `auth_required` (`-32000`).
-Logout is the ACP `logout` method.
+fail `session/new` and `session/prompt` with `auth_required` (`-32000`)
+carrying `data.authMethods` — the same advertised list — so the client can
+open its auth UI from any failure. Typing a native auth command
+(`/login`, `/logout`) gets a plain "isn't available in this environment"
+reply pointing at the client's sign-in/sign-out and ends the turn — it is
+never advertised, never reaches the model, never changes credentials, and
+never returns `auth_required`.
+
+`logout` is scoped to one provider route — the one named by
+`_meta.provider`, or the active provider when omitted — and clears only
+that provider's stored key and gateway base-URL. Re-authenticating
+overwrites the same provider's credential; authenticating a second
+provider adds alongside the first; `dsh-acp login --provider <route>`
+replaces it out of band. The active method, provider, and credential name
+are pushed to the client as `_auth/status_update` whenever they change.
 
 1. **Harness credential store** — `$DSH_HOME/.credentials.yaml` (mode 600),
    the file the dsh Web UI writes; hot-reloaded. Save a key with

@@ -29,6 +29,9 @@ extension disabled.
 | `clientCapabilities._meta.dsh.interaction.mode` | `"interactive" \| "rpc"` | Selects the DSH interaction mode passed to newly created agents. Unknown values are ignored. |
 | `clientCapabilities._meta.dsh.cordis.protocol` | literal `0` | Negotiates the private `_dsh/cordis/*` TUI Client plane. Both peers must advertise the same protocol. |
 | `clientCapabilities.auth._meta.gateway` | literal `true` | Requests advertisement of the custom gateway authentication method. |
+| `clientCapabilities.auth.terminal` | literal `true` | Standard ACP terminal-auth capability; enables the `terminal-login` auth method (the client runs the advertised command itself). |
+| `clientCapabilities._meta["terminal-auth"]` | literal `true` | Adds a `_meta["terminal-auth"]` launch spec (`command`, `args`, `label`) to the advertised terminal method for clients that launch the spec verbatim. |
+| `clientCapabilities.elicitation.url` | non-null object | Enables the `browser` auth method. Browser login hands the local page URL to the client through `elicitation/create` `mode: "url"`; without this capability the method is not advertised and selecting `browser` fails fast. |
 
 The adapter advertises the Cordis protocol and inclusive session fork in the
 initialize response. The objects are deep-merged under `agentCapabilities._meta`;
@@ -54,6 +57,7 @@ mounts and absent only where no host identity was provided.
           "base": "/home/user/.cache/dsh-acp/0.2.0-rc.2-a1b2c3d4e5f6"
         }
       },
+      "authStatus": {},
       "jetbrains": {
         "air": {
           "fork": {
@@ -128,12 +132,18 @@ content.
 
 ### Advertised auth methods
 
-| Method | Advertised metadata | Meaning |
-|---|---|---|
-| `api-key` | `_meta["api-key"] = {}` | The method uses the current provider route. |
-| `api-key:<provider>` | `_meta["api-key"].provider: string` | The API key belongs to the named provider route. |
-| `gateway` | `_meta.gateway.protocol: "openai"` | The gateway must expose an OpenAI-compatible endpoint. |
-| `gateway` | `_meta.gateway.restartRequired: "false"` | Authentication takes effect without restarting the ACP process. The value is the compatibility contract's string literal, not a boolean. |
+Methods are advertised per declared client capability; a capability the client
+does not declare hides the method it gates.
+
+| Method | Gated on | Advertised metadata | Meaning |
+|---|---|---|---|
+| `api-key` | always (per provider: `api-key:<provider>`) | `_meta["api-key"] = {}` or `.provider: string` | Save an API key to the harness credential store. |
+| `api-key:<provider>` | always | `_meta["api-key"].provider: string` | The API key belongs to the named provider route. |
+| `terminal-login` | `clientCapabilities.auth.terminal === true` or `clientCapabilities._meta["terminal-auth"] === true` | standard terminal fields `args: ["login"]`, `env: {}` | Spec terminal login: the client appends `args` to its own configured agent command and runs it out of band; the method is never sent back to `authenticate`. |
+| `terminal-login` | `clientCapabilities._meta["terminal-auth"] === true` | `_meta["terminal-auth"] = { command: string, args: string[], label: "dsh-acp login" }` | Optional verbatim launch spec for clients that run a concrete command (Zed's `terminal-auth` convention). `command`/`args` resolve to the running `dsh-acp` process. |
+| `browser` | `clientCapabilities.elicitation.url` non-null | none | Local-page login whose URL is surfaced to the client via `elicitation/create` `mode: "url"` (see below). |
+| `gateway` | `clientCapabilities.auth._meta.gateway === true` | `_meta.gateway.protocol: "openai"` | The gateway must expose an OpenAI-compatible endpoint. |
+| `gateway` | same | `_meta.gateway.restartRequired: "false"` | Authentication takes effect without restarting the ACP process. The value is the compatibility contract's string literal, not a boolean. |
 
 ### `authenticate` request
 
@@ -173,6 +183,100 @@ A custom gateway request uses this shape:
 
 `baseUrl` and an `Authorization` header are required. `headers` accepts a
 string-to-string record. `providerName` is an optional display and route name.
+
+### Browser login url elicitation
+
+When the client picks `browser` (or sends an `api-key` method without `_meta`
+while url elicitation is supported), the adapter starts its local auth page
+and sends a request-scoped `elicitation/create` in `mode: "url"`:
+
+```json
+{
+  "mode": "url",
+  "requestId": <id of the inbound authenticate request>,
+  "elicitationId": "dsh-acp-auth-<n>",
+  "url": "http://127.0.0.1:<port>/",
+  "message": "Save your API key for DEEPSEEK_API_KEY. …",
+  "_meta": {
+    "dsh": {
+      "auth": {
+        "credential": "DEEPSEEK_API_KEY",
+        "provider": "deepseek-official"
+      }
+    }
+  }
+}
+```
+
+`_meta.dsh.auth.provider` is omitted when the request targets the default
+route. An `accept` response only means the client surfaced the URL; the
+credential arrives through the page's own POST inside the page's bounded
+timeout. A `decline`, `cancel`, page timeout, or any other failure ends the
+request with `auth_required` (`-32000`) carrying `data.authMethods`, and the
+adapter sends `elicitation/complete` with `{ "elicitationId": "dsh-acp-auth-<n>" }`
+as the flow ends. Without `clientCapabilities.elicitation.url` the `browser`
+method is not advertised and selecting it fails fast with the same error shape.
+
+### `logout` request
+
+`logout` is scoped to one provider route — the one named by
+`_meta.provider` (a non-empty string) or, when omitted, the active provider
+route. It removes that provider's stored API key and gateway base-URL
+credential references only; other providers' credentials are untouched.
+
+```json
+{ "method": "logout", "params": { "_meta": { "provider": "anthropic" } } }
+```
+
+### `data.authMethods` on auth errors
+
+Every auth-related `-32000` (`auth_required`) — from `initialize`,
+`session/new`, `session/prompt`, or `authenticate` — carries
+`error.data.authMethods`, the same capability-filtered list `initialize`
+advertised, so the client can render its auth UI from any failure.
+
+Typing a native auth command (`/login`, `/logout`, with or without
+arguments) instead ends the turn normally: the adapter emits one
+`agent_message_chunk` saying the command isn't available in this
+environment — pointing at the client's sign-in (ACP auth methods) or
+sign-out (ACP `logout`) — and returns `stopReason: "end_turn"`.
+`auth_required` is never the answer to a typed auth command; the commands
+are never in `availableCommands`, never reach the model or the harness
+command registry, and typing them does not change credentials.
+
+### `_auth/status_update` notification
+
+The adapter pushes the current credential picture over `_meta.authStatus`
+(ext-method `_auth/status_update`) after `initialize` and whenever the
+credential store changes (a successful `authenticate`, `logout`, or an
+out-of-band update such as terminal login or the Web UI). The marker
+`agentCapabilities._meta.authStatus: {}` advertises the feed.
+
+```json
+{
+  "authStatus": {
+    "kind": "authenticated",
+    "label": "DeepSeek · DEEPSEEK_API_KEY",
+    "providers": [
+      {
+        "providerId": "deepseek-official",
+        "name": "DeepSeek",
+        "kind": "api_key",
+        "label": "DEEPSEEK_API_KEY"
+      }
+    ]
+  }
+}
+```
+
+`kind` is `"none"` or `"authenticated"`. Each entry reports the active
+method per provider: `kind` is `"api_key"` (stored key), `"gateway"` (stored
+key plus base-URL), `"environment"` (ambient env), or `"other"`. `label` is
+the credential-store name, never the secret. `kind: "none"` carries
+`label: "Not logged in"` and an empty `providers` list; a single configured
+provider is labelled `<name> · <credential name>`; several are labelled
+`"<n> providers"`. The notification is deduplicated on the serialized
+payload, so unchanged state is never re-pushed.
 
 ## Session update metadata
 
