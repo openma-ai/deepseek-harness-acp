@@ -9,9 +9,8 @@
  * warning. Only a dsh below the
  * floor is refused.
  *
- * The floor is declared once — as `peerDependencies["@deepseek-ai/dsh"]`
- * (mirrored in `engines.dsh`, which dsh's own plugin loader reads) — and
- * enforced in two places:
+ * The floor is declared once — as `engines.dsh`, which dsh's own plugin
+ * loader also reads — and enforced in two places:
  * `src/harness.ts` for every resolution source the standalone launcher
  * probes, and `src/plugin.ts` for the host dsh that mounts this package as a
  * Cordis plugin. This module carries only the manifest read and the message
@@ -28,14 +27,26 @@ import semver from "semver";
 /** Peer-declared package whose version bounds compatibility. */
 export const COMPAT_PACKAGE = "@deepseek-ai/dsh";
 
-/** The supported range declared by a manifest's `peerDependencies` ("*" when absent). */
-export function dshRangeOf(manifest: { peerDependencies?: Record<string, string> }): string {
-    return manifest.peerDependencies?.[COMPAT_PACKAGE] ?? "*";
+/**
+ * The supported range a manifest declares: `engines.dsh` (what dsh's own
+ * plugin loader evaluates, with prereleases included), else a legacy
+ * `@deepseek-ai/dsh` peer range, else "*".
+ *
+ * The floor lives in `engines.dsh` only: npm/pnpm evaluate peer ranges
+ * without prereleases, so a peer floor such as `>=0.1.7-rc.2` would reject
+ * every dsh prerelease (0.2.0-rc.2, 0.2.1-rc.2, ...) with ERESOLVE.
+ */
+export function dshRangeOf(manifest: {
+    engines?: Record<string, string>;
+    peerDependencies?: Record<string, string>;
+}): string {
+    return manifest.engines?.["dsh"] ?? manifest.peerDependencies?.[COMPAT_PACKAGE] ?? "*";
 }
 
-/** The `@deepseek-ai/dsh` versions this release supports (from `peerDependencies`). */
+/** The `@deepseek-ai/dsh` versions this release supports (from `engines.dsh`). */
 export function supportedDshRange(): string {
     const manifest = createRequire(import.meta.url)("../package.json") as {
+        engines?: Record<string, string>;
         peerDependencies?: Record<string, string>;
     };
     return dshRangeOf(manifest);

@@ -38,15 +38,16 @@ afterAll(() => {
 });
 
 describe("supported dsh range", () => {
-    it("reads the declared range from package.json peerDependencies", () => {
+    it("reads the declared floor from package.json engines.dsh", () => {
         expect(supportedDshRange()).toBe(">=0.1.7-rc.2");
         expect(COMPAT_PACKAGE).toBe("@deepseek-ai/dsh");
     });
 
-    it("falls back to * when a manifest declares no peer range", () => {
+    it("falls back to a legacy peer range, then *", () => {
         expect(dshRangeOf({})).toBe("*");
         expect(dshRangeOf({ peerDependencies: {} })).toBe("*");
         expect(dshRangeOf({ peerDependencies: { "@deepseek-ai/dsh": ">=1" } })).toBe(">=1");
+        expect(dshRangeOf({ engines: { dsh: ">=2" }, peerDependencies: { "@deepseek-ai/dsh": "1.0.0" } })).toBe(">=2");
     });
 });
 
