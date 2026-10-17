@@ -217,7 +217,7 @@ describe("resolveHost compatibility checks", () => {
     });
 
     it("reports the supported range from package metadata", () => {
-        expect(supportedDshRange()).toBe("0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2");
+        expect(supportedDshRange()).toBe(">=0.1.7-rc.2");
     });
 
     it("refuses a packaged runtime outside the supported range", () => {

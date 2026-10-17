@@ -28,9 +28,9 @@ export function updateDshManifests({ npm, fs, env = process.env, log = console.l
     if (matrix.length !== 3) throw new Error("Need three published release/RC versions");
     const previous = manifest.dshAcp.standaloneDsh;
     manifest.dshAcp.standaloneDsh = latest;
-    // The declared compatibility range is the union of the tested matrix —
-    // src/harness.ts and src/plugin.ts enforce it at resolution/mount time.
-    manifest.peerDependencies["@deepseek-ai/dsh"] = matrix.join(" || ");
+    // The declared compatibility is a minimum-version floor (peer range and
+    // engines.dsh), not the tested matrix: newer dsh releases stay attempted.
+    // Raising the floor is a deliberate maintainer change, never automatic.
     for (const name of Object.keys(manifest.devDependencies)) {
         if (name === "@deepseek-ai/dsh" || name.startsWith("@deepseek-ai/dsh-")) manifest.devDependencies[name] = latest;
     }

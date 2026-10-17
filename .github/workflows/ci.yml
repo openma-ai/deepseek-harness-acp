@@ -107,6 +107,32 @@ jobs:
       - name: Exercise the installed dsh profile
         run: npm exec -- node scripts/profile-smoke.mjs "$RUNNER_TEMP/dsh-host/node_modules/@deepseek-ai/dsh/lib/bin.js" "$RUNNER_TEMP/openma-deepseek-harness-acp-$(node -p "require('./package.json').version").tgz"
 
+  # The floor policy attempts every newer dsh: exercise the `next` dist-tag
+  # (unreleased line) through the same installed-profile smoke so an API
+  # change there is caught before it ships. A dsh newer than
+  # TESTED_DSH_THROUGH only warns at runtime; this job is what tests it.
+  dsh-next:
+    name: dsh --profile (next)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Install dsh@next host
+        timeout-minutes: 5
+        run: |
+          mkdir -p "$RUNNER_TEMP/dsh-host"
+          npm exec -- pnpm --dir "$RUNNER_TEMP/dsh-host" add --ignore-scripts --config.auto-install-peers=true "@deepseek-ai/dsh@next"
+          node -p "'dsh next: ' + require(process.env.RUNNER_TEMP + '/dsh-host/node_modules/@deepseek-ai/dsh/package.json').version"
+      - name: Pack ACP plugin
+        run: npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP"
+      - name: Exercise the installed dsh profile
+        run: npm exec -- node scripts/profile-smoke.mjs "$RUNNER_TEMP/dsh-host/node_modules/@deepseek-ai/dsh/lib/bin.js" "$RUNNER_TEMP/openma-deepseek-harness-acp-$(node -p "require('./package.json').version").tgz"
+
   # One non-blocking notice listing pull requests merged since the last v* tag.
   # A pull request that changes package.json version must keep the lockfile (and
   # any README pin of this package) in sync, and must stay a patch unless it is

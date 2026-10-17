@@ -16,7 +16,8 @@ import { pathToFileURL } from "node:url";
 
 import type { Context } from "@deepseek-ai/cordis";
 
-import { dshVersionAt, dshVersionSupported, refusalMessage, supportedDshRange } from "./compat.ts";
+import { logWarn } from "./log.ts";
+import { dshVersionAt, dshVersionSupported, dshVersionUntested, refusalMessage, supportedDshRange, untestedMessage } from "./compat.ts";
 import * as bridge from "./bridge/index.ts";
 import * as server from "./server.ts";
 import type { Config } from "./server.ts";
@@ -134,10 +135,15 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     const hostCtx = typeof hostBase === "string" ? ctx.extend({ baseUrl: hostBase }) : ctx;
     // Compatibility gate (issue #157): when mounted by a host dsh (Martty's
     // plugin-mode path), that host is the runtime — refuse it with a clear
-    // message when it is outside the supported range instead of failing deep
-    // inside the composition. The standalone path already passed resolveHost's
-    // own gate, so this re-check is a consistent no-op there.
+    // message when it is below the supported floor instead of failing deep
+    // inside the composition. A host newer than any tested dsh is attempted
+    // with a warning; API differences are feature-detected where used. The
+    // standalone path already passed resolveHost's own gate, so this re-check
+    // is a consistent no-op there.
     const hostDsh = dshVersionAt(String(hostCtx.baseUrl ?? import.meta.url));
+    if (hostDsh !== undefined && dshVersionUntested(hostDsh.version)) {
+        logWarn(untestedMessage(hostDsh.version ?? "unknown version", `dsh plugin host (${hostDsh.base})`));
+    }
     if (hostDsh !== undefined && !dshVersionSupported(hostDsh.version)) {
         throw new Error(
             [

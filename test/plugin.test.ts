@@ -129,7 +129,7 @@ describe("embeddable ACP Host plugin", () => {
         const plugin = await import("../src/plugin.ts");
         await expect(plugin.apply(ctx as never)).rejects.toThrow(/incompatible DeepSeek Harness/);
         await expect(plugin.apply(ctx as never)).rejects.toThrow(/0\.1\.1-rc\.2/);
-        await expect(plugin.apply(ctx as never)).rejects.toThrow(/0\.1\.7-rc\.2 \|\| 0\.2\.0-rc\.1 \|\| 0\.2\.0-rc\.2/);
+        await expect(plugin.apply(ctx as never)).rejects.toThrow(/supported versions: >=0\.1\.7-rc\.2/);
         await expect(plugin.apply(ctx as never)).rejects.toThrow(/dsh plugin host/);
     });
 

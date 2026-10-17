@@ -8,9 +8,14 @@ import {
     dshRangeOf,
     dshVersionAt,
     dshVersionSupported,
+    dshVersionUntested,
     refusalMessage,
     supportedDshRange,
+    TESTED_DSH_THROUGH,
+    untestedMessage,
 } from "../src/compat.ts";
+import { readFileSync } from "node:fs";
+import semver from "semver";
 import { dshAcpRuntimeOf } from "../src/bridge/index.ts";
 
 const roots: string[] = [];
@@ -34,7 +39,7 @@ afterAll(() => {
 
 describe("supported dsh range", () => {
     it("reads the declared range from package.json peerDependencies", () => {
-        expect(supportedDshRange()).toBe("0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2");
+        expect(supportedDshRange()).toBe(">=0.1.7-rc.2");
         expect(COMPAT_PACKAGE).toBe("@deepseek-ai/dsh");
     });
 
@@ -46,12 +51,29 @@ describe("supported dsh range", () => {
 });
 
 describe("dshVersionSupported", () => {
-    it("accepts versions inside the declared range and refuses others", () => {
+    it("accepts every version at or above the floor and refuses older ones", () => {
         expect(dshVersionSupported("0.2.0-rc.2")).toBe(true);
         expect(dshVersionSupported("0.1.7-rc.2")).toBe(true);
+        // Newer releases and prereleases are attempted, never refused by number.
+        expect(dshVersionSupported("0.2.1-rc.2")).toBe(true);
+        expect(dshVersionSupported("0.2.1-alpha.5")).toBe(true);
+        expect(dshVersionSupported("9.9.9")).toBe(true);
         expect(dshVersionSupported("0.1.1-rc.2")).toBe(false);
-        expect(dshVersionSupported("9.9.9")).toBe(false);
+        expect(dshVersionSupported("not-a-version")).toBe(false);
         expect(dshVersionSupported(undefined)).toBe(false);
+    });
+
+    it("flags only versions newer than the tested ceiling as untested", () => {
+        expect(dshVersionUntested(TESTED_DSH_THROUGH)).toBe(false);
+        expect(dshVersionUntested("0.2.0-rc.2")).toBe(false);
+        expect(dshVersionUntested("9.9.9")).toBe(true);
+        expect(dshVersionUntested(undefined)).toBe(false);
+        expect(untestedMessage("9.9.9", "dsh plugin host (/x)")).toMatch(/9\.9\.9 .*newer .*continuing/);
+    });
+
+    it("keeps the tested ceiling at or above the CI compatibility matrix", () => {
+        const matrix = JSON.parse(readFileSync(new URL("../runtime/compatibility.json", import.meta.url), "utf8")) as string[];
+        for (const version of matrix) expect(semver.gte(TESTED_DSH_THROUGH, version)).toBe(true);
     });
 
     it("honours an explicit range override", () => {

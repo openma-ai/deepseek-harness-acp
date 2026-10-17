@@ -82,7 +82,7 @@ describe("updateDshManifests", () => {
         const written = Object.fromEntries(seams.writes);
         const next = written["package.json"];
         expect(next.dshAcp.standaloneDsh).toBe(LATEST);
-        expect(next.peerDependencies["@deepseek-ai/dsh"]).toBe("0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2");
+        expect(next.peerDependencies["@deepseek-ai/dsh"]).toBe("*"); // the floor is maintainer-owned, never rewritten
         expect(next.devDependencies["@deepseek-ai/dsh"]).toBe(LATEST);
         expect(next.devDependencies["@deepseek-ai/dsh-agent"]).toBe(LATEST);
         expect(next.devDependencies["other"]).toBe("1.0.0");
@@ -128,7 +128,7 @@ describe("direct CLI invocation", () => {
 
             const next = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
             expect(next.dshAcp.standaloneDsh).toBe(LATEST);
-            expect(next.peerDependencies["@deepseek-ai/dsh"]).toBe("0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2");
+            expect(next.peerDependencies["@deepseek-ai/dsh"]).toBe("*"); // the floor is maintainer-owned, never rewritten
             expect(JSON.parse(readFileSync(join(dir, "runtime", "compatibility.json"), "utf8"))).toEqual(
                 ["0.1.7-rc.2", "0.2.0-rc.1", "0.2.0-rc.2"],
             );
