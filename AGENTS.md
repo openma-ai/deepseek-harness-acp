@@ -10,8 +10,10 @@
   for a release).
 - New features land on `main` and **accumulate unreleased**. They ride the
   next release the maintainer approves; do not tag a release per feature.
-- Release mechanics: version bump commit + `git tag vX.Y.Z` + push tags →
-  GitHub Actions publishes to npm via OIDC. Local `npm publish` is not used.
+- Release mechanics (RELEASING.md): release issue → release PR carrying the
+  version bump (`release/vX.Y.Z`, `Closes #issue`) → after it merges, tag the
+  merged commit on `main` and push the tag → GitHub Actions publishes to npm
+  via OIDC. Never push to `main` directly; local `npm publish` is not used.
 
 ## Project shape (quick orientation)
 
