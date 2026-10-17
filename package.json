@@ -125,14 +125,6 @@
     "yaml": "^2.9.1",
     "zod": "4.4.3"
   },
-  "peerDependencies": {
-    "@deepseek-ai/dsh": ">=0.1.7-rc.2"
-  },
-  "peerDependenciesMeta": {
-    "@deepseek-ai/dsh": {
-      "optional": true
-    }
-  },
   "exports": {
     ".": "./dist/index.js",
     "./bridge": "./dist/bridge.js",

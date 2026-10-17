@@ -18,7 +18,7 @@
  * against the same range.
  *
  * Every selected installation is checked against the `@deepseek-ai/dsh`
- * version range declared in `peerDependencies`; an out-of-range selection
+ * floor declared in `engines.dsh`; a selection below it
  * fails with a message naming the version found, where it came from, and
  * the supported range.
  *

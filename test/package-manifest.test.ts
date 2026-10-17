@@ -35,13 +35,13 @@ describe("ACP package manifest", () => {
         ) as string[];
         // A minimum-version floor, mirrored in engines.dsh (what dsh's own
         // plugin loader reads), never an exact-version allow-list.
-        const floor = manifest.peerDependencies?.["@deepseek-ai/dsh"];
+        const floor = (manifest as { engines?: Record<string, string> }).engines?.["dsh"];
         expect(floor).toMatch(/^>=\d+\.\d+\.\d+(?:-rc\.\d+)?$/);
-        expect((manifest as { engines?: Record<string, string> }).engines?.["dsh"]).toBe(floor);
         for (const version of compatibility) expect(semver.satisfies(version, floor!, { includePrerelease: true })).toBe(true);
-        expect(manifest.peerDependenciesMeta).toEqual({
-            "@deepseek-ai/dsh": { optional: true },
-        });
+        // No @deepseek-ai/dsh peer: npm/pnpm evaluate peers without
+        // prereleases, so a peer floor would reject every dsh prerelease.
+        expect(manifest.peerDependencies?.["@deepseek-ai/dsh"]).toBeUndefined();
+        expect(manifest.peerDependenciesMeta?.["@deepseek-ai/dsh"]).toBeUndefined();
         expect(manifest.exports?.["./plugin"]).toBe("./dist/plugin.js");
         expect(manifest.bin?.["dsh-acp"]).toBe("dist/bin.js");
         expect(manifest.files).toEqual(expect.arrayContaining(["vendor/*.json", "vendor/*.tgz"]));

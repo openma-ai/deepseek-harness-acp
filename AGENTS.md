@@ -24,6 +24,6 @@
 - Standalone always uses the vendored runtime unless a harness is named
   explicitly (`--dsh-path`/`DSH_PATH`/`DSH_ACP_HOST`, or `bundled`);
   PATH/invoking-dir/global installs are never probed. Plugin mode uses the
-  mounting host dsh. Both are checked against the `peerDependencies` floor
-  (`>=`, mirrored in `engines.dsh`); newer dsh versions are attempted, with
+  mounting host dsh. Both are checked against the `engines.dsh` floor
+  (`>=`; no `@deepseek-ai/dsh` peer — npm/pnpm peers exclude prereleases); newer dsh versions are attempted, with
   feature detection for API differences — never add an exact-version pin.

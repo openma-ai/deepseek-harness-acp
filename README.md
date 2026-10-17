@@ -57,8 +57,10 @@ chosen by the surface.
 ### DSH compatibility
 
 This release supports **`@deepseek-ai/dsh` `>=0.1.7-rc.2`** — a minimum-version
-floor declared in `peerDependencies` and mirrored in `engines.dsh` (the field
-dsh's own plugin loader checks), never an exact-version list. A newer dsh is
+floor declared in `engines.dsh` (the field dsh's own plugin loader checks, with
+prereleases included), never an exact-version list. It is deliberately not a
+`@deepseek-ai/dsh` peer dependency: npm and pnpm match peer ranges without
+prereleases, so a peer floor would reject every dsh prerelease. A newer dsh is
 always attempted: API differences between dsh generations are feature-detected
 where they are used (for example dsh 0.2.1's `subagents.drainDescendants`
 versus 0.2.0's `drainContinuableDescendants`), and a dsh newer than the newest
@@ -135,8 +137,8 @@ dsh-acp login        # interactive; or save the key in the dsh Web UI
 
 The standalone binary uses the runtime archived inside this package unless a
 harness is named explicitly via `--dsh-path` / `DSH_PATH` / `DSH_ACP_HOST`.
-DSH is an optional peer declared with a real semver range (see *DSH
-compatibility*), never an npm-installed dependency: plugin mode uses the
+DSH is declared as an `engines.dsh` floor (see *DSH compatibility*), never an
+npm-installed dependency: plugin mode uses the
 Host's tree, while standalone maps the same imports to the private runtime.
 When a real `$DSH_HOME/profiles/acp` exists, that profile owns the composition.
 
