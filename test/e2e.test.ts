@@ -1413,7 +1413,7 @@ describe("harness selection", () => {
             expect(result.stderr).toContain("incompatible DeepSeek Harness");
             expect(result.stderr).toContain("0.1.1-rc.2");
             expect(result.stderr).toContain(stale);
-            expect(result.stderr).toContain("0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2");
+            expect(result.stderr).toContain("supported versions: >=0.1.7-rc.2");
         } finally {
             rmSync(stale, { recursive: true, force: true });
         }

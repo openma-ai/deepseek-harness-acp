@@ -361,6 +361,29 @@ const MODE_LABELS: Record<SandboxMode, { name: string; description: string }> = 
  * @param ctx - cordis context carrying the injected dsh-base services.
  * @param config - provider/model selection and optional test transport.
  */
+/**
+ * Drain continuable subagent descendants of `parents` child-first, on any
+ * dsh generation. dsh 0.2.1 renamed `drainContinuableDescendants` to
+ * `drainDescendants`; the method is feature-detected so a newer dsh is
+ * attempted rather than refused. A subagents service exposing neither has
+ * no continuable manager to drain, and each top-level agent's own dispose
+ * still tears its tree down.
+ */
+export async function drainSubagentDescendants(subagents: unknown, parents: readonly unknown[]): Promise<void> {
+    if (subagents === null || typeof subagents !== "object") return;
+    const service = subagents as {
+        drainDescendants?: (parents: readonly unknown[]) => Promise<void>;
+        drainContinuableDescendants?: (parents: readonly unknown[]) => Promise<void>;
+    };
+    if (typeof service.drainDescendants === "function") {
+        await service.drainDescendants(parents);
+        return;
+    }
+    if (typeof service.drainContinuableDescendants === "function") {
+        await service.drainContinuableDescendants(parents);
+    }
+}
+
 export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise<void> {
     // Capture injected services during apply; handlers run outside the scope.
     const agents = ctx.agents;
@@ -3025,7 +3048,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             // Continuable subagents (when composed) own descendant teardown;
             // drain them child-first before disposing the top-level agents.
             try {
-                await subagents.drainContinuableDescendants(records.map((record) => record.agent));
+                await drainSubagentDescendants(subagents, records.map((record) => record.agent));
             } catch (error: unknown) {
                 logWarn(`continuable subagent teardown failed: ${String(error)}`);
             }

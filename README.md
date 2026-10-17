@@ -56,9 +56,15 @@ chosen by the surface.
 
 ### DSH compatibility
 
-This release supports **`@deepseek-ai/dsh` `0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2`**,
-declared as a real semver range in `peerDependencies` and derived from the
-tested profile matrix (`runtime/compatibility.json`). The bundled runtime is
+This release supports **`@deepseek-ai/dsh` `>=0.1.7-rc.2`** — a minimum-version
+floor declared in `peerDependencies` and mirrored in `engines.dsh` (the field
+dsh's own plugin loader checks), never an exact-version list. A newer dsh is
+always attempted: API differences between dsh generations are feature-detected
+where they are used (for example dsh 0.2.1's `subagents.drainDescendants`
+versus 0.2.0's `drainContinuableDescendants`), and a dsh newer than the newest
+tested version (`0.2.1-rc.2`) only logs a warning. Only a dsh below the floor
+is refused. CI exercises the tested profile matrix (`runtime/compatibility.json`)
+plus the `next` dist-tag. The bundled runtime is
 **DSH `0.2.0-rc.2`**, including the upstream cross-process session write lock.
 
 Runtime selection has exactly two rules (Martty issue #157):

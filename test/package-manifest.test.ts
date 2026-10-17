@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import semver from "semver";
 import { describe, expect, it } from "vitest";
 
 describe("ACP package manifest", () => {
@@ -32,7 +33,12 @@ describe("ACP package manifest", () => {
         const compatibility = JSON.parse(
             readFileSync(join(import.meta.dirname, "../runtime/compatibility.json"), "utf8"),
         ) as string[];
-        expect(manifest.peerDependencies).toEqual({ "@deepseek-ai/dsh": compatibility.join(" || ") });
+        // A minimum-version floor, mirrored in engines.dsh (what dsh's own
+        // plugin loader reads), never an exact-version allow-list.
+        const floor = manifest.peerDependencies?.["@deepseek-ai/dsh"];
+        expect(floor).toMatch(/^>=\d+\.\d+\.\d+(?:-rc\.\d+)?$/);
+        expect((manifest as { engines?: Record<string, string> }).engines?.["dsh"]).toBe(floor);
+        for (const version of compatibility) expect(semver.satisfies(version, floor!, { includePrerelease: true })).toBe(true);
         expect(manifest.peerDependenciesMeta).toEqual({
             "@deepseek-ai/dsh": { optional: true },
         });

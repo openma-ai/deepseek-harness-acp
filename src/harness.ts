@@ -33,8 +33,8 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { dshVersionSupported, refusalMessage, supportedDshRange } from "./compat.ts";
-import { logDebug } from "./log.ts";
+import { dshVersionSupported, dshVersionUntested, refusalMessage, supportedDshRange, untestedMessage } from "./compat.ts";
+import { logDebug, logWarn } from "./log.ts";
 import { resolveVendoredRuntime } from "./runtime.ts";
 
 export { supportedDshRange };
@@ -87,7 +87,7 @@ export class HarnessNotFoundError extends Error {
     }
 }
 
-/** A discovered installation outside the supported `@deepseek-ai/dsh` range. */
+/** A discovered installation below the supported `@deepseek-ai/dsh` floor. */
 export class HarnessCompatibilityError extends Error {
     constructor(
         public readonly host: HarnessHost,
@@ -181,13 +181,15 @@ function hostFromExplicit(explicit: string): HarnessHost | undefined {
  * the only host — ambient installs are never consulted.
  *
  * @throws HarnessNotFoundError when the selection names nothing usable.
- * @throws HarnessCompatibilityError when it names an out-of-range install.
+ * @throws HarnessCompatibilityError when it names an install below the floor;
+ *         one newer than any tested dsh is used with a warning.
  */
 export function resolveHost(explicit?: string): HarnessHost {
     if (explicit !== undefined && explicit !== BUNDLED_HOST) {
         const host = hostFromExplicit(explicit);
         if (host !== undefined) {
             if (!dshVersionSupported(host.dshVersion)) throw new HarnessCompatibilityError(host, supportedDshRange());
+            if (dshVersionUntested(host.dshVersion)) logWarn(untestedMessage(host.dshVersion ?? "unknown version", host.source));
             return host;
         }
         // An explicit path that does not resolve is an error, not a fallback:
