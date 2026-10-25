@@ -59,8 +59,10 @@ describe("ACP package manifest", () => {
         for (const [name, range] of dshDevelopmentPins) {
             if (range === standalone) continue;
             expect(semver.valid(range), `${name} pin ${range} must be an exact version`).toBeTruthy();
+            // lt/compare ignore includePrerelease (RangeOptions only); prerelease
+            // ordering is already part of the SemVer compare algorithm.
             expect(
-                semver.lt(range, standalone!, { includePrerelease: true }),
+                semver.lt(range, standalone!),
                 `${name}@${range} must be older than standaloneDsh ${standalone}`,
             ).toBe(true);
         }
