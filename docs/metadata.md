@@ -438,9 +438,32 @@ clients that provide a specialized renderer.
 
 ```json
 {
+  "mode": "form",
+  "sessionId": "…",
+  "toolCallId": "call-9",
+  "message": "Where should this run?",
+  "requestedSchema": {
+    "type": "object",
+    "required": [],
+    "properties": {
+      "question_0": {
+        "type": "string",
+        "title": "Target",
+        "oneOf": [
+          { "const": "option_0", "title": "Local", "description": "Run on this machine." }
+        ]
+      },
+      "question_0__other": {
+        "type": "string",
+        "title": "Other"
+      }
+    }
+  },
   "_meta": {
     "dsh.userQuestions": {
       "version": 1,
+      "callId": "call-9",
+      "timed": false,
       "questions": [
         {
           "id": "target",
@@ -466,6 +489,42 @@ Each question has required `id` and `question` strings. `header`, `detail`,
 `label` and can include `description`. The currently defined intent is
 `{ kind: "plan-review", approve: string }`; unknown future intents must fall
 back to the standard form presentation.
+
+### Form encoding
+
+- Question `i` maps to field `question_<i>`. A choice question emits
+  `{const: "option_<j>", title: "<label>"}` entries (an array field when
+  `multiSelect`); a question with no options is a free-text field. A choice
+  question also gets a `<name>__other` free-text companion field — the
+  established choice-UI convention — so a renderer can offer "Other" without
+  an extra enum value, while a generic client just renders one more optional
+  text input.
+- `required` is always empty and multi-select fields carry no `minItems`:
+  every DSH question is skippable, and an empty selection decodes to the
+  same skipped answer as an omitted field. Clients must not force a
+  selection before allowing submit.
+- When the DSH request names a call (`wait.callId`), the elicitation sets
+  the ACP `toolCallId` and echoes the same id at
+  `_meta["dsh.userQuestions"].callId` (`timed` marks a timed-mode ask).
+
+### Answer decoding
+
+On `action: "accept"`, each `question_<i>` value (string or array of
+strings) decodes `option_<j>` back to its option label; a client may also
+answer with a question's `id` as the content key, or with the literal option
+label — both are accepted. `<name>__other` (or `<question.id>__other`)
+becomes the answer's `custom` text; for a single-select question a non-empty
+custom answer takes precedence over any selection. `action: "cancel"`
+rejects the DSH request with `ASK_CANCELLED`.
+
+### Cancellation
+
+When the DSH wait is aborted the adapter maps the abort to
+`$/cancel_request` so the client can dismiss the ask UI — with one
+exception: a timed-mode ask that reaches its deadline stays open, because
+the DSH question is continued rather than cancelled. A late `accept`
+response still settles that pending RPC and is reported through the
+user-question `service.answer` path as a late answer.
 
 ## Compatibility checklist
 

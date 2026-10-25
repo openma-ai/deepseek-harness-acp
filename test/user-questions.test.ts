@@ -12,8 +12,17 @@ import type {
 } from "@deepseek-ai/dsh-user-questions";
 import * as bridge from "../src/bridge/index.ts";
 
+type CreateElicitation = (
+    request: CreateElicitationRequest,
+    options?: { signal?: AbortSignal },
+) => Promise<CreateElicitationResponse>;
+
 type UserQuestionBridge = {
-    questionsToElicitation?: (questions: AskUserQuestionItem[], sessionId: string) => CreateElicitationRequest;
+    questionsToElicitation?: (
+        questions: AskUserQuestionItem[],
+        sessionId: string,
+        wait?: AskUserQuestionRequest["wait"],
+    ) => CreateElicitationRequest;
     answerFromElicitation?: (
         questions: AskUserQuestionItem[],
         response: CreateElicitationResponse,
@@ -21,7 +30,7 @@ type UserQuestionBridge = {
     askUserQuestionsOverAcp?: (
         request: AskUserQuestionRequest,
         sessionId: string,
-        create: (request: CreateElicitationRequest) => Promise<CreateElicitationResponse>,
+        create: CreateElicitation,
         onLateAnswer?: (answer: AskUserQuestionAnswer) => void,
     ) => Promise<AskUserQuestionAnswer>;
     createElicitation?: (
@@ -35,7 +44,7 @@ type UserQuestionBridge = {
         options: {
             formSupported: () => boolean;
             sessionIdForRequest: (request: AskUserQuestionRequest) => string | undefined;
-            create: (request: CreateElicitationRequest) => Promise<CreateElicitationResponse>;
+            create: CreateElicitation;
         },
     ) => () => void;
 };
@@ -43,7 +52,7 @@ type UserQuestionBridge = {
 const subject = bridge as UserQuestionBridge;
 
 describe("ACP user-question elicitation", () => {
-    it("maps a DSH single-choice question onto a standard ACP form with an Other field", () => {
+    it("maps a DSH single-choice question onto a standard ACP form with an __other field", () => {
         const questions: AskUserQuestionItem[] = [{
             id: "target",
             header: "Target",
@@ -60,6 +69,7 @@ describe("ACP user-question elicitation", () => {
         expect(request).toMatchObject({
             mode: "form",
             sessionId: "s1",
+            message: "Where should this run?",
             requestedSchema: {
                 type: "object",
                 properties: {
@@ -70,10 +80,9 @@ describe("ACP user-question elicitation", () => {
                         oneOf: [
                             { const: "option_0", title: "Local", description: "Run on this machine." },
                             { const: "option_1", title: "Remote", description: "Run in the cluster." },
-                            { const: "custom_0", title: "Other" },
                         ],
                     },
-                    question_0_custom: {
+                    question_0__other: {
                         type: "string",
                         title: "Other",
                         description: "Type a custom answer.",
@@ -81,6 +90,10 @@ describe("ACP user-question elicitation", () => {
                 },
                 required: [],
             },
+        });
+        expect(request?._meta?.["dsh.userQuestions"]).toMatchObject({
+            version: 1,
+            questions,
         });
     });
 
@@ -92,15 +105,20 @@ describe("ACP user-question elicitation", () => {
             multiSelect: true,
         }], "s1");
 
+        // No minItems: an empty selection is the skipped answer, which clients
+        // must be able to submit for a skippable question.
         expect(request).toMatchObject({
             mode: "form",
             requestedSchema: {
                 required: [],
                 properties: {
-                    question_0: { type: "array", minItems: 1 },
+                    question_0: { type: "array" },
                 },
             },
         });
+        const schema = (request?.mode === "form" ? request.requestedSchema : undefined) as
+            { properties?: Record<string, unknown> } | undefined;
+        expect(schema?.properties?.["question_0"]).not.toHaveProperty("minItems");
     });
 
     it("restores multi-select labels and custom text from accepted form content", () => {
@@ -114,13 +132,71 @@ describe("ACP user-question elicitation", () => {
         const answer = subject.answerFromElicitation?.(questions, {
             action: "accept",
             content: {
-                question_0: ["option_0", "custom_0"],
-                question_0_custom: "Metrics",
+                question_0: ["option_0"],
+                question_0__other: "Metrics",
             },
         });
 
         expect(answer).toEqual({
             answers: [{ id: "features", selected: ["Cache"], custom: "Metrics" }],
+        });
+    });
+
+    it("decodes literal option labels clients send for declared choices", () => {
+        const questions: AskUserQuestionItem[] = [{
+            id: "target",
+            question: "Where should this run?",
+            options: [{ label: "Local" }, { label: "Remote" }],
+        }];
+
+        // A generic form client may submit the displayed label rather than the
+        // option_N const.
+        const answer = subject.answerFromElicitation?.(questions, {
+            action: "accept",
+            content: { question_0: "Remote" },
+        });
+
+        expect(answer).toEqual({
+            answers: [{ id: "target", selected: ["Remote"] }],
+        });
+    });
+
+    it("decodes answers keyed by question id for meta-aware clients", () => {
+        const questions: AskUserQuestionItem[] = [{
+            id: "target",
+            question: "Where should this run?",
+            options: [{ label: "Local" }, { label: "Remote" }],
+        }];
+
+        const answer = subject.answerFromElicitation?.(questions, {
+            action: "accept",
+            content: {
+                target: "Remote",
+                "target__other": "Colo",
+            },
+        });
+
+        expect(answer).toEqual({
+            answers: [{ id: "target", selected: [], custom: "Colo" }],
+        });
+    });
+
+    it("carries the dsh call id onto the elicitation toolCallId and meta for timed asks", () => {
+        const request = subject.questionsToElicitation?.(
+            [{ id: "confirm", question: "Continue?" }],
+            "s1",
+            { callId: "call-9" as never, timed: true },
+        );
+
+        expect(request).toMatchObject({
+            toolCallId: "call-9",
+            _meta: {
+                "dsh.userQuestions": {
+                    version: 1,
+                    callId: "call-9",
+                    timed: true,
+                },
+            },
         });
     });
 
@@ -175,25 +251,53 @@ describe("ACP user-question elicitation", () => {
         expect(sent).toEqual([request]);
     });
 
-    it("rejects a timed elicitation when the wait signal aborts, then delivers a late accept", async () => {
+    it("rejects a timed elicitation when the wait signal aborts, keeps the ask open, and delivers a late accept", async () => {
         const controller = new AbortController();
         const timeout = new UserQuestionError("ask_user_question timed out before the user answered", "ASK_TIMED_OUT");
         let finish: ((response: CreateElicitationResponse) => void) | undefined;
+        let cancelSignal: AbortSignal | undefined;
         const late: AskUserQuestionAnswer[] = [];
+        const pending = subject.askUserQuestionsOverAcp?.(
+            {
+                questions: [{ id: "confirm", question: "Continue?" }],
+                wait: { callId: "call-1" as never, timed: true },
+                signal: controller.signal,
+            },
+            "s1",
+            (_request, options) => {
+                cancelSignal = options?.signal;
+                return new Promise((resolve) => { finish = resolve; });
+            },
+            (answer) => { late.push(answer); },
+        );
+        controller.abort(timeout);
+        await expect(pending).rejects.toMatchObject({ code: "ASK_TIMED_OUT" });
+        // A timed-out question is continued, not cancelled: the client must not
+        // receive $/cancel_request, so the late accept still has an open RPC to
+        // settle.
+        expect(cancelSignal?.aborted).not.toBe(true);
+        finish?.({ action: "accept", content: { question_0: "yes" } });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(late).toEqual([{ answers: [{ id: "confirm", selected: [], custom: "yes" }] }]);
+    });
+
+    it("cancels the elicitation through $/cancel_request when the question ends", async () => {
+        const controller = new AbortController();
+        let cancelSignal: AbortSignal | undefined;
         const pending = subject.askUserQuestionsOverAcp?.(
             {
                 questions: [{ id: "confirm", question: "Continue?" }],
                 signal: controller.signal,
             },
             "s1",
-            () => new Promise((resolve) => { finish = resolve; }),
-            (answer) => { late.push(answer); },
+            (_request, options) => {
+                cancelSignal = options?.signal;
+                return new Promise<CreateElicitationResponse>(() => undefined);
+            },
         );
-        controller.abort(timeout);
-        await expect(pending).rejects.toMatchObject({ code: "ASK_TIMED_OUT" });
-        finish?.({ action: "accept", content: { question_0: "yes" } });
-        await new Promise((resolve) => setTimeout(resolve, 0));
-        expect(late).toEqual([{ answers: [{ id: "confirm", selected: [], custom: "yes" }] }]);
+        controller.abort(new Error("session closed"));
+        await expect(pending).rejects.toMatchObject({ code: "ASK_ABORTED" });
+        expect(cancelSignal?.aborted).toBe(true);
     });
 
     it("turns a cancelled elicitation into the user-question cancellation error", async () => {

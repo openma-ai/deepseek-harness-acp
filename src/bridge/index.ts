@@ -3167,7 +3167,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             const child = clientSubagents ? subagentByChild.get(String(request.agent.session.id)) : undefined;
             return child?.agent === request.agent ? child.childSessionId : undefined;
         },
-        create: (request) => conn.request("elicitation/create", request),
+        create: (request, options) => conn.request("elicitation/create", request,
+            options?.signal === undefined ? {} : { cancellationSignal: options.signal }),
     });
 
     let quiescing: Promise<void> | undefined;
