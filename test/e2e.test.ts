@@ -1025,7 +1025,7 @@ describe("dsh-acp server (e2e smoke)", () => {
                     args: [],
                     env: [{ name: "X", value: "1" }],
                 },
-                { type: "sse", name: "legacy", url: "http://127.0.0.1:1/sse" },
+                { type: "sse", name: "legacy", url: "http://127.0.0.1:1/sse", headers: [] },
             ],
         })) as Record<string, unknown>;
         expect(result["sessionId"]).toBeTruthy();
