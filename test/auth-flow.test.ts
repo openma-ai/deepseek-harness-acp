@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { RequestError } from "@agentclientprotocol/sdk";
+import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import { AuthLoginCancelled, runBrowserLogin } from "../src/bridge/auth-flow.ts";
 import type { LocalAuthPage } from "../src/auth-page.ts";
 

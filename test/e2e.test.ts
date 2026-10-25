@@ -763,7 +763,7 @@ function persistedSessionHeaders(sessionRoot: string): Array<Record<string, unkn
 }
 
 describe("subagent session origin", () => {
-    it("keeps child sessions out of the ACP session list and refuses to open them", async () => {
+    it.each([false, true])("keeps children restricted and routes delegation output (subagents=%s)", async (optIn) => {
         const sessionRoot = mkdtempSync(join(tmpdir(), "dsh-acp-subagent-origin-"));
         const workspace = mkdtempSync(join(tmpdir(), "dsh-acp-subagent-origin-ws-"));
         let parentTurns = 0;
@@ -793,7 +793,7 @@ describe("subagent session origin", () => {
             DSH_PERMISSION_MODE: "danger-full-access",
         });
         try {
-            await client.request("initialize", { protocolVersion: 1 }, 60_000);
+            await client.request("initialize", { protocolVersion: 1, ...(optIn ? { clientCapabilities: { subagents: {} } } : {}) }, 60_000);
             const { sessionId } = await client.request("session/new", { cwd: workspace, mcpServers: [] }) as { sessionId: string };
             await client.request("session/prompt", {
                 sessionId,
@@ -809,6 +809,36 @@ describe("subagent session origin", () => {
             expect(children).toHaveLength(2);
             expect(children.every((header) => header["origin"] === "subagent" && header["delegationDepth"] === 1)).toBe(true);
             expect(children.map((header) => header["isSeeded"]).sort()).toEqual([false, true]);
+
+            const updates = client.notifications.filter(n => n.method === "session/update").map(n => n.params);
+            const associations = updates.filter(n => (n["update"] as Record<string, unknown>)["sessionUpdate"] === "subagent_update");
+            if (optIn) {
+                expect(associations.length).toBeGreaterThanOrEqual(4);
+                for (const child of children) {
+                    const childId = String(child["id"]);
+                    const announce = updates.findIndex(n => n["sessionId"] === sessionId &&
+                        (n["update"] as Record<string, unknown>)["sessionUpdate"] === "subagent_update" &&
+                        (n["update"] as Record<string, unknown>)["sessionId"] === childId);
+                    const childOutput = updates.findIndex(n => n["sessionId"] === childId &&
+                        (n["update"] as Record<string, unknown>)["sessionUpdate"] === "agent_message_chunk");
+                    expect(announce).toBeGreaterThanOrEqual(0);
+                    expect(childOutput).toBeGreaterThan(announce);
+                    const messages = updates.filter(n => (n["update"] as Record<string, unknown>)["sessionUpdate"] === "session_message");
+                    const outgoing = messages.find(n => n["sessionId"] === childId)?.["update"] as Record<string, unknown> | undefined;
+                    const incoming = messages.filter(n => n["sessionId"] === sessionId &&
+                        (n["update"] as Record<string, unknown>)["senderSessionId"] === childId)
+                        .map(n => n["update"] as Record<string, unknown>);
+                    expect(outgoing?.["content"]).toEqual([{ type: "text", text: "CHILD" }]);
+                    expect(incoming).not.toHaveLength(0);
+                    const received = Object.assign({}, ...incoming);
+                    expect(received["senderMessageId"]).toBe(outgoing?.["messageId"]);
+                    const linkedOutgoing = Object.assign({}, ...messages.filter(n => n["sessionId"] === childId).map(n => n["update"]));
+                    expect(linkedOutgoing["recipientMessageId"]).toBe(received["messageId"]);
+                }
+            } else {
+                expect(associations).toEqual([]);
+            }
+
 
             const listed = await client.request("session/list", { cwd: workspace }) as {
                 sessions: Array<{ sessionId: string }>;
@@ -995,7 +1025,7 @@ describe("dsh-acp server (e2e smoke)", () => {
                     args: [],
                     env: [{ name: "X", value: "1" }],
                 },
-                { type: "sse", name: "legacy", url: "http://127.0.0.1:1/sse" },
+                { type: "sse", name: "legacy", url: "http://127.0.0.1:1/sse", headers: [] },
             ],
         })) as Record<string, unknown>;
         expect(result["sessionId"]).toBeTruthy();

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { RequestError } from "@agentclientprotocol/sdk";
+import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import { buildForkSeed, SessionSeq } from "@deepseek-ai/dsh-session";
 
 import {

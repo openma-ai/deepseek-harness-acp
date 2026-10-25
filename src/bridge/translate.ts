@@ -20,10 +20,16 @@ import type {
     ToolCallLocation,
     ToolKind,
     Usage,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 
 /** One ACP `session/update` payload (without the session id envelope). */
-export type SessionUpdate = SessionNotification["update"];
+// SDK 2.0.2 predates the Active RFD's two cross-view reference fields.
+// Keep that narrow additive delta typed here; the app transport preserves it.
+type LinkedSessionMessage = Extract<SessionNotification["update"], { sessionUpdate: "session_message" }> & {
+    senderMessageId?: string;
+    recipientMessageId?: string;
+};
+export type SessionUpdate = Exclude<SessionNotification["update"], { sessionUpdate: "session_message" }> | LinkedSessionMessage;
 
 /**
  * A harness session-log event, deliberately widened: `SessionEventMap` is

@@ -10,7 +10,7 @@
  * flow client-side, whether the key landed or the flow failed.
  */
 
-import type { CreateElicitationRequest, CreateElicitationResponse } from "@agentclientprotocol/sdk";
+import type { CreateElicitationRequest, CreateElicitationResponse } from "@agentclientprotocol/sdk/unstable";
 import type { LocalAuthPage } from "../auth-page.ts";
 import type { JsonRpcId } from "./request-ids.ts";
 
