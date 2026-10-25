@@ -4,7 +4,7 @@ import type {
     CreateElicitationResponse,
     ElicitationContentValue,
     ElicitationPropertySchema,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import { Service, type Context } from "@deepseek-ai/cordis";
 import {
     UserQuestionError,

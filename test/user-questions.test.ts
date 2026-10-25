@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { CreateElicitationRequest, CreateElicitationResponse } from "@agentclientprotocol/sdk";
+import type { CreateElicitationRequest, CreateElicitationResponse } from "@agentclientprotocol/sdk/unstable";
 import { Context } from "@deepseek-ai/cordis";
 import UserQuestionService, {
     UserQuestionError,

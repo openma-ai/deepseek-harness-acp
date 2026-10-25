@@ -7,7 +7,7 @@
  * not this agent stream. Unknown methods still reach AgentSideConnection.
  */
 
-import type { AnyMessage, Stream } from "@agentclientprotocol/sdk";
+import type { AnyMessage, Stream } from "@agentclientprotocol/sdk/unstable";
 
 /** Handler for one extra JSON-RPC request method. */
 export type AcpRpcHandler = (params: unknown) => unknown | Promise<unknown>;

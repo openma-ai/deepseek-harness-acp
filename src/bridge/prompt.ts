@@ -15,7 +15,7 @@
  * are still rejected — silently dropping them would be worse than refusing.
  */
 
-import type { ContentBlock as AcpContentBlock } from "@agentclientprotocol/sdk";
+import type { ContentBlock as AcpContentBlock } from "@agentclientprotocol/sdk/unstable";
 import type {
     ImageAttachmentRef,
     ImageMediaType as DshImageMediaType,

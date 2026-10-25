@@ -7,7 +7,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { Context } from "@deepseek-ai/cordis";
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
-import { AgentSideConnection } from "@agentclientprotocol/sdk";
+import { AgentContext } from "@agentclientprotocol/sdk/unstable";
 import * as bridge from "../src/bridge/index.ts";
 import { selfHarness } from "../src/bridge/self-harness.ts";
 
@@ -15,8 +15,8 @@ const AUTH_STATUS_UPDATE = "_auth/status_update";
 
 interface FakeAgent {
     id: string;
-    session: { id: string; header: { cwd: string }; snapshotEvents: () => unknown[] };
-    ctx: { on: () => () => void };
+    session: { id: string; header: { id: string; cwd: string }; snapshotEvents: () => unknown[] };
+    ctx: Context;
     options: { model?: string };
     cancel: ReturnType<typeof vi.fn>;
     followup: ReturnType<typeof vi.fn>;
@@ -27,8 +27,8 @@ interface FakeAgent {
 function fakeAgent(id: string, cwd: string): FakeAgent {
     return {
         id,
-        session: { id, header: { cwd }, snapshotEvents: () => [] },
-        ctx: { on: () => () => {} },
+        session: { id, header: { id, cwd }, snapshotEvents: () => [] },
+        ctx: new Context(),
         options: {},
         cancel: vi.fn(),
         followup: vi.fn(),
@@ -45,6 +45,7 @@ class BridgeClient {
     private buffered: Record<string, unknown>[] = [];
     private waiters: { match: (m: Record<string, unknown>) => boolean; resolve: (m: Record<string, unknown>) => void }[] = [];
     private nextId = 0;
+    readonly notifications: Record<string, unknown>[] = [];
     /** Handles agent→client requests (e.g. elicitation/create). */
     onClientRequest: ((message: Record<string, unknown>) => void) | undefined;
 
@@ -57,6 +58,7 @@ class BridgeClient {
             const { value, done } = await this.reader.read();
             if (done) return;
             const message = value as Record<string, unknown>;
+            if (message["method"] !== undefined && message["id"] === undefined) this.notifications.push(message);
             if (typeof message["method"] === "string" && message["id"] !== undefined) {
                 this.onClientRequest?.(message);
                 continue;
@@ -192,7 +194,8 @@ async function boot(options: BootOptions = {}) {
     });
     ctx.set("skills", { list: async () => options.skills ?? [] });
     ctx.set("subagents", { drainContinuableDescendants: async () => {} });
-    ctx.set("userQuestions", { registerProvider: () => () => {} });
+    let questionProvider: { ask: (request: unknown) => Promise<unknown> } | undefined;
+    ctx.set("userQuestions", { registerProvider: (provider: typeof questionProvider) => { questionProvider = provider; return () => {}; } });
 
     const client = new BridgeClient();
     const harness = selfHarness();
@@ -203,7 +206,7 @@ async function boot(options: BootOptions = {}) {
         env: options.env ?? { NODE_ENV: "production" },
         ...(options.provider !== undefined ? { provider: options.provider } : {}),
     });
-    return { ctx, client, creds, agents, createdAgents };
+    return { ctx, client, creds, agents, createdAgents, ask: (request: unknown) => questionProvider!.ask(request) };
 }
 
 function authMethodIds(result: Record<string, unknown>): string[] {
@@ -833,7 +836,7 @@ describe("_auth/status_update", () => {
 
     it("swallows extNotification failures inside publishAuthStatus", async () => {
         const spy = vi
-            .spyOn(AgentSideConnection.prototype, "extNotification")
+            .spyOn(AgentContext.prototype, "notify")
             .mockRejectedValue(new Error("client gone"));
         const { ctx, client, creds } = await boot({ providers: [{ id: "deepseek-official" }] });
         try {
@@ -849,5 +852,200 @@ describe("_auth/status_update", () => {
             spy.mockRestore();
             await ctx.fiber.dispose();
         }
+    });
+});
+
+
+// RFD contract tests exercise the bridge on its real JSON-RPC stream. DSH
+// lifecycle/interaction producers are controlled because no model is needed.
+describe("opt-in subagent sessions", () => {
+    async function setup(subagents: unknown) {
+        const env = await boot({ providers: [{ id: "deepseek" }] });
+        await env.client.request("initialize", {
+            protocolVersion: 1,
+            clientCapabilities: { ...(subagents !== undefined ? { subagents } : {}), elicitation: { form: {} } },
+        });
+        await env.client.request("authenticate", {
+            methodId: "api-key:deepseek", _meta: { "api-key": { apiKey: "test-key" } },
+        });
+        const response = await env.client.request("session/new", { cwd: "/ws", mcpServers: [] });
+        expect(response["error"]).toBeUndefined();
+        const id = (response["result"] as { sessionId: string }).sessionId;
+        const parent = env.createdAgents[0]!;
+        const { agent: child } = await env.agents.create({ sessionId: "child", meta: { cwd: "/child" } });
+        const emit = (agent: FakeAgent, type: string, data: unknown) => (agent.ctx.emit as (type: string, data: unknown) => void)(type, data);
+        const start = (agent = parent, childId = "child", runId = "r1") => emit(agent, "subagent/start", {
+            id: childId, runId, provider: "local", local: true,
+        });
+        const end = (stopReason = "completed", runId = "r1", childId = "child", agent = parent) => emit(agent, "subagent/end", {
+            id: childId, runId, provider: "local", local: true, stopReason,
+            lastAssistantMessage: [{ type: "text", text: "FINAL" }],
+        });
+        const flush = async () => { await env.client.request("session/list", {}); };
+        const updates = () => env.client.notifications.filter(n => n["method"] === "session/update")
+            .map(n => n["params"] as { sessionId: string; update: Record<string, unknown> });
+        return { ...env, id, parent, child, start, end, flush, updates };
+    }
+
+    it("announces before automatically routing child output and keeps reusable identities", async () => {
+        const e = await setup({});
+        try {
+            e.start();
+            e.ctx.emit("session/event", { header: { id: "child" } } as never, {
+                type: "assistant/message", data: { message: { content: [{ type: "text", text: "child answer" }] } },
+            } as never);
+            e.end();
+            e.start(e.parent, "child", "r2");
+            e.end("aborted", "r2");
+            await e.flush();
+            const updates = e.updates();
+            const associations = updates.filter(n => n.update["sessionUpdate"] === "subagent_update");
+            expect(associations).toEqual([
+                { sessionId: e.id, update: { sessionUpdate: "subagent_update", sessionId: "child", state: { state: "running" } } },
+                { sessionId: e.id, update: { sessionUpdate: "subagent_update", sessionId: "child", state: { state: "idle", stopReason: "end_turn" } } },
+                { sessionId: e.id, update: { sessionUpdate: "subagent_update", sessionId: "child", state: { state: "running" } } },
+                { sessionId: e.id, update: { sessionUpdate: "subagent_update", sessionId: "child", state: { state: "idle", stopReason: "cancelled" } } },
+            ]);
+            const output = updates.findIndex(n => n.sessionId === "child" && n.update["sessionUpdate"] === "agent_message_chunk");
+            expect(output).toBeGreaterThan(updates.indexOf(associations[0]!));
+            expect(updates[output]?.update["content"]).toEqual({ type: "text", text: "child answer" });
+        } finally { await e.ctx.fiber.dispose(); }
+    });
+
+    it("uses immediate parents, not the root, and retains routing after an activation ends", async () => {
+        const e = await setup({});
+        try {
+            const { agent: grandchild } = await e.agents.create({ sessionId: "grandchild" });
+            e.start();
+            e.end();
+            e.start(e.child, "grandchild", "r3");
+            e.end("error", "r3", "grandchild", e.child);
+            await e.flush();
+            expect(e.updates()).toContainEqual({ sessionId: "child", update: {
+                sessionUpdate: "subagent_update", sessionId: grandchild.id, state: { state: "running" },
+            } });
+            expect(e.updates()).toContainEqual({ sessionId: "child", update: {
+                sessionUpdate: "subagent_update", sessionId: grandchild.id, state: { state: "idle", stopReason: "error" },
+            } });
+        } finally { await e.ctx.fiber.dispose(); }
+    });
+
+    it("preserves final output as independently identified, linked child/parent message views", async () => {
+        const e = await setup({});
+        try {
+            e.start();
+            e.ctx.emit("session/event", e.parent.session as never, { type: "user/message", data: {
+                id: "delivery-1", source: { kind: "subagent-settled", senderSessionId: "child" },
+                content: [{ type: "text", text: "FINAL" }],
+            } } as never);
+            e.end(); await e.flush();
+            const messages = e.updates().filter(n => n.update["sessionUpdate"] === "session_message");
+            expect(new Set(messages.map(n => `${n.sessionId}:${n.update["messageId"]}`)).size).toBe(2);
+            const outgoing = messages.find(n => n.sessionId === "child")!;
+            const incomingViews = messages.filter(n => n.sessionId === e.id);
+            const incoming = { ...incomingViews[0]!, update: Object.assign({}, ...incomingViews.map(n => n.update)) };
+            expect(outgoing.update).toMatchObject({ senderSessionId: "child", recipientSessionId: e.id,
+                recipientMessageId: incoming.update["messageId"], content: [{ type: "text", text: "FINAL" }] });
+            expect(incoming.update).toMatchObject({ senderSessionId: "child", recipientSessionId: e.id,
+                senderMessageId: outgoing.update["messageId"], content: [{ type: "text", text: "FINAL" }] });
+            expect(outgoing.update["messageId"]).not.toBe(incoming.update["messageId"]);
+        } finally { await e.ctx.fiber.dispose(); }
+    });
+
+    it.each([undefined, null])("keeps legacy metadata without opt-in (%s)", async capability => {
+        const e = await setup(capability);
+        try {
+            e.start(); e.end(); await e.flush();
+            expect(e.updates().some(n => n.update["sessionUpdate"] === "subagent_update")).toBe(false);
+            expect(e.updates()).toEqual(expect.arrayContaining([expect.objectContaining({ sessionId: e.id,
+                update: expect.objectContaining({ _meta: expect.objectContaining({ dsh: expect.objectContaining({ event: "subagent/lifecycle" }) }) }),
+            })]));
+        } finally { await e.ctx.fiber.dispose(); }
+    });
+
+    it("links an observed foreground tool result to its child's final result without truncation", async () => {
+        const e = await setup({});
+        try {
+            e.start(); e.end();
+            e.ctx.emit("tools/result", { agent: e.parent, callId: "delegate-1" } as never, {
+                isError: false, value: { kind: "foreground", runId: "child", output: [{ type: "text", text: "x".repeat(24000) }] },
+            } as never);
+            await e.flush();
+            const messages = e.updates().filter(n => n.update["sessionUpdate"] === "session_message");
+            const incoming = messages.find(n => n.sessionId === e.id);
+            expect(incoming).toBeDefined();
+            expect(incoming!.update).toMatchObject({ senderSessionId: "child", recipientSessionId: e.id,
+                senderMessageId: "dsh:r1:out", content: [{ type: "text", text: "x".repeat(24000) }] });
+            expect(messages).toContainEqual({ sessionId: "child", update: {
+                sessionUpdate: "session_message", messageId: "dsh:r1:out", recipientMessageId: incoming!.update["messageId"],
+            } });
+        } finally { await e.ctx.fiber.dispose(); }
+    });
+
+    it("routes thoughts, tools, plans, usage and live assistant frames to the child", async () => {
+        const e = await setup({});
+        try {
+            e.start();
+            const event = (type: string, data: unknown) => e.ctx.emit("session/event", { header: { id: "child" } } as never, { type, data } as never);
+            event("assistant/chunk", { turn: 1, step: 0, chunk: { type: "reasoning-delta", text: "Thinking" } });
+            event("tool/call", { turn: 1, step: 0, callId: "tool-child", name: "bash", arguments: '{"command":"pwd"}' });
+            event("todo/write", { todos: [{ content: "Investigate", status: "in_progress" }] });
+            event("request/context", { contextWindow: 1000 });
+            event("assistant/message", { turn: 1, step: 1, message: { content: [{ type: "text", text: "answer" }] }, usage: { inputTokens: 100, outputTokens: 20 } });
+            e.ctx.emit("agent/assistant-stream", { agent: e.child, frame: { type: "start", attemptId: "a2", turn: 2, step: 0 } } as never);
+            e.ctx.emit("agent/assistant-stream", { agent: e.child, frame: { type: "chunk", attemptId: "a2", chunk: { type: "text-delta", index: 0, text: "LIVE" } } } as never);
+            await e.flush();
+            const updates = e.updates();
+            for (const kind of ["agent_thought_chunk", "tool_call", "plan", "usage_update", "agent_message_chunk"]) {
+                expect(updates.some(n => n.sessionId === "child" && n.update["sessionUpdate"] === kind)).toBe(true);
+                expect(updates.some(n => n.sessionId === e.id && n.update["sessionUpdate"] === kind)).toBe(false);
+            }
+        } finally { await e.ctx.fiber.dispose(); }
+    });
+
+    it("does not invent a parent receipt merely because a child completed", async () => {
+        const e = await setup({});
+        try {
+            e.start(); e.end(); await e.flush();
+            const incoming = e.updates().filter(n => n.sessionId === e.id && n.update["sessionUpdate"] === "session_message");
+            expect(incoming).toEqual([]);
+        } finally { await e.ctx.fiber.dispose(); }
+    });
+
+    it("reports repeated work and late final chunks without requiring a fresh activation", async () => {
+        const e = await setup({});
+        try {
+            e.start(); e.end();
+            e.ctx.emit("agent/status", { agent: e.child, status: "running" } as never);
+            e.ctx.emit("session/event", { header: { id: "child" } } as never, {
+                type: "turn/end", data: { turn: "t2", reason: { kind: "max-tokens" } },
+            } as never);
+            e.ctx.emit("agent/status", { agent: e.child, status: "idle" } as never);
+            await e.flush();
+            const states = e.updates().filter(n => n.update["sessionUpdate"] === "subagent_update").map(n => n.update["state"]);
+            expect(states.slice(-2)).toEqual([{ state: "running" }, { state: "idle", stopReason: "max_tokens" }]);
+        } finally { await e.ctx.fiber.dispose(); }
+    });
+
+    it("routes child permissions and elicitation to the child after announcement", async () => {
+        const e = await setup({});
+        try {
+            e.start();
+            const requests: Record<string, unknown>[] = [];
+            e.client.onClientRequest = message => {
+                requests.push(message);
+                void e.client.respond(message["id"], message["method"] === "session/request_permission"
+                    ? { outcome: { outcome: "selected", optionId: "allow-once" } }
+                    : { action: "accept", content: { question_0: "option_0" } });
+            };
+            const decision = await e.ctx.waterfall("approval/request", { agent: e.child, callId: "call-1" } as never,
+                (() => "fallback") as never);
+            expect(decision).toBe("allowed-once");
+            const answer = await e.ask({ agent: e.child, questions: [{ id: "q", question: "Continue?", options: [{ label: "yes" }] }] });
+            expect(answer).toBeDefined();
+            expect(e.parent.cancel).not.toHaveBeenCalled();
+            expect(requests.map(r => (r["params"] as { sessionId: string }).sessionId)).toEqual(["child", "child"]);
+            expect(e.updates().find(n => n.update["sessionUpdate"] === "subagent_update")).toMatchObject({ sessionId: e.id, update: { sessionUpdate: "subagent_update", sessionId: "child" } });
+        } finally { await e.ctx.fiber.dispose(); }
     });
 });

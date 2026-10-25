@@ -24,11 +24,11 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { isAbsolute } from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
-    AgentSideConnection,
+    agent as acpApp,
+    type AgentContext,
     ndJsonStream,
     PROTOCOL_VERSION,
     RequestError,
-    type Agent as AcpAgent,
     type AuthenticateRequest,
     type AuthMethod,
     type CancelNotification,
@@ -57,7 +57,7 @@ import {
     type SetSessionModeResponse,
     type StopReason,
     type Stream,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import { z } from "zod";
 import type { Context } from "@deepseek-ai/cordis";
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
@@ -405,21 +405,28 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     const commandPublications = new LatestPublication();
     interface LiveSubagent {
         rootSessionId: string;
+        parentSessionId: string;
+        agent: Agent | undefined;
         childSessionId: string;
         runId: string;
         provider: string;
         toolCallId: string;
         projection: SessionProjection;
+        lastStopReason?: string;
+        workState?: "running" | "idle";
+        receiptId?: string;
+        resultId?: string;
     }
     const subagentByChild = new Map<string, LiveSubagent>();
     const subagentByRun = new Map<string, LiveSubagent>();
     const watchedSubagentParents = new WeakSet<object>();
     let closed = false;
-    let conn: AgentSideConnection;
+    let conn: AgentContext;
     /** Whether the client renders `_meta.terminal_output` display terminals. */
     let clientTerminalOutput = false;
     /** Whether the client wants nested child text/thought/tool updates. */
     let clientSubagentTranscript = false;
+    let clientSubagents = false;
     /** Whether the client can render standard ACP form elicitation. */
     let clientElicitationForm = false;
     /** Explicit interaction semantics negotiated from ACP client `_meta`. */
@@ -1157,7 +1164,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
 
     /** Send one update without letting a disconnected client fail an agent turn. */
     const notify = (sessionId: string, update: SessionUpdate): void => {
-        void conn.sessionUpdate({ sessionId, update }).catch((error: unknown) => {
+        void conn.notify("session/update", { sessionId, update }).catch((error: unknown) => {
             logWarn(`session/update failed: ${String(error)}`);
         });
     };
@@ -1190,21 +1197,43 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 local: info.local,
                 ...(parentLink !== undefined ? { parentToolCallId: parentLink.toolCallId } : {}),
             };
-            for (const update of record.projection.onEvent({ type: "subagent/start", data: payload })) {
-                notify(rootSessionId, update);
+            const parentSessionId = String(parent.session.id);
+            // Identity is a conversation, not an activation. Never reparent it.
+            const existing = subagentByChild.get(childSessionId);
+            let ancestor: string | undefined = parentSessionId;
+            while (ancestor !== undefined && ancestor !== childSessionId) ancestor = subagentByChild.get(ancestor)?.parentSessionId;
+            if (ancestor === childSessionId || sessions.has(childSessionId) ||
+                (existing !== undefined && existing.parentSessionId !== parentSessionId)) {
+                logWarn(`refusing to reparent subagent ${childSessionId}`);
+                return;
+            }
+            if (clientSubagents) {
+                notify(parentSessionId, {
+                    sessionUpdate: "subagent_update", sessionId: childSessionId,
+                    state: { state: "running" },
+                });
+            } else {
+                for (const update of record.projection.onEvent({ type: "subagent/start", data: payload })) {
+                    notify(rootSessionId, update);
+                }
             }
 
             const child = agents.get(info.id);
             const link: LiveSubagent = {
                 rootSessionId,
+                parentSessionId,
+                agent: child,
                 childSessionId,
                 runId,
                 provider: info.provider,
                 toolCallId,
+                ...(clientSubagents ? { workState: "running" as const } : {}),
                 projection: new SessionProjection(undefined, {
                     terminalOutput: clientTerminalOutput,
                     ...(child?.session.header.cwd !== undefined ? { cwd: child.session.header.cwd } : {}),
-                    subagent: { childSessionId, parentToolCallId: toolCallId, provider: info.provider },
+                    ...(!clientSubagents ? {
+                        subagent: { childSessionId, parentToolCallId: toolCallId, provider: info.provider },
+                    } : {}),
                 }),
             };
             subagentByChild.set(childSessionId, link);
@@ -1230,12 +1259,50 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                         : {}),
                     ...(parentLink !== undefined ? { parentToolCallId: parentLink.toolCallId } : {}),
                 };
-                for (const update of record.projection.onEvent({ type: "subagent/end", data: payload })) {
-                    notify(link.rootSessionId, update);
+                if (clientSubagents) {
+                    // Lifecycle completion observes outgoing output, not receipt.
+                    // Only a durable parent user/message can confirm that side.
+                    const text = info.lastAssistantMessage?.flatMap(block =>
+                        block.type === "text" ? [block.text] : []).join("");
+                    if (text !== undefined && text.length > 0) {
+                        const outgoingId = `dsh:${runId}:out`;
+                        const message = {
+                            sessionUpdate: "session_message" as const,
+                            senderSessionId: link.childSessionId,
+                            recipientSessionId: link.parentSessionId,
+                            content: [{ type: "text" as const, text }],
+                        };
+                        link.resultId = outgoingId;
+                        notify(link.childSessionId, { ...message, messageId: outgoingId,
+                            ...(link.receiptId !== undefined ? { recipientMessageId: link.receiptId } : {}),
+                        });
+                        if (link.receiptId !== undefined) {
+                            notify(link.parentSessionId, { sessionUpdate: "session_message", messageId: link.receiptId,
+                                senderMessageId: outgoingId,
+                            });
+                        }
+                    }
+                    const reasons: Record<string, string> = {
+                        completed: "end_turn", aborted: "cancelled", "max-tokens": "max_tokens",
+                        refusal: "refusal", error: "error",
+                    };
+                    // Older activations can settle after a new one has started.
+                    if (subagentByChild.get(link.childSessionId)?.runId === runId) {
+                        link.lastStopReason = reasons[info.stopReason] ?? "error";
+                        link.workState = "idle";
+                        notify(link.parentSessionId, {
+                            sessionUpdate: "subagent_update", sessionId: link.childSessionId,
+                            state: { state: "idle", stopReason: link.lastStopReason },
+                        });
+                    }
+                } else {
+                    for (const update of record.projection.onEvent({ type: "subagent/end", data: payload })) {
+                        notify(link.rootSessionId, update);
+                    }
                 }
             }
             subagentByRun.delete(runId);
-            if (subagentByChild.get(link.childSessionId)?.runId === runId) {
+            if (!clientSubagents && subagentByChild.get(link.childSessionId)?.runId === runId) {
                 subagentByChild.delete(link.childSessionId);
             }
         });
@@ -1889,7 +1956,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         if (json === lastAuthStatus) return;
         lastAuthStatus = json;
         try {
-            await conn.extNotification("_auth/status_update", { authStatus: status });
+            await conn.notify("_auth/status_update", { authStatus: status });
         } catch (error: unknown) {
             logDebug(`_auth/status_update failed: ${String(error)}`);
         }
@@ -1910,8 +1977,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         try {
             await runBrowserLogin(
                 {
-                    createElicitation: (request) => conn.createElicitation(request),
-                    completeElicitation: (params) => conn.completeElicitation(params),
+                    createElicitation: (request) => conn.request("elicitation/create", request),
+                    completeElicitation: (params) => conn.notify("elicitation/complete", params),
                     startPage: (options) => startLocalAuthPage(options),
                     openPage: (url) => openLocalAuthPage(url),
                     saveCredential: (key) => saveCredential(provider, key),
@@ -2121,6 +2188,64 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             ownedRecord(exec.agent)?.projection
             ?? subagentByChild.get(String(exec.agent.session.id))?.projection;
         projection?.recordToolResult(String(exec.callId), result.value);
+        // DSH's foreground tool seam exposes the exact returned child output;
+        // unlike subagent/end this is evidence of delivery to the caller.
+        if (!clientSubagents || result.value === null || typeof result.value !== "object") return;
+        const value = result.value as { kind?: unknown; runId?: unknown; output?: unknown };
+        if (value.kind !== "foreground" || typeof value.runId !== "string" || !Array.isArray(value.output)) return;
+        const child = subagentByChild.get(value.runId);
+        const parentId = String(exec.agent.session.id);
+        if (child === undefined || child.parentSessionId !== parentId) return;
+        const receiptId = `dsh:tool-result:${String(exec.callId)}`;
+        child.receiptId = receiptId;
+        notify(parentId, {
+            sessionUpdate: "session_message", messageId: receiptId,
+            senderSessionId: child.childSessionId, recipientSessionId: parentId,
+            content: value.output.flatMap(block => block?.type === "text" && typeof block.text === "string"
+                ? [{ type: "text" as const, text: block.text }] : []),
+            ...(child.resultId !== undefined ? { senderMessageId: child.resultId } : {}),
+        });
+        if (child.resultId !== undefined) {
+            notify(child.childSessionId, { sessionUpdate: "session_message", messageId: child.resultId, recipientMessageId: receiptId });
+        }
+    });
+
+    // Only actual consumed messages establish incoming transcript entries.
+    const publishDirectedReceipt = (recipient: string, event: HarnessEvent): boolean => {
+        if (!clientSubagents || event.type !== "user/message" || event.data === undefined) return false;
+        const source = event.data["source"] as { kind?: string; senderSessionId?: string } | undefined;
+        const sender = source?.senderSessionId;
+        if (sender === undefined || typeof event.data["id"] !== "string") return false;
+        const link = subagentByChild.get(sender);
+        if (link === undefined && !sessions.has(sender)) return false;
+        const content = event.data["content"];
+        if (!Array.isArray(content)) return false;
+        const messageId = `dsh:received:${event.data["id"]}`;
+        const isSettlement = source?.kind === "subagent-settled" && link?.parentSessionId === recipient;
+        if (isSettlement) link.receiptId = messageId;
+        notify(recipient, {
+            sessionUpdate: "session_message", messageId, senderSessionId: sender, recipientSessionId: recipient,
+            content: content.flatMap(block => block?.type === "text" && typeof block.text === "string"
+                ? [{ type: "text" as const, text: block.text }] : []),
+            ...(isSettlement && link.resultId !== undefined ? { senderMessageId: link.resultId } : {}),
+        });
+        if (isSettlement && link.resultId !== undefined) {
+            notify(sender, { sessionUpdate: "session_message", messageId: link.resultId, recipientMessageId: messageId });
+        }
+        return true;
+    };
+
+    ctx.on("agent/status", ({ agent, status }) => {
+        if (!clientSubagents) return;
+        const child = subagentByChild.get(String(agent.session.id));
+        if (child === undefined || child.agent !== agent || child.workState === status) return;
+        child.workState = status;
+        if (status === "running") delete child.lastStopReason;
+        notify(child.parentSessionId, {
+            sessionUpdate: "subagent_update", sessionId: child.childSessionId,
+            state: status === "running" ? { state: "running" }
+                : child.lastStopReason !== undefined ? { state: "idle", stopReason: child.lastStopReason } : { state: "idle" },
+        });
     });
 
     ctx.on("session/event", (session, event: SessionEvent) => {
@@ -2128,15 +2253,22 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         const record = sessions.get(sessionId);
         if (record === undefined || record.agent.session !== session) {
             const child = subagentByChild.get(sessionId);
-            if (child !== undefined && clientSubagentTranscript) {
-                for (const update of child.projection.onEvent(event as unknown as HarnessEvent)) {
-                    notify(child.rootSessionId, update);
+            if (child !== undefined && (clientSubagents || clientSubagentTranscript)) {
+                const harnessEvent = event as unknown as HarnessEvent;
+                if (harnessEvent.type === "turn/end" && harnessEvent.data !== undefined) {
+                    const reason = harnessEvent.data["reason"] as { kind?: string } | undefined;
+                    child.lastStopReason = reason?.kind === "error" ? "error" : turnEndToStopReason(reason as Parameters<typeof turnEndToStopReason>[0]);
+                }
+                if (publishDirectedReceipt(sessionId, harnessEvent)) return;
+                for (const update of child.projection.onEvent(harnessEvent)) {
+                    notify(clientSubagents ? child.childSessionId : child.rootSessionId, update);
                 }
             }
             return;
         }
         try {
             const harnessEvent = event as unknown as HarnessEvent;
+            if (publishDirectedReceipt(sessionId, harnessEvent)) return;
             for (const update of record.projection.onEvent(harnessEvent)) {
                 notify(sessionId, update);
             }
@@ -2169,8 +2301,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             return;
         }
         const child = subagentByChild.get(sessionId);
-        if (child !== undefined && clientSubagentTranscript) {
-            for (const update of child.projection.onAssistantStream(frame)) notify(child.rootSessionId, update);
+        if (child !== undefined && (clientSubagents || clientSubagentTranscript)) {
+            for (const update of child.projection.onAssistantStream(frame)) notify(clientSubagents ? child.childSessionId : child.rootSessionId, update);
         }
     });
 
@@ -2193,10 +2325,12 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     // session" convenience that flips the harness approval policy to 'never'.
     ctx.on("approval/request", (request, next) => {
         const record = ownedRecord(request.agent);
-        if (record === undefined || request.callId === undefined) return next();
+        const child = clientSubagents ? subagentByChild.get(String(request.agent.session.id)) : undefined;
+        if ((record === undefined && child?.agent !== request.agent) || request.callId === undefined) return next();
+        const sessionId = record !== undefined ? String(record.agent.session.id) : child!.childSessionId;
         return conn
-            .requestPermission({
-                sessionId: String(record.agent.session.id),
+            .request("session/request_permission", {
+                sessionId,
                 toolCall: { toolCallId: request.callId },
                 options: [
                     { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
@@ -2207,7 +2341,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             .then(({ outcome }) => {
                 if (outcome.outcome === "cancelled") return "cancelled" as const;
                 if (outcome.optionId === "allow-always") {
-                    setApprovalPolicy(record, "never");
+                    if (record !== undefined) setApprovalPolicy(record, "never");
+                    else approval.setPolicy(request.agent, "never");
                     return "allowed-once" as const;
                 }
                 return outcome.optionId === "allow-once" ? ("allowed-once" as const) : ("rejected" as const);
@@ -2218,7 +2353,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     // The ACP agent                                                       //
     // ------------------------------------------------------------------ //
 
-    const makeAgent = (connection: AgentSideConnection): AcpAgent => {
+    const makeAgent = (connection: AgentContext) => {
         conn = connection;
         return {
             async initialize(params: InitializeRequest): Promise<InitializeResponse> {
@@ -2237,6 +2372,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     capsMeta !== null && typeof capsMeta === "object"
                         ? capsMeta["subagent-transcript"] === true
                         : false;
+                clientSubagents = params.clientCapabilities?.subagents != null;
                 clientInteractionMode = interactionModeFromClientMeta(capsMeta);
                 clientElicitationForm =
                     params.clientCapabilities?.elicitation?.form !== undefined &&
@@ -2566,7 +2702,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 return { sessions: sessionsInfo };
             },
 
-            async extMethod(method, params): Promise<Record<string, unknown>> {
+            async extMethod(method: string, params: unknown): Promise<Record<string, unknown>> {
                 if (method !== "_session/steering") throw RequestError.methodNotFound(method);
                 assertOpen();
                 const parsed = steeringRequestSchema.safeParse(params);
@@ -3027,9 +3163,11 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         sessionIdForRequest: (request) => {
             if (request.agent === undefined) return undefined;
             const record = ownedRecord(request.agent);
-            return record === undefined ? undefined : String(record.agent.session.id);
+            if (record !== undefined) return String(record.agent.session.id);
+            const child = clientSubagents ? subagentByChild.get(String(request.agent.session.id)) : undefined;
+            return child?.agent === request.agent ? child.childSessionId : undefined;
         },
-        create: (request) => userQuestionsPlugin.createElicitation(conn, request),
+        create: (request) => conn.request("elicitation/create", request),
     });
 
     let quiescing: Promise<void> | undefined;
@@ -3078,9 +3216,26 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     // The tap records inbound request ids for request-scoped url elicitation
     // (browser login during `authenticate`, which has no session).
     const stream = muxAcpStream(tapRequestIds(raw, requestIds), rpc);
-    conn = new AgentSideConnection(makeAgent, stream);
+    const app = acpApp();
+    let handlers: ReturnType<typeof makeAgent>;
+    app.onConnect((connection) => { handlers = makeAgent(connection.client); });
+    app.onRequest("initialize", ({ params }) => handlers.initialize(params));
+    app.onRequest("authenticate", ({ params }) => handlers.authenticate(params));
+    app.onRequest("logout", ({ params }) => handlers.logout(params));
+    app.onRequest("session/new", ({ params }) => handlers.newSession(params));
+    app.onRequest("session/load", ({ params }) => handlers.loadSession(params));
+    app.onRequest("session/fork", ({ params }) => handlers.unstable_forkSession(params));
+    app.onRequest("session/resume", ({ params }) => handlers.resumeSession(params));
+    app.onRequest("session/list", ({ params }) => handlers.listSessions(params));
+    app.onRequest("session/prompt", ({ params }) => handlers.prompt(params));
+    app.onRequest("session/set_mode", ({ params }) => handlers.setSessionMode(params));
+    app.onRequest("session/set_config_option", ({ params }) => handlers.setSessionConfigOption(params));
+    app.onRequest("session/close", ({ params }) => handlers.closeSession(params));
+    app.onRequest("*", ({ method, params }) => handlers.extMethod(method, params));
+    app.onNotification("session/cancel", ({ params }) => handlers.cancel(params));
+    const connection = app.connect(stream);
 
-    void conn.closed
+    void connection.closed
         .catch((error: unknown) => {
             logWarn(`connection closed with an error: ${String(error)}`);
         })

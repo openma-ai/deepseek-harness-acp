@@ -7,7 +7,7 @@
  * recent inbound request per method.
  */
 
-import type { AnyMessage, Stream } from "@agentclientprotocol/sdk";
+import type { AnyMessage, Stream } from "@agentclientprotocol/sdk/unstable";
 
 export type JsonRpcId = string | number;
 

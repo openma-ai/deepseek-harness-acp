@@ -20,7 +20,7 @@ describe("ACP package manifest", () => {
             };
         };
         expect(manifest.dependencies).toEqual({
-            "@agentclientprotocol/sdk": "1.4.0",
+            "@agentclientprotocol/sdk": "2.0.2",
             semver: "^7.8.5",
             tar: "7.5.22",
             yaml: "^2.9.1",

@@ -1,7 +1,7 @@
 /** Reusable ACP server provider: one Host composition, many owned transports. */
 
 import type { Context } from "@deepseek-ai/cordis";
-import type { Stream } from "@agentclientprotocol/sdk";
+import type { Stream } from "@agentclientprotocol/sdk/unstable";
 
 import * as bridge from "./bridge/index.ts";
 import { selfHarness } from "./bridge/self-harness.ts";
