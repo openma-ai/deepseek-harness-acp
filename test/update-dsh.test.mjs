@@ -27,14 +27,25 @@ function manifest(overrides = {}) {
     };
 }
 
-function fakeSeams({ latest = LATEST, versions = VERSIONS, manifestValue = manifest(), runtime = { dependencies: {} } } = {}) {
-    const npm = vi.fn((args) => (args.includes("dist-tags.latest") ? latest : versions));
+function fakeSeams({ latest = LATEST, versions = VERSIONS, packageVersions = {}, manifestValue = manifest(), runtime = { dependencies: {} } } = {}) {
+    const npm = vi.fn((args) => {
+        if (args.includes("dist-tags.latest")) return latest;
+        if (args.includes("versions")) {
+            const name = args[1];
+            if (name === "@deepseek-ai/dsh") return versions;
+            if (packageVersions[name] !== undefined) return packageVersions[name];
+            // Default: every other @deepseek-ai/dsh-* package publishes `latest`.
+            return versions;
+        }
+        return versions;
+    });
     const writes = [];
     const appended = [];
     const log = vi.fn();
     const fs = {
         readJson: (path) => (path === "package.json" ? manifestValue : runtime),
         writeJson: (path, value) => writes.push([path, value]),
+        writeText: (path, text) => writes.push([path, text]),
         append: (path, text) => appended.push([path, text]),
     };
     return { npm, fs, env: {}, log, writes, appended };
@@ -87,8 +98,33 @@ describe("updateDshManifests", () => {
         expect(next.devDependencies["@deepseek-ai/dsh-agent"]).toBe(LATEST);
         expect(next.devDependencies["other"]).toBe("1.0.0");
         expect(written["runtime/package.json"].dependencies["@deepseek-ai/dsh"]).toBe(LATEST);
-        expect(written["runtime/compatibility.json"]).toEqual(["0.1.7-rc.2", "0.2.0-rc.1", "0.2.0-rc.2"]);
+        expect(written["runtime/compatibility.json"]).toBe(JSON.stringify(["0.1.7-rc.2", "0.2.0-rc.1", "0.2.0-rc.2"]) + "\n");
         expect(seams.appended).toEqual([]);
+    });
+
+    it("keeps dsh-* pins that do not publish the new version", () => {
+        const seams = fakeSeams({
+            manifestValue: manifest({
+                devDependencies: {
+                    "@deepseek-ai/dsh": "0.1.7-rc.2",
+                    "@deepseek-ai/dsh-agent": "0.1.7-rc.2",
+                    "@deepseek-ai/dsh-invariants": "0.1.7-rc.2",
+                    other: "1.0.0",
+                },
+            }),
+            packageVersions: {
+                "@deepseek-ai/dsh-agent": VERSIONS,
+                "@deepseek-ai/dsh-invariants": ["0.1.7-rc.2"], // no LATEST
+            },
+        });
+        expect(updateDshManifests(seams)).toMatchObject({ changed: true });
+        const next = Object.fromEntries(seams.writes)["package.json"];
+        expect(next.devDependencies["@deepseek-ai/dsh"]).toBe(LATEST);
+        expect(next.devDependencies["@deepseek-ai/dsh-agent"]).toBe(LATEST);
+        expect(next.devDependencies["@deepseek-ai/dsh-invariants"]).toBe("0.1.7-rc.2");
+        expect(seams.log).toHaveBeenCalledWith(
+            `Keeping @deepseek-ai/dsh-invariants@0.1.7-rc.2 (no ${LATEST} on npm)`,
+        );
     });
 
     it("appends the changed marker to GITHUB_OUTPUT when set", () => {

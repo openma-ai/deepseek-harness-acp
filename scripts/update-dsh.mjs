@@ -8,6 +8,16 @@ import { pathToFileURL } from "node:url";
  * the compatibility matrix. The manifest logic takes injectable seams so
  * the release path is covered by unit tests (issue #157).
  */
+function packagePublishesVersion(npm, name, version) {
+    try {
+        const published = npm(["view", name, "versions"]);
+        const list = Array.isArray(published) ? published : [published];
+        return list.includes(version);
+    } catch {
+        return false;
+    }
+}
+
 export function updateDshManifests({ npm, fs, env = process.env, log = console.log }) {
     const manifest = fs.readJson("package.json");
     const latest = npm(["view", "@deepseek-ai/dsh", "dist-tags.latest"]);
@@ -32,13 +42,21 @@ export function updateDshManifests({ npm, fs, env = process.env, log = console.l
     // not the tested matrix: newer dsh releases stay attempted.
     // Raising the floor is a deliberate maintainer change, never automatic.
     for (const name of Object.keys(manifest.devDependencies)) {
-        if (name === "@deepseek-ai/dsh" || name.startsWith("@deepseek-ai/dsh-")) manifest.devDependencies[name] = latest;
+        if (name !== "@deepseek-ai/dsh" && !name.startsWith("@deepseek-ai/dsh-")) continue;
+        // Some @deepseek-ai/dsh-* packages lag the CLI release (e.g. dsh-invariants
+        // stopped at 0.2.0-rc.2). Only rewrite pins that actually publish `latest`.
+        if (!packagePublishesVersion(npm, name, latest)) {
+            log(`Keeping ${name}@${manifest.devDependencies[name]} (no ${latest} on npm)`);
+            continue;
+        }
+        manifest.devDependencies[name] = latest;
     }
     const runtime = fs.readJson("runtime/package.json");
     runtime.dependencies["@deepseek-ai/dsh"] = latest;
     fs.writeJson("package.json", manifest);
     fs.writeJson("runtime/package.json", runtime);
-    fs.writeJson("runtime/compatibility.json", matrix);
+    // Single-line: CI feeds this file into GITHUB_OUTPUT / fromJSON matrices.
+    fs.writeText("runtime/compatibility.json", `${JSON.stringify(matrix)}\n`);
     log(`Upgrade dsh ${previous} -> ${latest}; profile matrix: ${matrix.join(", ")}`);
     if (env.GITHUB_OUTPUT) fs.append(env.GITHUB_OUTPUT, `changed=true\nversion=${latest}\nprevious=${previous}\n`);
     return { changed: true, latest, previous, matrix };
@@ -49,6 +67,7 @@ const realSeams = {
     fs: {
         readJson: (path) => JSON.parse(readFileSync(path, "utf8")),
         writeJson: (path, value) => writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`),
+        writeText: (path, text) => writeFileSync(path, text),
         append: (path, text) => appendFileSync(path, text),
     },
 };

@@ -12,7 +12,7 @@
   "bugs": {
     "url": "https://github.com/openma-ai/deepseek-harness-acp/issues"
   },
-  "description": "Agent Client Protocol (ACP) adapter for DeepSeek Harness — use DeepSeek Harness from ACP clients such as Zed.",
+  "description": "Agent Client Protocol (ACP) adapter for DeepSeek Harness \u2014 use DeepSeek Harness from ACP clients such as Zed.",
   "main": "dist/index.js",
   "bin": {
     "dsh-acp": "dist/bin.js"
@@ -75,7 +75,7 @@
     "@deepseek-ai/dsh-goal": "0.2.1-rc.2",
     "@deepseek-ai/dsh-goal-round-driver": "0.2.1-rc.2",
     "@deepseek-ai/dsh-home-paths": "0.2.1-rc.2",
-    "@deepseek-ai/dsh-invariants": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-invariants": "0.2.0-rc.2",
     "@deepseek-ai/dsh-jobs-local": "0.2.1-rc.2",
     "@deepseek-ai/dsh-launch-environment": "0.2.1-rc.2",
     "@deepseek-ai/dsh-llm": "0.2.1-rc.2",
