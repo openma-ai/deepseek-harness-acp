@@ -49,10 +49,21 @@ describe("ACP package manifest", () => {
         expect(manifest.dshAcp?.standaloneDsh).toMatch(/^\d+\.\d+\.\d+(?:-rc\.\d+)?$/);
         expect(manifest.dshAcp?.hostCompatibility).toEqual({ cordisProtocol: 0, policy: "capability-negotiated" });
 
-        const dshDevelopmentRanges = Object.entries(manifest.devDependencies ?? {})
-            .filter(([name]) => name === "@deepseek-ai/dsh" || name.startsWith("@deepseek-ai/dsh-"))
-            .map(([, range]) => range);
-        expect(new Set(dshDevelopmentRanges)).toEqual(new Set([manifest.dshAcp?.standaloneDsh]));
+        // Most @deepseek-ai/dsh* pins track standaloneDsh. Some packages lag the
+        // CLI release when npm never published that version (e.g. dsh-invariants
+        // stopped at 0.2.0-rc.2) — scripts/update-dsh.mjs keeps those older pins.
+        const standalone = manifest.dshAcp?.standaloneDsh;
+        const dshDevelopmentPins = Object.entries(manifest.devDependencies ?? {})
+            .filter(([name]) => name === "@deepseek-ai/dsh" || name.startsWith("@deepseek-ai/dsh-"));
+        expect(dshDevelopmentPins.some(([, range]) => range === standalone)).toBe(true);
+        for (const [name, range] of dshDevelopmentPins) {
+            if (range === standalone) continue;
+            expect(semver.valid(range), `${name} pin ${range} must be an exact version`).toBeTruthy();
+            expect(
+                semver.lt(range, standalone!, { includePrerelease: true }),
+                `${name}@${range} must be older than standaloneDsh ${standalone}`,
+            ).toBe(true);
+        }
 
         const runtime = JSON.parse(readFileSync(join(import.meta.dirname, "../runtime/package.json"), "utf8")) as {
             dependencies?: Record<string, string>;
