@@ -147,11 +147,11 @@
     }
   },
   "optionalDependencies": {
-    "@deepseek-ai/libreoffice-kit-darwin-arm64": "0.1.1",
-    "@deepseek-ai/libreoffice-kit-darwin-x64": "0.1.1",
-    "@deepseek-ai/libreoffice-kit-wasm": "0.1.1",
-    "@deepseek-ai/libreoffice-kit-win32-arm64": "0.1.2",
-    "@deepseek-ai/libreoffice-kit-win32-x64": "0.1.2",
+    "@deepseek-ai/libreoffice-kit-darwin-arm64": "0.1.5",
+    "@deepseek-ai/libreoffice-kit-darwin-x64": "0.1.5",
+    "@deepseek-ai/libreoffice-kit-wasm": "0.1.5",
+    "@deepseek-ai/libreoffice-kit-win32-arm64": "0.1.5",
+    "@deepseek-ai/libreoffice-kit-win32-x64": "0.1.5",
     "sherpa-onnx-darwin-arm64": "1.13.8",
     "sherpa-onnx-darwin-x64": "1.13.8",
     "sherpa-onnx-linux-arm64": "1.13.8",

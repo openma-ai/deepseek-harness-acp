@@ -71,5 +71,26 @@ describe("ACP package manifest", () => {
             dependencies?: Record<string, string>;
         };
         expect(runtime.dependencies?.["@deepseek-ai/dsh"]).toBe(manifest.dshAcp?.standaloneDsh);
+
+        // External native packages are pruned from the bundled runtime and redeclared
+        // as optionalDependencies so npm installs the host platform binary. Keep the
+        // pins exact matches of the versions locked under runtime/package-lock.json
+        // (scripts/pack-runtime.mjs asserts the same at pack time).
+        const runtimeLock = JSON.parse(
+            readFileSync(join(import.meta.dirname, "../runtime/package-lock.json"), "utf8"),
+        ) as { packages?: Record<string, { optional?: boolean; version?: string }> };
+        const external: Record<string, string> = {};
+        for (const [pkgPath, pkg] of Object.entries(runtimeLock.packages ?? {})) {
+            if (!pkg.optional || typeof pkg.version !== "string") continue;
+            if (
+                !pkgPath.startsWith("node_modules/@deepseek-ai/libreoffice-kit-")
+                && !pkgPath.startsWith("node_modules/sherpa-onnx-")
+            ) continue;
+            const name = pkgPath.slice("node_modules/".length);
+            if (name.startsWith("@") ? name.split("/").length !== 2 : name.includes("/")) continue;
+            external[name] = pkg.version;
+        }
+        expect((manifest as { optionalDependencies?: Record<string, string> }).optionalDependencies)
+            .toEqual(external);
     });
 });
