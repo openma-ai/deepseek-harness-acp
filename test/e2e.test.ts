@@ -823,6 +823,7 @@ describe("subagent session origin", () => {
             if (optIn) {
                 for (const child of children) {
                     const childId = String(child["id"]);
+                    let settledLink: string | undefined;
                     await expect.poll(() => {
                         const notes = client.notifications.filter(n => n.method === "session/update").map(n => n.params);
                         const announce = notes.findIndex(n => n["sessionId"] === sessionId &&
@@ -832,11 +833,39 @@ describe("subagent session origin", () => {
                             (n["update"] as Record<string, unknown>)["sessionUpdate"] === "agent_message_chunk");
                         const outgoing = notes.find(n => n["sessionId"] === childId &&
                             (n["update"] as Record<string, unknown>)["sessionUpdate"] === "session_message");
-                        const incoming = notes.find(n => n["sessionId"] === sessionId &&
+                        const incoming = notes.filter(n => n["sessionId"] === sessionId &&
                             (n["update"] as Record<string, unknown>)["sessionUpdate"] === "session_message" &&
-                            (n["update"] as Record<string, unknown>)["senderSessionId"] === childId);
-                        return announce >= 0 && childOutput > announce && outgoing !== undefined && incoming !== undefined;
-                    }, { timeout: 20_000 }).toBe(true);
+                            (n["update"] as Record<string, unknown>)["senderSessionId"] === childId)
+                            .map(n => n["update"] as Record<string, unknown>);
+                        if (announce < 0 || childOutput <= announce || outgoing === undefined || incoming.length === 0) {
+                            settledLink = undefined;
+                            return false;
+                        }
+                        // The parent receipt and the child-side link update are
+                        // two separate notifications, so the receipt can be
+                        // visible before the child update that carries
+                        // `recipientMessageId` has been flushed. Merge both
+                        // sides exactly like the assertions below and wait for
+                        // the link instead of racing it.
+                        const received = Object.assign({}, ...incoming);
+                        const linked = Object.assign({}, ...notes
+                            .filter(n => n["sessionId"] === childId &&
+                                (n["update"] as Record<string, unknown>)["sessionUpdate"] === "session_message")
+                            .map(n => n["update"] as Record<string, unknown>));
+                        const link = linked["recipientMessageId"];
+                        const receivedId = received["messageId"];
+                        if (typeof link !== "string" || typeof receivedId !== "string" || link !== receivedId) {
+                            settledLink = undefined;
+                            return false;
+                        }
+                        // A child can publish more than one receipt (observed
+                        // tool result, then settlement), so the first linked
+                        // state is not necessarily the last one. Require the
+                        // link to hold for one more poll before accepting it.
+                        if (settledLink === link) return true;
+                        settledLink = link;
+                        return false;
+                    }, { timeout: 20_000, interval: 50 }).toBe(true);
                 }
             }
 
