@@ -93,7 +93,8 @@ do not participate in this lock.
 
 Restoring historical sessions uses the host's V3 migration, which preserves
 the original log. Upgraded sessions cannot be read by older hosts.
-Multi-root workspaces remain unsupported.
+Multi-root workspaces are supported via the bundled multi-root plugin
+(see Sessions under Features).
 
 ### A · dsh profile plugin (recommended)
 
