@@ -960,7 +960,7 @@ describe("dsh-acp server (e2e smoke)", () => {
         expect(capabilities["loadSession"]).toBe(true);
         expect(capabilities["promptCapabilities"]).toMatchObject({ embeddedContext: true, image: true });
         expect(capabilities["auth"]).toEqual({ logout: {} });
-        expect(capabilities["sessionCapabilities"]).toMatchObject({ list: {}, resume: {}, fork: {} });
+        expect(capabilities["sessionCapabilities"]).toMatchObject({ list: {}, resume: {}, fork: {}, close: {} });
         expect(capabilities["_meta"]).toMatchObject({
             dsh: {
                 cordis: { protocol: 0 },

@@ -63,7 +63,14 @@ import type { Context } from "@deepseek-ai/cordis";
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import { ReasoningEffortId, type createUserMessage, type errorChain } from "@deepseek-ai/dsh-llm";
-import { buildForkSeed, SessionLogOffset, SessionSeq, type SessionEvent, type SessionId } from "@deepseek-ai/dsh-session";
+import {
+    buildForkSeed,
+    SessionLogOffset,
+    SessionSeq,
+    type SessionEvent,
+    type SessionHeader,
+    type SessionId,
+} from "@deepseek-ai/dsh-session";
 import type { foldSessionTitle } from "@deepseek-ai/dsh-session-title";
 import type { setSandboxMode } from "@deepseek-ai/dsh-sandbox-policy";
 import type { SandboxMode } from "@deepseek-ai/dsh-sandbox";
@@ -123,6 +130,7 @@ import {
     PromptImageError,
     UnsupportedPromptContentError,
 } from "./prompt.ts";
+import { resolveSessionTitle } from "./session-title.ts";
 import { SessionProjection, turnEndToStopReason, type HarnessEvent, type SessionUpdate } from "./translate.ts";
 import { advertisesCordis, CORDIS_CAPABILITY } from "./cordis-protocol.ts";
 import { AcpRpc, muxAcpStream } from "./rpc.ts";
@@ -131,6 +139,7 @@ import * as tuiClientPlugin from "./tui-client-plugin.ts";
 import * as userQuestionsPlugin from "./user-questions-plugin.ts";
 import { substituteUnavailableModel } from "./model-catalog.ts";
 import { presetDisplayName, type PresetRow } from "./presets.ts";
+export { resolveSessionTitle } from "./session-title.ts";
 export {
     answerFromElicitation,
     askUserQuestionsOverAcp,
@@ -174,11 +183,26 @@ function readSessionEvents(session: { snapshotEvents?: () => readonly unknown[];
     return session.snapshotEvents?.() ?? session.events ?? [];
 }
 
-/** Metadata returned directly by rc stores and wrapped in alpha snapshots. */
-interface StoredHeader {
+/** The immutable header fields the projection cache uses to match a lifecycle. */
+interface SessionTitleHeader {
     id: SessionId;
-    cwd?: string;
+    version?: number;
     createdAt?: number;
+    cwd?: string;
+    isSeeded?: boolean;
+}
+
+/** The projection-cache surface used for titles (duck-typed: optional service). */
+interface SessionTitleCache {
+    cachedSnapshot(
+        header: SessionTitleHeader,
+        keys?: readonly string[],
+    ): { values: { title?: unknown } } | undefined;
+    cachedPredecessorTitle(header: SessionTitleHeader): { values: { title?: unknown } } | undefined;
+}
+
+/** Metadata returned directly by rc stores and wrapped in alpha snapshots. */
+interface StoredHeader extends SessionTitleHeader {
     /**
      * Coarse classification written by DSH when the session is a subagent
      * child. The Web sidebar hides rows carrying this value.
@@ -957,6 +981,24 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     };
 
     /**
+     * The cached title projection for one stored header. The cache is
+     * optional (older hosts may not mount it), and null/empty values are
+     * misses because the title projection is null before the first title.
+     */
+    const cachedSessionTitle = (header: SessionTitleHeader): string | undefined => {
+        try {
+            const cache = ctx.get("sessionProjectionCache") as SessionTitleCache | undefined;
+            if (cache === undefined) return undefined;
+            const titleOf = (snapshot: { values: { title?: unknown } } | undefined): string | undefined =>
+                resolveSessionTitle({ projcacheTitle: snapshot?.values.title });
+            return titleOf(cache.cachedSnapshot(header, ["title"])) ?? titleOf(cache.cachedPredecessorTitle(header));
+        } catch (error: unknown) {
+            logDebug(`projection title lookup failed: ${String(error)}`);
+            return undefined;
+        }
+    };
+
+    /**
      * Subagent children stay in the shared session store so the Web sidebar
      * can hide them, but ACP clients must not list, load, resume, or silently
      * restore them as ordinary sessions.
@@ -1011,7 +1053,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         }
         let events: readonly SessionEvent[] = [];
         let replay: ReturnType<typeof buildReplay> | undefined;
-        let storedHeader: { agentPreset?: string; cwd?: string } | undefined;
+        let storedHeader: SessionHeader | undefined;
         let presetId: string | undefined;
         const presets = presetsService();
         let handle: Awaited<ReturnType<typeof agents.resume>>;
@@ -1043,7 +1085,11 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             terminalOutput: clientTerminalOutput,
             ...(cwd !== undefined ? { cwd } : {}),
         });
-        projection.title = restored.title;
+        const title = resolveSessionTitle({
+            projcacheTitle: storedHeader !== undefined ? cachedSessionTitle(storedHeader) : undefined,
+            logTitle: restored.title ?? foldSessionTitle(events)?.title,
+        });
+        projection.title = title;
         const record = registerRecord(
             sessionId,
             handle.agent,
@@ -1071,9 +1117,9 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         // A failed ownership claim publishes no transcript or title updates.
         if (replay !== undefined) {
             for (const update of replay.updates) notify(sessionId, update);
-            if (restored.title !== undefined) {
-                notify(sessionId, { sessionUpdate: "session_info_update", title: restored.title });
-            }
+        }
+        if (title !== undefined) {
+            notify(sessionId, { sessionUpdate: "session_info_update", title });
         }
         ensureSelection(record);
         queueMicrotask(() => publishCommands(sessionId));
@@ -2418,7 +2464,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                         // mcp-client's second transport. Legacy SSE does not.
                         mcpCapabilities: { http: true, sse: false },
                         auth: { logout: {} },
-                        sessionCapabilities: { list: {}, resume: {}, fork: {} },
+                        sessionCapabilities: { list: {}, resume: {}, fork: {}, close: {} },
                     },
                     authMethods: advertisedAuthMethods(
                         providers,
@@ -2681,15 +2727,23 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     ? headers.filter((header) => header.cwd === params.cwd)
                     : headers).filter((header) => !isSubagentHeader(header));
                 const page = filtered.slice(0, 100);
+                const projectedTitles = page.map((header) => cachedSessionTitle(header));
+                // The cache covers every listed row; only rows the cache
+                // missed fall back to reading the log, and only for the
+                // existing cost-controlled prefix.
                 const withTitles = await Promise.allSettled(
-                    page.slice(0, 20).map(async (header) => {
+                    page.slice(0, 20).map(async (header, index) => {
+                        if (projectedTitles[index] !== undefined) return undefined;
                         const events = await readStoredEvents(persistence, header.id);
                         return foldSessionTitle(events)?.title;
                     }),
                 );
                 const sessionsInfo: SessionInfo[] = page.map((header, index) => {
                     const settled = withTitles[index];
-                    const title = settled !== undefined && settled.status === "fulfilled" ? settled.value : undefined;
+                    const title = resolveSessionTitle({
+                        projcacheTitle: projectedTitles[index],
+                        logTitle: settled !== undefined && settled.status === "fulfilled" ? settled.value : undefined,
+                    });
                     return {
                         sessionId: String(header.id),
                         cwd: header.cwd ?? "",
@@ -3045,7 +3099,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     // ------------------------------------------------------------------ //
 
     /**
-     * Live mcp-client mounts by server name. ACP has no session/close, so a
+     * Live mcp-client mounts by server name. Mounts are process-scoped, not
+     * session-scoped: `session/close` disposes the ACP session record but a
      * mount lives until the process exits or a later session re-declares the
      * same name with a different config (the client edited its settings —
      * replace, so new sessions and the next turns of old ones see the new
