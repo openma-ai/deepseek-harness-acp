@@ -20,3 +20,9 @@ await build({ ...shared, entryPoints: ['src/server.ts'], outfile: 'dist/server.j
 // Complete embeddable Cordis plugin plus the ordinary profile's stdio adapter.
 await build({ ...shared, entryPoints: ['src/plugin.ts'], outfile: 'dist/plugin.js' });
 await build({ ...shared, entryPoints: ['src/stdio.ts'], outfile: 'dist/stdio.js' });
+// Built-in multi-root replacements: a session scope plus the fs and sandbox
+// providers that read it. Separate entries because the profile patch mounts
+// each as its own Cordis row (the upstream rows are disabled first).
+await build({ ...shared, entryPoints: ['src/multi-root/index.ts'], outfile: 'dist/multi-root.js' });
+await build({ ...shared, entryPoints: ['src/multi-root/fs.ts'], outfile: 'dist/multi-root-fs.js' });
+await build({ ...shared, entryPoints: ['src/multi-root/sandbox.ts'], outfile: 'dist/multi-root-sandbox.js' });

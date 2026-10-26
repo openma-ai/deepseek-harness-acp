@@ -19,6 +19,9 @@ import type { Context } from "@deepseek-ai/cordis";
 import * as acpBridge from "./bridge/index.ts";
 import type { BridgeHarness } from "./bridge/index.ts";
 import { pluginOf, type HarnessKit } from "./harness.ts";
+import * as multiRootFs from "./multi-root/fs.ts";
+import * as multiRootScope from "./multi-root/index.ts";
+import * as multiRootSandbox from "./multi-root/sandbox.ts";
 import type { Settings } from "./settings.ts";
 
 export const name = "dsh-acp-app";
@@ -99,6 +102,19 @@ export async function apply(ctx: Context, config: AppConfig): Promise<void> {
         ...(p["mcpClient"] !== undefined
             ? { mcpClient: p["mcpClient"] as unknown as NonNullable<BridgeHarness["mcpClient"]> }
             : {}),
+        ...(kit.session.appendPluginRecord !== undefined
+            ? {
+                  appendPluginRecord: kit.session
+                      .appendPluginRecord as unknown as NonNullable<BridgeHarness["appendPluginRecord"]>,
+              }
+            : {}),
+        ...(kit.session.pluginRecordOf !== undefined
+            ? {
+                  pluginRecordOf: kit.session.pluginRecordOf as unknown as NonNullable<
+                      BridgeHarness["pluginRecordOf"]
+                  >,
+              }
+            : {}),
     };
 
     await (ctx as unknown as typeof anyCtx).effect(async function* (this: unknown) {
@@ -142,10 +158,19 @@ export async function apply(ctx: Context, config: AppConfig): Promise<void> {
         await checkpoints;
         yield checkpoints.dispose;
 
+        // ACP `additionalDirectories` scope plus its provider replacements.
+        // Cordis refuses two providers per service key, so the upstream
+        // fs/sandbox modules above are not mounted on this path: the
+        // multi-root subclasses keep their mechanics and widen only the
+        // writable roots for sessions that carry extra directories.
+        const multiRoot = anyCtx.plugin(multiRootScope.default);
+        await multiRoot;
+        yield multiRoot.dispose;
+
         // Sandboxed execution: platform sandbox chain, per-session mode
         // policy, managed subprocess groups, confined bash, one-shot
         // approvals for wider-access retries.
-        const sandbox = anyCtx.plugin(pluginOf(p["sandbox"]!), {});
+        const sandbox = anyCtx.plugin(multiRootSandbox.default, {});
         await sandbox;
         yield sandbox.dispose;
         const sandboxPolicy = anyCtx.plugin(pluginOf(p["sandboxPolicy"]!), {
@@ -168,7 +193,7 @@ export async function apply(ctx: Context, config: AppConfig): Promise<void> {
 
         // Filesystem stack riding the same sandbox policy, with the
         // read-before-edit observation gate and the model-facing fs tools.
-        const fs = anyCtx.plugin(pluginOf(p["fs"]!), {});
+        const fs = anyCtx.plugin(multiRootFs.default, {});
         await fs;
         yield fs.dispose;
         const fsPolicy = anyCtx.plugin(p["fsObservationPolicy"]!);

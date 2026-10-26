@@ -74,16 +74,30 @@ const OWN_BRIDGE_SPECIFIER = "@openma/deepseek-harness-acp/bridge";
 const OWN_SERVER_SPECIFIER = "@openma/deepseek-harness-acp/server";
 const OWN_PLUGIN_SPECIFIER = "@openma/deepseek-harness-acp/plugin";
 const OWN_STDIO_SPECIFIER = "@openma/deepseek-harness-acp/stdio";
+const OWN_MULTI_ROOT_SPECIFIER = "@openma/deepseek-harness-acp/multi-root";
+const OWN_MULTI_ROOT_FS_SPECIFIER = "@openma/deepseek-harness-acp/multi-root/fs";
+const OWN_MULTI_ROOT_SANDBOX_SPECIFIER = "@openma/deepseek-harness-acp/multi-root/sandbox";
 
 /** Rewrite this package's rows (incl. nested inserts) to absolute entries. */
 function rewriteOwnRows(
     row: PatchEntry,
-    entries: { bridge: string; server: string; plugin: string; stdio: string },
+    entries: {
+        bridge: string;
+        server: string;
+        plugin: string;
+        stdio: string;
+        multiRoot: string;
+        multiRootFs: string;
+        multiRootSandbox: string;
+    },
 ): void {
     if (row["name"] === OWN_BRIDGE_SPECIFIER) row["name"] = entries.bridge;
     if (row["name"] === OWN_SERVER_SPECIFIER) row["name"] = entries.server;
     if (row["name"] === OWN_PLUGIN_SPECIFIER) row["name"] = entries.plugin;
     if (row["name"] === OWN_STDIO_SPECIFIER) row["name"] = entries.stdio;
+    if (row["name"] === OWN_MULTI_ROOT_SPECIFIER) row["name"] = entries.multiRoot;
+    if (row["name"] === OWN_MULTI_ROOT_FS_SPECIFIER) row["name"] = entries.multiRootFs;
+    if (row["name"] === OWN_MULTI_ROOT_SANDBOX_SPECIFIER) row["name"] = entries.multiRootSandbox;
     const insert = row["insert"];
     if (Array.isArray(insert)) {
         for (const nested of insert) {
@@ -235,6 +249,21 @@ export async function bootAcpProfile(
         import.meta.url.endsWith(".ts") || !existsSync(distStdio)
             ? join(ownRoot(), "src", "stdio.ts")
             : distStdio;
+    const distMultiRoot = join(ownRoot(), "dist", "multi-root.js");
+    const multiRootEntry =
+        import.meta.url.endsWith(".ts") || !existsSync(distMultiRoot)
+            ? join(ownRoot(), "src", "multi-root", "index.ts")
+            : distMultiRoot;
+    const distMultiRootFs = join(ownRoot(), "dist", "multi-root-fs.js");
+    const multiRootFsEntry =
+        import.meta.url.endsWith(".ts") || !existsSync(distMultiRootFs)
+            ? join(ownRoot(), "src", "multi-root", "fs.ts")
+            : distMultiRootFs;
+    const distMultiRootSandbox = join(ownRoot(), "dist", "multi-root-sandbox.js");
+    const multiRootSandboxEntry =
+        import.meta.url.endsWith(".ts") || !existsSync(distMultiRootSandbox)
+            ? join(ownRoot(), "src", "multi-root", "sandbox.ts")
+            : distMultiRootSandbox;
     const basePatch = bundlePatchPath(req.resolve("@deepseek-ai/dsh-base/package.json"));
     const ownPatch = bundlePatchPath(join(ownRoot(), "package.json"));
     const bundlePatches: PatchEntry[] = [
@@ -252,6 +281,9 @@ export async function bootAcpProfile(
             server: serverEntry,
             plugin: pluginEntry,
             stdio: stdioEntry,
+            multiRoot: multiRootEntry,
+            multiRootFs: multiRootFsEntry,
+            multiRootSandbox: multiRootSandboxEntry,
         });
     }
 

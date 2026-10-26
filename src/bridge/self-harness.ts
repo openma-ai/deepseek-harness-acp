@@ -15,6 +15,7 @@
 
 import { createUserMessage, errorChain } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
+import * as sessionModule from "@deepseek-ai/dsh-session";
 import { foldSessionTitle } from "@deepseek-ai/dsh-session-title";
 import { SANDBOX_MODES, setSandboxMode } from "@deepseek-ai/dsh-sandbox-policy";
 import * as agentModule from "@deepseek-ai/dsh-agent";
@@ -30,6 +31,12 @@ export function selfHarness(): BridgeHarness {
         ln?: BridgeHarness["installModelSelection"];
     };
     const installModelSelection = agents.installModelSelection ?? agents.ln;
+    // Plugin records are a newer session feature; a host without them keeps
+    // additionalDirectories live-only instead of failing to load the bridge.
+    const sessionRecords = sessionModule as unknown as {
+        appendPluginRecord?: BridgeHarness["appendPluginRecord"];
+        pluginRecordOf?: BridgeHarness["pluginRecordOf"];
+    };
     return {
         createUserMessage,
         errorChain,
@@ -39,5 +46,11 @@ export function selfHarness(): BridgeHarness {
         sandboxModes: SANDBOX_MODES,
         ...(installModelSelection !== undefined ? { installModelSelection } : {}),
         mcpClient: mcpClient as unknown as NonNullable<BridgeHarness["mcpClient"]>,
+        ...(sessionRecords.appendPluginRecord !== undefined
+            ? { appendPluginRecord: sessionRecords.appendPluginRecord }
+            : {}),
+        ...(sessionRecords.pluginRecordOf !== undefined
+            ? { pluginRecordOf: sessionRecords.pluginRecordOf }
+            : {}),
     };
 }
