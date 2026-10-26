@@ -15,6 +15,7 @@ import { zstdDecompressSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import { createServer, type Server, type ServerResponse } from "node:http";
 import { delimiter, join } from "node:path";
+import { canonicalRoot } from "../src/multi-root/roots.ts";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const ROOT = join(import.meta.dirname, "..");
@@ -1051,7 +1052,7 @@ describe("dsh-acp server (e2e smoke)", () => {
                 .map((update) => (update["content"] as { text?: string } | undefined)?.text ?? "")
                 .join("");
             expect(status).toContain("Additional directories");
-            expect(status).toContain(extra);
+            expect(status).toContain(canonicalRoot(extra));
 
             await expect(client.request("session/new", {
                 cwd: workspace,
@@ -1338,7 +1339,7 @@ describe("dsh-acp server (e2e smoke)", () => {
                     .join("");
             };
 
-            expect(await statusText(created.sessionId)).toContain(extra);
+            expect(await statusText(created.sessionId)).toContain(canonicalRoot(extra));
 
             // The persisted plugin record restores the roots when the client
             // omits additionalDirectories on a later load.
@@ -1347,7 +1348,7 @@ describe("dsh-acp server (e2e smoke)", () => {
                 cwd: workspace,
                 mcpServers: [],
             })).resolves.toMatchObject({ modes: expect.any(Object) });
-            expect(await statusText(created.sessionId)).toContain(extra);
+            expect(await statusText(created.sessionId)).toContain(canonicalRoot(extra));
         } finally {
             rmSync(extra, { recursive: true, force: true });
         }
@@ -1458,21 +1459,21 @@ describe("dsh-acp server (e2e smoke)", () => {
                 cwd: workspace,
                 mcpServers: [],
             })).resolves.toMatchObject({ modes: expect.any(Object) });
-            expect(await statusText(created.sessionId)).toContain(extra);
+            expect(await statusText(created.sessionId)).toContain(canonicalRoot(extra));
 
             await expect(client.request("session/load", {
                 sessionId: created.sessionId,
                 cwd: workspace,
                 mcpServers: [],
             })).resolves.toMatchObject({ modes: expect.any(Object) });
-            expect(await statusText(created.sessionId)).toContain(extra);
+            expect(await statusText(created.sessionId)).toContain(canonicalRoot(extra));
 
             const child = await client.request("session/fork", {
                 sessionId: created.sessionId,
                 cwd: workspace,
                 mcpServers: [],
             }) as { sessionId: string };
-            expect(await statusText(child.sessionId)).toContain(extra);
+            expect(await statusText(child.sessionId)).toContain(canonicalRoot(extra));
         } finally {
             rmSync(extra, { recursive: true, force: true });
         }
@@ -2158,7 +2159,7 @@ describe("inclusive session/fork against a local mock model", () => {
             .filter((update) => update["sessionUpdate"] === "agent_message_chunk")
             .map((update) => (update["content"] as { text?: string } | undefined)?.text ?? "")
             .join("");
-        expect(rootedStatus).toContain(forkExtra);
+        expect(rootedStatus).toContain(canonicalRoot(forkExtra));
 
         const inherited = await client.request("session/fork", {
             sessionId: rooted.sessionId,
@@ -2173,7 +2174,7 @@ describe("inclusive session/fork against a local mock model", () => {
             .filter((update) => update["sessionUpdate"] === "agent_message_chunk")
             .map((update) => (update["content"] as { text?: string } | undefined)?.text ?? "")
             .join("");
-        expect(inheritedStatus).toContain(forkExtra);
+        expect(inheritedStatus).toContain(canonicalRoot(forkExtra));
 
         const prompts = ["FORK_ONE tell me one", "FORK_TWO tell me two", "FORK_THREE tell me three"];
         for (const text of prompts) {

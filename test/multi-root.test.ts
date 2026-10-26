@@ -19,6 +19,7 @@ import {
 import { MultiRootFileSystem } from "../src/multi-root/fs.ts";
 import { MultiRootSandboxProvider } from "../src/multi-root/sandbox.ts";
 import {
+    canonicalRoot,
     effectiveAdditionalRoots,
     normalizeAdditionalDirectories,
     RootValidationError,
@@ -61,7 +62,12 @@ describe("multi-root validation", () => {
     it("canonicalizes absolute directories and preserves request order", () => {
         const first = tempDir("dsh-acp-root-a-");
         const second = tempDir("dsh-acp-root-b-");
-        expect(normalizeAdditionalDirectories([first, second])).toEqual([first, second]);
+        // mkdtempSync may return a non-realpath spelling (macOS /var → /private/var;
+        // Windows short names); the plugin always stores the realpath form.
+        expect(normalizeAdditionalDirectories([first, second])).toEqual([
+            canonicalRoot(first),
+            canonicalRoot(second),
+        ]);
     });
 
     it("rejects relative, non-directory, missing, duplicate, and primary entries", () => {
@@ -95,7 +101,9 @@ describe("multi-root validation", () => {
         const extra = tempDir("dsh-acp-effective-extra-");
         const nested = join(primary, "nested");
         mkdirSync(nested);
-        expect(effectiveAdditionalRoots(primary, [extra, nested, join(extra, "gone")])).toEqual([extra]);
+        expect(effectiveAdditionalRoots(primary, [extra, nested, join(extra, "gone")])).toEqual([
+            canonicalRoot(extra),
+        ]);
     });
 });
 
@@ -190,8 +198,11 @@ describe("multi-root dialect widening", () => {
         const upstream = confined(["sandbox-exec", "-p", profile, "--", "true"]);
         const widened = widenConfinedArgv(upstream, ["true"], policy(workspace), [extra]);
         const widenedProfile = widened.argv[2] ?? "";
-        expect(widenedProfile).toContain(`(subpath "${extra}")`);
-        expect(widenedProfile).toContain(`(subpath "${workspace}")`);
+        // SBPL string literals escape `\` and `"` the same way dialects.sbplString does.
+        const sbplLiteral = (path: string): string =>
+            `"${path.replaceAll("\\", String.raw`\\`).replaceAll('"', String.raw`\"`)}"`;
+        expect(widenedProfile).toContain(`(subpath ${sbplLiteral(extra)})`);
+        expect(widenedProfile).toContain(`(subpath ${sbplLiteral(workspace)})`);
         expect(widened.argv.slice(-2)).toEqual(["--", "true"]);
     });
 
@@ -265,10 +276,13 @@ describe("multi-root sandbox provider", () => {
         const confined = await provider.confine(["true"], policy);
         const separator = confined.argv.indexOf("--");
         expect(separator).toBeGreaterThan(0);
-        expect(confined.argv.slice(0, separator)).toEqual(expect.arrayContaining(["--bind", extra, extra]));
+        const canonicalExtra = canonicalRoot(extra);
+        expect(confined.argv.slice(0, separator)).toEqual(
+            expect.arrayContaining(["--bind", canonicalExtra, canonicalExtra]),
+        );
 
         scope.set("session-sandbox", []);
         const singleRoot = await provider.confine(["true"], policy);
-        expect(singleRoot.argv).not.toContain(extra);
+        expect(singleRoot.argv).not.toContain(canonicalExtra);
     });
 });
