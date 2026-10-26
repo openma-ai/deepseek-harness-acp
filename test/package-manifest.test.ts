@@ -49,14 +49,48 @@ describe("ACP package manifest", () => {
         expect(manifest.dshAcp?.standaloneDsh).toMatch(/^\d+\.\d+\.\d+(?:-rc\.\d+)?$/);
         expect(manifest.dshAcp?.hostCompatibility).toEqual({ cordisProtocol: 0, policy: "capability-negotiated" });
 
-        const dshDevelopmentRanges = Object.entries(manifest.devDependencies ?? {})
-            .filter(([name]) => name === "@deepseek-ai/dsh" || name.startsWith("@deepseek-ai/dsh-"))
-            .map(([, range]) => range);
-        expect(new Set(dshDevelopmentRanges)).toEqual(new Set([manifest.dshAcp?.standaloneDsh]));
+        // Most @deepseek-ai/dsh* pins track standaloneDsh. Some packages lag the
+        // CLI release when npm never published that version (e.g. dsh-invariants
+        // stopped at 0.2.0-rc.2) — scripts/update-dsh.mjs keeps those older pins.
+        const standalone = manifest.dshAcp?.standaloneDsh;
+        const dshDevelopmentPins = Object.entries(manifest.devDependencies ?? {})
+            .filter(([name]) => name === "@deepseek-ai/dsh" || name.startsWith("@deepseek-ai/dsh-"));
+        expect(dshDevelopmentPins.some(([, range]) => range === standalone)).toBe(true);
+        for (const [name, range] of dshDevelopmentPins) {
+            if (range === standalone) continue;
+            expect(semver.valid(range), `${name} pin ${range} must be an exact version`).toBeTruthy();
+            // lt/compare ignore includePrerelease (RangeOptions only); prerelease
+            // ordering is already part of the SemVer compare algorithm.
+            expect(
+                semver.lt(range, standalone!),
+                `${name}@${range} must be older than standaloneDsh ${standalone}`,
+            ).toBe(true);
+        }
 
         const runtime = JSON.parse(readFileSync(join(import.meta.dirname, "../runtime/package.json"), "utf8")) as {
             dependencies?: Record<string, string>;
         };
         expect(runtime.dependencies?.["@deepseek-ai/dsh"]).toBe(manifest.dshAcp?.standaloneDsh);
+
+        // External native packages are pruned from the bundled runtime and redeclared
+        // as optionalDependencies so npm installs the host platform binary. Keep the
+        // pins exact matches of the versions locked under runtime/package-lock.json
+        // (scripts/pack-runtime.mjs asserts the same at pack time).
+        const runtimeLock = JSON.parse(
+            readFileSync(join(import.meta.dirname, "../runtime/package-lock.json"), "utf8"),
+        ) as { packages?: Record<string, { optional?: boolean; version?: string }> };
+        const external: Record<string, string> = {};
+        for (const [pkgPath, pkg] of Object.entries(runtimeLock.packages ?? {})) {
+            if (!pkg.optional || typeof pkg.version !== "string") continue;
+            if (
+                !pkgPath.startsWith("node_modules/@deepseek-ai/libreoffice-kit-")
+                && !pkgPath.startsWith("node_modules/sherpa-onnx-")
+            ) continue;
+            const name = pkgPath.slice("node_modules/".length);
+            if (name.startsWith("@") ? name.split("/").length !== 2 : name.includes("/")) continue;
+            external[name] = pkg.version;
+        }
+        expect((manifest as { optionalDependencies?: Record<string, string> }).optionalDependencies)
+            .toEqual(external);
     });
 });
