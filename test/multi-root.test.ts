@@ -194,13 +194,14 @@ describe("multi-root dialect widening", () => {
     it("widens the seatbelt profile's writable subpath form", () => {
         const workspace = tempDir("dsh-acp-seatbelt-workspace-");
         const extra = tempDir("dsh-acp-seatbelt-extra-");
-        const profile = `(version 1) (allow default) (deny file-write*) (allow file-write* (literal "/dev/null")) (allow file-write* (subpath "/tmp") (subpath "${workspace}"))`;
+        // SBPL string literals escape \ and " the same way dialects.sbplString does.
+        // Build the fixture profile with the same quoting so both roots match.
+        const sbplLiteral = (path: string): string =>
+            `"${path.replaceAll("\\", String.raw`\\`).replaceAll('"', String.raw`\"`)}"`;
+        const profile = `(version 1) (allow default) (deny file-write*) (allow file-write* (literal "/dev/null")) (allow file-write* (subpath "/tmp") (subpath ${sbplLiteral(workspace)}))`;
         const upstream = confined(["sandbox-exec", "-p", profile, "--", "true"]);
         const widened = widenConfinedArgv(upstream, ["true"], policy(workspace), [extra]);
         const widenedProfile = widened.argv[2] ?? "";
-        // SBPL string literals escape `\` and `"` the same way dialects.sbplString does.
-        const sbplLiteral = (path: string): string =>
-            `"${path.replaceAll("\\", String.raw`\\`).replaceAll('"', String.raw`\"`)}"`;
         expect(widenedProfile).toContain(`(subpath ${sbplLiteral(extra)})`);
         expect(widenedProfile).toContain(`(subpath ${sbplLiteral(workspace)})`);
         expect(widened.argv.slice(-2)).toEqual(["--", "true"]);
