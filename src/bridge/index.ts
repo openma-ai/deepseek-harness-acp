@@ -108,6 +108,7 @@ import { openLocalAuthPage, startLocalAuthPage } from "../auth-page.ts";
 import { AuthLoginCancelled, runBrowserLogin } from "./auth-flow.ts";
 import { RequestIdTracker, tapRequestIds } from "./request-ids.ts";
 import { logDebug, logWarn } from "../log.ts";
+import { normalizeAdditionalDirectories, RootValidationError, storedAdditionalDirectories } from "../multi-root/roots.ts";
 import {
     acpInclusiveForkCapabilityMeta,
     inclusiveHistoryPrefix,
@@ -177,6 +178,14 @@ export interface BridgeHarness {
      * unregisters. Absent on installations that predate the plugin.
      */
     mcpClient?: { apply: (ctx: never, config: never) => void };
+    /**
+     * `appendPluginRecord` from `@deepseek-ai/dsh-session` (optional seam):
+     * appends an ignorable `plugin:` record that survives load/resume/fork.
+     * Older hosts without plugin records simply keep the roots live-only.
+     */
+    appendPluginRecord?: (session: unknown, type: string, data: unknown) => unknown;
+    /** `pluginRecordOf` from `@deepseek-ai/dsh-session` (optional seam). */
+    pluginRecordOf?: (event: unknown) => { type: string; data: unknown } | undefined;
 }
 
 function readSessionEvents(session: { snapshotEvents?: () => readonly unknown[]; events?: readonly unknown[] }): readonly unknown[] {
@@ -304,6 +313,24 @@ interface SessionRecord {
     mutationTail: Promise<void>;
 }
 
+/**
+ * The durable record name for ACP's additional directories. A `plugin:` record
+ * is ignorable to other readers, survives the JSONL store, and is carried by
+ * fork seeds; the last record on a session is the authoritative list.
+ */
+const MULTI_ROOT_RECORD_TYPE = "plugin:acp/multi-root";
+
+interface MultiRootRecordData {
+    additionalDirectories?: unknown;
+}
+
+/** The structural shape of the optional `ctx.acpMultiRootScope` service. */
+interface MultiRootScopeLike {
+    set(sessionId: string, roots: readonly string[]): void;
+    get(sessionId: string | undefined): readonly string[];
+    delete(sessionId: string): void;
+}
+
 // Extension requests bypass the SDK's core prompt schema validation.
 const steeringRequestSchema = z.object({
     sessionId: z.string().min(1),
@@ -426,6 +453,79 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     const SANDBOX_MODES = harness.sandboxModes;
     const bridgeEnv = config.env ?? process.env;
     const sessions = new Map<string, SessionRecord>();
+
+    // ------------------------------------------------------------------ //
+    // ACP additional directories (built-in multi-root plugin)             //
+    // ------------------------------------------------------------------ //
+
+    /** The optional scope service mounted by the built-in multi-root plugin. */
+    const multiRootScope = (): MultiRootScopeLike | undefined =>
+        ctx.get("acpMultiRootScope") as MultiRootScopeLike | undefined;
+
+    /** Capability gate: without the plugin the old reject stays in force. */
+    const multiRootAvailable = (): boolean => multiRootScope() !== undefined;
+
+    const setMultiRootScope = (sessionId: string, roots: readonly string[]): void => {
+        multiRootScope()?.set(sessionId, roots);
+    };
+
+    const sameRoots = (left: readonly string[], right: readonly string[]): boolean =>
+        left.length === right.length && left.every((root, index) => root === right[index]);
+
+    /**
+     * The last persisted additional-directory record on a session. Plugin
+     * records are ignorable and carried by fork seeds, so the newest record
+     * wins; a malformed payload contributes no grants.
+     */
+    const persistedAdditionalDirectories = (events: readonly unknown[]): string[] => {
+        if (harness.pluginRecordOf === undefined) return [];
+        for (let index = events.length - 1; index >= 0; index -= 1) {
+            const record = harness.pluginRecordOf(events[index]);
+            if (record === undefined || record.type !== MULTI_ROOT_RECORD_TYPE) continue;
+            const data = record.data as MultiRootRecordData | null;
+            if (data === null || typeof data !== "object") return [];
+            return storedAdditionalDirectories(data.additionalDirectories);
+        }
+        return [];
+    };
+
+    /**
+     * Persist one session's additional roots. Best effort: a host without
+     * plugin records keeps the live scope only, and a store failure must not
+     * fail the ACP request that already created a valid session.
+     */
+    const persistAdditionalDirectories = (session: unknown, roots: readonly string[]): void => {
+        if (roots.length === 0 || harness.appendPluginRecord === undefined) return;
+        try {
+            harness.appendPluginRecord(session, MULTI_ROOT_RECORD_TYPE, {
+                additionalDirectories: [...roots],
+            } satisfies MultiRootRecordData);
+        } catch (error: unknown) {
+            logWarn(`could not persist additionalDirectories: ${String(error)}`);
+        }
+    };
+
+    /**
+     * Apply the roots a load/resume/fork request supplies, or the persisted
+     * list when the request omits them. Non-empty request input replaces the
+     * stored list; omitted/empty input restores the stored list (the spec's
+     * lifecycle calls are not a patch, and an empty array is what clients send
+     * when they have nothing to add). A resulting non-empty list that differs
+     * from what was stored is appended as a new plugin record.
+     */
+    const applyAdditionalDirectories = (
+        record: SessionRecord,
+        requested: readonly string[],
+        stored: readonly string[],
+    ): readonly string[] => {
+        const effective = requested.length > 0 ? requested : stored;
+        setMultiRootScope(String(record.agent.session.id), effective);
+        if (requested.length > 0 && !sameRoots(requested, stored)) {
+            persistAdditionalDirectories(record.agent.session, requested);
+        }
+        return effective;
+    };
+
     const commandPublications = new LatestPublication();
     interface LiveSubagent {
         rootSessionId: string;
@@ -1037,7 +1137,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
      */
     const restoreSession = async (
         sessionId: string,
-        options: { replay: boolean; cwd?: string },
+        options: { replay: boolean; cwd?: string; additionalDirectories?: readonly string[] },
     ): Promise<SessionRecord> => {
         requirePersistence();
         const existing = sessions.get(sessionId);
@@ -1069,6 +1169,14 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     const agent = restoredAgent ?? (agentCtx as unknown as { agent: Agent }).agent;
                     storedHeader = agent.session.header;
                     events = readSessionEvents(agent.session) as readonly SessionEvent[];
+                    // Restore persisted roots before the agent can run a tool;
+                    // a request-supplied list is the replacement, not a patch.
+                    const stored = persistedAdditionalDirectories(events);
+                    const requested = options.additionalDirectories ?? [];
+                    setMultiRootScope(
+                        sessionId,
+                        requested.length > 0 ? requested : stored,
+                    );
                     if (options.replay) replay = buildReplay(events as unknown as HarnessEvent[]);
                     presetId = (await presets.resolve(presetFromLog(storedHeader, events))).id;
                     await presets.mount(agentCtx, presetId);
@@ -1099,6 +1207,11 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             projection,
         );
         if (presetId !== undefined) record.preset = presetId;
+        applyAdditionalDirectories(
+            record,
+            options.additionalDirectories ?? [],
+            persistedAdditionalDirectories(events),
+        );
         // Permission facts are logged and replayed (permission/preset,
         // sandbox/mode, approval/policy events); mirror the service folds
         // so the advertised state matches what is enforced.
@@ -2112,6 +2225,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         const used = record.projection.contextWindow;
         const route = routeOf(record);
         const effort = record.effort ?? loggedConfig(record)?.reasoningEffort;
+        const additionalDirectories = multiRootScope()?.get(String(record.agent.session.id)) ?? [];
         const lines = [
             `**dsh-acp** ${VERSION} — DeepSeek Harness ACP bridge`,
             "",
@@ -2125,6 +2239,9 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             `| Permission mode | ${record.modeId} |`,
             `| Approvals | ${record.approvals} |`,
             `| Workspace | ${record.agent.session.header.cwd ?? process.cwd()} |`,
+            ...(additionalDirectories.length > 0
+                ? [`| Additional directories | ${additionalDirectories.join(", ")} |`]
+                : []),
             `| Session | ${String(record.agent.session.id)} |`,
             ...(used !== undefined ? [`| Context window | ${used.toLocaleString()} tokens |`] : []),
         ];
@@ -2464,7 +2581,16 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                         // mcp-client's second transport. Legacy SSE does not.
                         mcpCapabilities: { http: true, sse: false },
                         auth: { logout: {} },
-                        sessionCapabilities: { list: {}, resume: {}, fork: {}, close: {} },
+                        sessionCapabilities: {
+                            list: {},
+                            resume: {},
+                            fork: {},
+                            close: {},
+                            // Advertised only when the built-in multi-root
+                            // scope is mounted; otherwise the bridge keeps
+                            // rejecting non-empty additionalDirectories.
+                            ...(multiRootAvailable() ? { additionalDirectories: {} } : {}),
+                        },
                     },
                     authMethods: advertisedAuthMethods(
                         providers,
@@ -2564,7 +2690,10 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 await requireCredential(config.provider);
                 mark("credential");
                 validateCwd(params.cwd);
-                validateAdditionalDirectories(params.additionalDirectories);
+                const additionalDirectories = validateAdditionalDirectories(
+                    params.additionalDirectories,
+                    params.cwd,
+                );
                 syncMcpServers(params.mcpServers, params.cwd);
                 mark("request setup");
                 const sessionId = SessionId(randomUUID());
@@ -2592,6 +2721,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     config.permissionMode ?? (permissionService().defaultPreset as SandboxMode),
                 );
                 if (presetId !== undefined) record.preset = presetId;
+                setMultiRootScope(String(sessionId), additionalDirectories);
+                persistAdditionalDirectories(handle.agent.session, additionalDirectories);
                 if (config.permissionMode !== undefined) {
                     applyMode(record, String(sessionId), config.permissionMode);
                 } else {
@@ -2615,11 +2746,18 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 assertOpen();
                 await requireCredential(config.provider);
                 validateCwd(params.cwd);
-                validateAdditionalDirectories(params.additionalDirectories);
+                const additionalDirectories = validateAdditionalDirectories(
+                    params.additionalDirectories,
+                    params.cwd,
+                );
                 syncMcpServers(params.mcpServers, params.cwd);
                 requirePersistence();
                 await assertAcpVisibleSession(params.sessionId);
-                const record = await restoreSession(params.sessionId, { replay: true, cwd: params.cwd });
+                const record = await restoreSession(params.sessionId, {
+                    replay: true,
+                    cwd: params.cwd,
+                    additionalDirectories,
+                });
                 const options = await configOptions(record);
                 return {
                     modes: modeState(record),
@@ -2631,12 +2769,16 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 assertOpen();
                 await requireCredential(config.provider);
                 validateCwd(params.cwd);
-                validateAdditionalDirectories(params.additionalDirectories);
+                const requestedDirectories = validateAdditionalDirectories(
+                    params.additionalDirectories,
+                    params.cwd,
+                );
                 syncMcpServers(params.mcpServers, params.cwd);
                 // Invalid fork meta fails before a missing session can hide it,
                 // and never degrades into a whole-session copy.
                 const request = parseForkRequest(params._meta);
                 const source = await readForkSource(params.sessionId);
+                const sourceDirectories = persistedAdditionalDirectories(source.events);
                 const seeded = forkSeedFor(source.events, request, params.sessionId);
                 const route = lastRequestRoute(seeded.kept);
                 const live = sessions.get(params.sessionId);
@@ -2684,6 +2826,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 );
                 if (provider !== undefined) record.provider = provider;
                 if (presetId !== undefined) record.preset = presetId;
+                applyAdditionalDirectories(record, requestedDirectories, sourceDirectories);
                 const recordedMode = currentPermission(record);
                 if (
                     recordedMode !== undefined &&
@@ -2706,11 +2849,18 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 assertOpen();
                 await requireCredential(config.provider);
                 validateCwd(params.cwd);
-                validateAdditionalDirectories(params.additionalDirectories);
+                const additionalDirectories = validateAdditionalDirectories(
+                    params.additionalDirectories,
+                    params.cwd,
+                );
                 syncMcpServers(params.mcpServers, params.cwd);
                 requirePersistence();
                 await assertAcpVisibleSession(params.sessionId);
-                const record = await restoreSession(params.sessionId, { replay: false, cwd: params.cwd });
+                const record = await restoreSession(params.sessionId, {
+                    replay: false,
+                    cwd: params.cwd,
+                    additionalDirectories,
+                });
                 const options = await configOptions(record);
                 return {
                     modes: modeState(record),
@@ -3062,6 +3212,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 const record = sessions.get(params.sessionId);
                 if (record === undefined) return;
                 sessions.delete(params.sessionId);
+                multiRootScope()?.delete(params.sessionId);
                 record.agent.cancel({ kind: "user" });
                 settlePrompt(record, "cancelled");
                 await record.dispose().catch((error: unknown) => {
@@ -3088,9 +3239,32 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         if (!isAbsolute(cwd)) throw invalidParams(`cwd must be an absolute path: ${cwd}`);
     }
 
-    function validateAdditionalDirectories(additionalDirectories: string[] | undefined): void {
-        if (additionalDirectories !== undefined && additionalDirectories.length > 0) {
+    /**
+     * Validate ACP `additionalDirectories` for one lifecycle request.
+     *
+     * Omit / `[]` is the single-root path. Non-empty input requires the
+     * built-in multi-root plugin (otherwise today's "not supported" reject is
+     * preserved), then every entry must be a non-empty absolute directory;
+     * relative or missing paths are Invalid params, never silently resolved.
+     *
+     * @returns canonical additional roots in request order.
+     */
+    function validateAdditionalDirectories(
+        additionalDirectories: readonly string[] | null | undefined,
+        cwd?: string,
+    ): string[] {
+        const input: unknown = additionalDirectories ?? [];
+        if (Array.isArray(input) && input.length > 0 && !multiRootAvailable()) {
             throw invalidParams("additionalDirectories is not supported");
+        }
+        try {
+            return normalizeAdditionalDirectories(
+                input,
+                cwd !== undefined ? { primaryRoot: cwd } : {},
+            );
+        } catch (error: unknown) {
+            if (error instanceof RootValidationError) throw invalidParams(error.message);
+            throw error;
         }
     }
 

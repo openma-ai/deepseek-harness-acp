@@ -15,6 +15,7 @@ import { zstdDecompressSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import { createServer, type Server, type ServerResponse } from "node:http";
 import { delimiter, join } from "node:path";
+import { canonicalRoot } from "../src/multi-root/roots.ts";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const ROOT = join(import.meta.dirname, "..");
@@ -960,7 +961,13 @@ describe("dsh-acp server (e2e smoke)", () => {
         expect(capabilities["loadSession"]).toBe(true);
         expect(capabilities["promptCapabilities"]).toMatchObject({ embeddedContext: true, image: true });
         expect(capabilities["auth"]).toEqual({ logout: {} });
-        expect(capabilities["sessionCapabilities"]).toMatchObject({ list: {}, resume: {}, fork: {}, close: {} });
+        expect(capabilities["sessionCapabilities"]).toMatchObject({
+            list: {},
+            resume: {},
+            fork: {},
+            close: {},
+            additionalDirectories: {},
+        });
         expect(capabilities["_meta"]).toMatchObject({
             dsh: {
                 cordis: { protocol: 0 },
@@ -1026,15 +1033,46 @@ describe("dsh-acp server (e2e smoke)", () => {
         );
     }, 60_000);
 
-    it("rejects non-empty additional directories instead of silently narrowing the workspace", async () => {
-        await expect(client.request("session/new", {
-            cwd: workspace,
-            additionalDirectories: [join(workspace, "other-root")],
-            mcpServers: [],
-        })).rejects.toMatchObject({
-            code: -32602,
-            message: expect.stringContaining("additionalDirectories is not supported"),
-        });
+    it("accepts absolute additional directories and rejects relative ones", async () => {
+        const extra = mkdtempSync(join(tmpdir(), "dsh-acp-extra-root-"));
+        try {
+            const created = await client.request("session/new", {
+                cwd: workspace,
+                additionalDirectories: [extra],
+                mcpServers: [],
+            }) as { sessionId: string };
+            expect(created.sessionId).toBeTruthy();
+
+            await expect(client.request("session/prompt", {
+                sessionId: created.sessionId,
+                prompt: [{ type: "text", text: "/status" }],
+            })).resolves.toMatchObject({ stopReason: "end_turn" });
+            const status = client.updatesFor(created.sessionId)
+                .filter((update) => update["sessionUpdate"] === "agent_message_chunk")
+                .map((update) => (update["content"] as { text?: string } | undefined)?.text ?? "")
+                .join("");
+            expect(status).toContain("Additional directories");
+            expect(status).toContain(canonicalRoot(extra));
+
+            await expect(client.request("session/new", {
+                cwd: workspace,
+                additionalDirectories: ["relative/other-root"],
+                mcpServers: [],
+            })).rejects.toMatchObject({
+                code: -32602,
+                message: expect.stringContaining("absolute"),
+            });
+
+            // Omitted/empty input is exactly the single-root path.
+            const singleRoot = await client.request("session/new", {
+                cwd: workspace,
+                additionalDirectories: [],
+                mcpServers: [],
+            }) as { sessionId: string };
+            expect(singleRoot.sessionId).toBeTruthy();
+        } finally {
+            rmSync(extra, { recursive: true, force: true });
+        }
     }, 60_000);
 
     it("keeps a new session registered while Zed applies config defaults concurrently", async () => {
@@ -1276,20 +1314,44 @@ describe("dsh-acp server (e2e smoke)", () => {
         ).rejects.toThrow(/unknown session/);
     }, 60_000);
 
-    it("rejects additional directories when loading a session", async () => {
-        const created = await client.request("session/new", {
-            cwd: workspace,
-            mcpServers: [],
-        }) as { sessionId: string };
-        await expect(client.request("session/load", {
-            sessionId: created.sessionId,
-            cwd: workspace,
-            additionalDirectories: [join(workspace, "other-root")],
-            mcpServers: [],
-        })).rejects.toMatchObject({
-            code: -32602,
-            message: expect.stringContaining("additionalDirectories is not supported"),
-        });
+    it("accepts additional directories when loading and restores them when omitted", async () => {
+        const extra = mkdtempSync(join(tmpdir(), "dsh-acp-load-extra-"));
+        try {
+            const created = await client.request("session/new", {
+                cwd: workspace,
+                mcpServers: [],
+            }) as { sessionId: string };
+            await expect(client.request("session/load", {
+                sessionId: created.sessionId,
+                cwd: workspace,
+                additionalDirectories: [extra],
+                mcpServers: [],
+            })).resolves.toMatchObject({ modes: expect.any(Object) });
+
+            const statusText = async (id: string): Promise<string> => {
+                await client.request("session/prompt", {
+                    sessionId: id,
+                    prompt: [{ type: "text", text: "/status" }],
+                });
+                return client.updatesFor(id)
+                    .filter((update) => update["sessionUpdate"] === "agent_message_chunk")
+                    .map((update) => (update["content"] as { text?: string } | undefined)?.text ?? "")
+                    .join("");
+            };
+
+            expect(await statusText(created.sessionId)).toContain(canonicalRoot(extra));
+
+            // The persisted plugin record restores the roots when the client
+            // omits additionalDirectories on a later load.
+            await expect(client.request("session/load", {
+                sessionId: created.sessionId,
+                cwd: workspace,
+                mcpServers: [],
+            })).resolves.toMatchObject({ modes: expect.any(Object) });
+            expect(await statusText(created.sessionId)).toContain(canonicalRoot(extra));
+        } finally {
+            rmSync(extra, { recursive: true, force: true });
+        }
     }, 60_000);
 
     it("loads a persisted session from a fresh server process", async () => {
@@ -1365,6 +1427,57 @@ describe("dsh-acp server (e2e smoke)", () => {
             }),
         ).rejects.toThrow(/unknown session/);
     }, 60_000);
+
+    it("persists additional directories across resume, load, and fork", async () => {
+        const extra = mkdtempSync(join(tmpdir(), "dsh-acp-persist-extra-"));
+        try {
+            const created = await client.request("session/new", {
+                cwd: workspace,
+                additionalDirectories: [extra],
+                mcpServers: [],
+            }) as { sessionId: string };
+
+            // A fresh process proves the plugin record is durable, not just
+            // the bridge's in-memory scope table.
+            await client.close();
+            client = new AcpTestClient(sessionRoot, workspace);
+            await client.request("initialize", { protocolVersion: 1 });
+
+            const statusText = async (id: string): Promise<string> => {
+                await client.request("session/prompt", {
+                    sessionId: id,
+                    prompt: [{ type: "text", text: "/status" }],
+                });
+                return client.updatesFor(id)
+                    .filter((update) => update["sessionUpdate"] === "agent_message_chunk")
+                    .map((update) => (update["content"] as { text?: string } | undefined)?.text ?? "")
+                    .join("");
+            };
+
+            await expect(client.request("session/resume", {
+                sessionId: created.sessionId,
+                cwd: workspace,
+                mcpServers: [],
+            })).resolves.toMatchObject({ modes: expect.any(Object) });
+            expect(await statusText(created.sessionId)).toContain(canonicalRoot(extra));
+
+            await expect(client.request("session/load", {
+                sessionId: created.sessionId,
+                cwd: workspace,
+                mcpServers: [],
+            })).resolves.toMatchObject({ modes: expect.any(Object) });
+            expect(await statusText(created.sessionId)).toContain(canonicalRoot(extra));
+
+            const child = await client.request("session/fork", {
+                sessionId: created.sessionId,
+                cwd: workspace,
+                mcpServers: [],
+            }) as { sessionId: string };
+            expect(await statusText(child.sessionId)).toContain(canonicalRoot(extra));
+        } finally {
+            rmSync(extra, { recursive: true, force: true });
+        }
+    }, 120_000);
 });
 
 // Optional: run the same handshake against a real standalone host install
@@ -2021,12 +2134,47 @@ describe("inclusive session/fork against a local mock model", () => {
         await expect(client.request("session/fork", {
             sessionId,
             cwd: workspace,
-            additionalDirectories: [join(workspace, "other-root")],
+            additionalDirectories: ["relative/other-root"],
             mcpServers: [],
         })).rejects.toMatchObject({
             code: -32602,
-            message: expect.stringContaining("additionalDirectories is not supported"),
+            message: expect.stringContaining("absolute"),
         });
+
+        // A fork request can add roots; the child carries them, and a later
+        // fork that omits the field inherits them from the source snapshot.
+        const forkExtra = join(workspace, "fork-extra-root");
+        mkdirSync(forkExtra, { recursive: true });
+        const rooted = await client.request("session/fork", {
+            sessionId,
+            cwd: workspace,
+            additionalDirectories: [forkExtra],
+            mcpServers: [],
+        }) as { sessionId: string };
+        await client.request("session/prompt", {
+            sessionId: rooted.sessionId,
+            prompt: [{ type: "text", text: "/status" }],
+        });
+        const rootedStatus = client.updatesFor(rooted.sessionId)
+            .filter((update) => update["sessionUpdate"] === "agent_message_chunk")
+            .map((update) => (update["content"] as { text?: string } | undefined)?.text ?? "")
+            .join("");
+        expect(rootedStatus).toContain(canonicalRoot(forkExtra));
+
+        const inherited = await client.request("session/fork", {
+            sessionId: rooted.sessionId,
+            cwd: workspace,
+            mcpServers: [],
+        }) as { sessionId: string };
+        await client.request("session/prompt", {
+            sessionId: inherited.sessionId,
+            prompt: [{ type: "text", text: "/status" }],
+        });
+        const inheritedStatus = client.updatesFor(inherited.sessionId)
+            .filter((update) => update["sessionUpdate"] === "agent_message_chunk")
+            .map((update) => (update["content"] as { text?: string } | undefined)?.text ?? "")
+            .join("");
+        expect(inheritedStatus).toContain(canonicalRoot(forkExtra));
 
         const prompts = ["FORK_ONE tell me one", "FORK_TWO tell me two", "FORK_THREE tell me three"];
         for (const text of prompts) {

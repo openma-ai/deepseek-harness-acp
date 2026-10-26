@@ -28,6 +28,31 @@
 - id: acp-app-startup
   disabled: true
 
+# ACP `additionalDirectories`: Cordis refuses two providers for the same
+# service key, so the single-root fs/sandbox rows are disabled before the
+# built-in multi-root replacements mount. The replacements keep the upstream
+# runner chain and filesystem mechanics; their scope service is empty for
+# sessions that send no extra roots, which then take the upstream path
+# verbatim. They are the ONLY provider for ctx.fs / ctx.sandbox in this
+# composition — do not re-enable the rows above.
+- id: fs-sandbox
+  disabled: true
+
+- id: sandbox
+  disabled: true
+
+- insert:
+    # Per-session additional roots fed by the ACP bridge (session/new, load,
+    # resume, fork). The fs and sandbox providers inject this service.
+    - id: acp-multi-root
+      name: '@openma/deepseek-harness-acp/multi-root'
+
+    - id: acp-multi-root-fs
+      name: '@openma/deepseek-harness-acp/multi-root/fs'
+
+    - id: acp-multi-root-sandbox
+      name: '@openma/deepseek-harness-acp/multi-root/sandbox'
+
 # Model-facing tool rows move off the host plane and into each agent preset's
 # own composition (standard/code/minimal/cordis ship complete agent.cordis.yml
 # files) — the same split the web-app bundle makes, and what gives "minimal"
