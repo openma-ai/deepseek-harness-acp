@@ -70,7 +70,7 @@ jobs:
             git switch -c "$UPDATE_BRANCH"
             git config user.name 'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add package.json package-lock.json runtime/package.json runtime/package-lock.json runtime/compatibility.json
+            git add package.json package-lock.json runtime/package.json runtime/package-lock.json runtime/compatibility.json src/compat.ts
             git commit -m "chore: upgrade bundled dsh to $DSH_VERSION"
             git push origin "$UPDATE_BRANCH"
           fi

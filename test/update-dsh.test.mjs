@@ -27,7 +27,9 @@ function manifest(overrides = {}) {
     };
 }
 
-function fakeSeams({ latest = LATEST, versions = VERSIONS, packageVersions = {}, manifestValue = manifest(), runtime = { dependencies: {} } } = {}) {
+const COMPAT_SOURCE = 'export const TESTED_DSH_THROUGH = "0.1.7-rc.2";\n';
+
+function fakeSeams({ latest = LATEST, versions = VERSIONS, packageVersions = {}, manifestValue = manifest(), runtime = { dependencies: {} }, compat = COMPAT_SOURCE } = {}) {
     const npm = vi.fn((args) => {
         if (args.includes("dist-tags.latest")) return latest;
         if (args.includes("versions")) {
@@ -44,6 +46,7 @@ function fakeSeams({ latest = LATEST, versions = VERSIONS, packageVersions = {},
     const log = vi.fn();
     const fs = {
         readJson: (path) => (path === "package.json" ? manifestValue : runtime),
+        readText: () => compat,
         writeJson: (path, value) => writes.push([path, value]),
         writeText: (path, text) => writes.push([path, text]),
         append: (path, text) => appended.push([path, text]),
@@ -99,7 +102,13 @@ describe("updateDshManifests", () => {
         expect(next.devDependencies["other"]).toBe("1.0.0");
         expect(written["runtime/package.json"].dependencies["@deepseek-ai/dsh"]).toBe(LATEST);
         expect(written["runtime/compatibility.json"]).toBe(JSON.stringify(["0.1.7-rc.2", "0.2.0-rc.1", "0.2.0-rc.2"]) + "\n");
+        expect(written["src/compat.ts"]).toBe(`export const TESTED_DSH_THROUGH = "${LATEST}";\n`);
         expect(seams.appended).toEqual([]);
+    });
+
+    it("fails when src/compat.ts lost its TESTED_DSH_THROUGH constant", () => {
+        const seams = fakeSeams({ compat: "export {};\n" });
+        expect(() => updateDshManifests(seams)).toThrow("src/compat.ts has no TESTED_DSH_THROUGH constant");
     });
 
     it("keeps dsh-* pins that do not publish the new version", () => {
@@ -148,6 +157,8 @@ describe("direct CLI invocation", () => {
         const script = resolve("scripts/update-dsh.mjs");
         try {
             mkdirSync(join(dir, "runtime"), { recursive: true });
+            mkdirSync(join(dir, "src"), { recursive: true });
+            writeFileSync(join(dir, "src", "compat.ts"), COMPAT_SOURCE);
             writeFileSync(join(dir, "package.json"), JSON.stringify(manifest()));
             writeFileSync(join(dir, "runtime", "package.json"), JSON.stringify({ dependencies: {} }));
             const output = join(dir, "github-output");
@@ -168,6 +179,7 @@ describe("direct CLI invocation", () => {
             expect(JSON.parse(readFileSync(join(dir, "runtime", "compatibility.json"), "utf8"))).toEqual(
                 ["0.1.7-rc.2", "0.2.0-rc.1", "0.2.0-rc.2"],
             );
+            expect(readFileSync(join(dir, "src", "compat.ts"), "utf8")).toBe(`export const TESTED_DSH_THROUGH = "${LATEST}";\n`);
             expect(readFileSync(output, "utf8")).toBe(`changed=true\nversion=${LATEST}\nprevious=0.1.7-rc.2\n`);
         } finally {
             process.chdir(cwd);
