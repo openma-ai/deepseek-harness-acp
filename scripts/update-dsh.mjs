@@ -5,9 +5,13 @@ import { pathToFileURL } from "node:url";
 
 /**
  * Upgrade the bundled @deepseek-ai/dsh to the latest dist-tag and refresh
- * the compatibility matrix. The manifest logic takes injectable seams so
+ * the compatibility matrix and the tested ceiling (`TESTED_DSH_THROUGH` in
+ * src/compat.ts). The manifest logic takes injectable seams so
  * the release path is covered by unit tests (issue #157).
  */
+const COMPAT_PATH = "src/compat.ts";
+const TESTED_THROUGH = /(export const TESTED_DSH_THROUGH = ")[^"]*(";)/;
+
 function packagePublishesVersion(npm, name, version) {
     try {
         const published = npm(["view", name, "versions"]);
@@ -57,6 +61,11 @@ export function updateDshManifests({ npm, fs, env = process.env, log = console.l
     fs.writeJson("runtime/package.json", runtime);
     // Single-line: CI feeds this file into GITHUB_OUTPUT / fromJSON matrices.
     fs.writeText("runtime/compatibility.json", `${JSON.stringify(matrix)}\n`);
+    // Keep the tested ceiling in step with the newest matrix entry so
+    // test/compat.test.ts stays green and runtime only warns above it.
+    const compat = fs.readText(COMPAT_PATH);
+    if (!TESTED_THROUGH.test(compat)) throw new Error(`${COMPAT_PATH} has no TESTED_DSH_THROUGH constant`);
+    fs.writeText(COMPAT_PATH, compat.replace(TESTED_THROUGH, `$1${latest}$2`));
     log(`Upgrade dsh ${previous} -> ${latest}; profile matrix: ${matrix.join(", ")}`);
     if (env.GITHUB_OUTPUT) fs.append(env.GITHUB_OUTPUT, `changed=true\nversion=${latest}\nprevious=${previous}\n`);
     return { changed: true, latest, previous, matrix };
@@ -66,6 +75,7 @@ const realSeams = {
     npm: (args) => JSON.parse(execFileSync("npm", [...args, "--json", "--registry=https://registry.npmjs.org"], { encoding: "utf8" })),
     fs: {
         readJson: (path) => JSON.parse(readFileSync(path, "utf8")),
+        readText: (path) => readFileSync(path, "utf8"),
         writeJson: (path, value) => writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`),
         writeText: (path, text) => writeFileSync(path, text),
         append: (path, text) => appendFileSync(path, text),
