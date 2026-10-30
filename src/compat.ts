@@ -57,7 +57,7 @@ export function supportedDshRange(): string {
  * it). test/compat.test.ts keeps it at or above every
  * runtime/compatibility.json entry.
  */
-export const TESTED_DSH_THROUGH = "0.2.1-rc.2";
+export const TESTED_DSH_THROUGH = "0.2.1-rc.5";
 
 /**
  * True when `version` meets the floor `range`; unknown versions refuse.
