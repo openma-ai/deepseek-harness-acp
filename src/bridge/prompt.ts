@@ -99,6 +99,57 @@ export class PromptImageError extends Error {
     }
 }
 
+/** Duck-typed `ctx.llm` lookup used to verify the pinned route accepts images. */
+export interface ModelInfoResolver {
+    resolveModelInfo(
+        provider: string,
+        model: string,
+    ): Promise<{ inputModalities?: readonly string[] | undefined } | undefined>;
+}
+
+/** Whether any ACP prompt block carries an inline image. */
+export function promptHasImages(prompt: readonly AcpContentBlock[]): boolean {
+    return prompt.some((block) => block.type === "image");
+}
+
+/**
+ * Refuse inline images when the pinned route's model does not declare image
+ * input.
+ *
+ * The harness accepts the prompt and silently omits the image for a text-only
+ * model, so the client believes the image was delivered. Refusing here turns
+ * that misconfiguration into an explicit protocol error, matching the adapter's
+ * existing rule that dropping unsupported content is worse than refusing it.
+ *
+ * @param llm - live model-info service, absent only outside a harness host
+ * @param provider - pinned provider route for the session
+ * @param model - pinned model id for the session
+ * @throws PromptImageError when the route is unknown or the model is text-only
+ */
+export async function assertImageInputSupported(
+    llm: ModelInfoResolver | undefined,
+    provider: string | undefined,
+    model: string | undefined,
+): Promise<void> {
+    if (provider === undefined || model === undefined) {
+        throw new PromptImageError("the current model route could not be resolved for image input");
+    }
+    if (llm === undefined) {
+        throw new PromptImageError("the current model route could not be verified for image input");
+    }
+    let info: { inputModalities?: readonly string[] | undefined } | undefined;
+    try {
+        info = await llm.resolveModelInfo(provider, model);
+    } catch (error: unknown) {
+        throw new PromptImageError("the current model route could not be verified for image input", {
+            cause: error,
+        });
+    }
+    if (info?.inputModalities === undefined || !info.inputModalities.includes("image")) {
+        throw new PromptImageError(`model "${model}" does not declare image input`);
+    }
+}
+
 function contextBlock(uri: string, text: string): string {
     // Fenced, attribution-carrying context representation; models treat the
     // tag as provenance rather than instructions.
