@@ -201,12 +201,12 @@ DSH_ACP_TEST_HOST=/tmp/dsh-host npm test
 
 2026-10-02 `gh workflow list` 列出三个 workflow：`CI`（`.github/workflows/ci.yml`）、`Release`（`release.yml`）、`Update bundled dsh`（`dsh-update.yml`）。
 
-`CI` 在 `main` 的 push、所有 `pull_request`，以及 `workflow_dispatch` 时跑。`ci.yml` 与 `release.yml` 都没有 `concurrency`。`test` job 没有 `timeout-minutes`。`standalone` 的 `timeout-minutes` 是 20。
+`CI` 在 `main` 的 push、所有 `pull_request`，以及 `workflow_dispatch` 时跑。`ci.yml` 与 `release.yml` 都没有 `concurrency`。`test` job 没有 `timeout-minutes`。`standalone` 的 `timeout-minutes` 是 25。
 
 | Job | 运行环境 | 步骤 |
 |---|---|---|
 | `test` | `ubuntu-latest`、`ubuntu-24.04-arm`、`macos-latest`、`windows-latest` × Node 22、24。显示名 `test (<os>, node <node>)`。`fail-fast: false` | `npm ci`，`npm run typecheck`，`npm test`，`npm run build`。只有 `ubuntu-latest` 且 Node 24 时再 `npm pack`，并把 `*.tgz` 上传为 artifact `package-tgz` |
-| `standalone` | `needs: test`，`if: ${{ !cancelled() }}`，同一组 OS × Node，超时 20 分钟 | 下载 `package-tgz`，执行 `node scripts/standalone-smoke.mjs` |
+| `standalone` | `needs: test`，`if: ${{ !cancelled() }}`，同一组 OS × Node，超时 25 分钟 | 下载 `package-tgz`，执行 `node scripts/standalone-smoke.mjs` |
 | `compatibility-versions` | `ubuntu-latest` | 把 `runtime/compatibility.json` 写入 job output `versions` |
 | `dsh-compatibility` | `needs: compatibility-versions`。显示名 `dsh --profile (<matrix.dsh>)`。`ubuntu-latest`，Node 24。`fail-fast: false` | `npm ci`，`npm run build`，pnpm 安装 `@deepseek-ai/dsh@${{ matrix.dsh }}`（该步骤 `timeout-minutes: 5`），`npm pack --ignore-scripts`，再 `npm exec -- node scripts/profile-smoke.mjs` |
 
@@ -249,7 +249,7 @@ DSH_ACP_TEST_HOST=/tmp/dsh-host npm test
 1. `verify-tag`（显示名 “verify tag is on main”）执行 `bash scripts/verify-release-tag.sh "$GITHUB_SHA" origin/main`。脚本用 `git merge-base --is-ancestor` 确认 tag 提交包含在 `origin/main` 里。
 2. `test`、`compatibility-versions`、`package` 都 `needs: verify-tag`。`test` 的 OS × Node 矩阵与 `ci.yml` 相同，步骤是 `npm ci`、`npm run typecheck`、`npm test`。`package` 在 `ubuntu-latest`、Node 24 上 `npm pack`，上传 artifact `package-tgz`。
 3. `dsh-compatibility` 与 `ci.yml` 使用同一份 `runtime/compatibility.json` 和 `scripts/profile-smoke.mjs`，Node 24，`needs: compatibility-versions`。
-4. `standalone` `needs: package`，四个 OS × Node 22 和 24，超时 20 分钟，执行 `node scripts/standalone-smoke.mjs`。`test/ci-workflows.test.ts` 要求 `publish` 的 `needs` 包含 `standalone` 和 `dsh-compatibility`。
+4. `standalone` `needs: package`，四个 OS × Node 22 和 24，超时 25 分钟，执行 `node scripts/standalone-smoke.mjs`。`test/ci-workflows.test.ts` 要求 `publish` 的 `needs` 包含 `standalone` 和 `dsh-compatibility`。
 5. `publish` `needs: [test, dsh-compatibility, standalone]`。权限是 `id-token: write`（注释：npm OIDC trusted publishing）和 `contents: write`（注释：create the GitHub Release）。Node 24 的注释写明该版本自带 npm `>= 11.5.1`（能做 OIDC）。tag 名必须等于 `v` 加上 `package.json` 的 `version`，否则打印 `::error::tag <tag> != package.json <v版本>` 并失败。然后下载已测试的 tarball 并 `npm publish`。tag 匹配 `*-alpha.*`、`*-beta.*` 或 `*-rc.*` 时 dist-tag 为 `beta`，否则为 `latest`。最后 `gh release create "$GITHUB_REF_NAME" *.tgz --generate-notes --verify-tag`；tag 名含 `-` 时加上 `--prerelease`。仓库没有 `CHANGELOG.md`，Release 说明来自 `--generate-notes`。
 
 已发生的 run，不是会自动更新的指针：

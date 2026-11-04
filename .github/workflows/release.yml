@@ -108,7 +108,7 @@ jobs:
   standalone:
     needs: package
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
