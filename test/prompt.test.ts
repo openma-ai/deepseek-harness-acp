@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { AttachmentId } from "@deepseek-ai/dsh-attachment";
 import {
+    assertImageInputSupported,
     attachmentIngestOf,
     convertPrompt,
     deliverPrompt,
+    promptHasImages,
     PromptImageError,
     UnsupportedPromptContentError,
     type AttachmentIngest,
@@ -254,5 +256,66 @@ describe("attachmentIngestOf", () => {
                 validateImage: async () => {},
             }),
         ).toBeUndefined();
+    });
+});
+
+describe("promptHasImages", () => {
+    it("reports whether any prompt block is an inline image", () => {
+        expect(promptHasImages([{ type: "text", text: "hello" }])).toBe(false);
+        expect(
+            promptHasImages([
+                { type: "text", text: "look" },
+                { type: "image", data: "aGk=", mimeType: "image/png" },
+            ]),
+        ).toBe(true);
+    });
+});
+
+describe("assertImageInputSupported", () => {
+    const resolver = (inputModalities?: readonly string[]) => ({
+        resolveModelInfo: async (_provider: string, _model: string) => ({ inputModalities }),
+    });
+
+    it("admits a model that declares image input", async () => {
+        await expect(
+            assertImageInputSupported(resolver(["text", "image"]), "deepseek-official", "v4.1"),
+        ).resolves.toBeUndefined();
+    });
+
+    it("refuses a text-only model", async () => {
+        const attempt = assertImageInputSupported(resolver(["text"]), "deepseek-official", "v4.1");
+        await expect(attempt).rejects.toBeInstanceOf(PromptImageError);
+        await expect(
+            assertImageInputSupported(resolver(["text"]), "deepseek-official", "v4.1"),
+        ).rejects.toThrow('model "v4.1" does not declare image input');
+    });
+
+    it("refuses when the model declares no modalities at all", async () => {
+        await expect(
+            assertImageInputSupported(resolver(undefined), "deepseek-official", "v4.1"),
+        ).rejects.toThrow("does not declare image input");
+    });
+
+    it("refuses an unresolved route instead of guessing", async () => {
+        await expect(
+            assertImageInputSupported(resolver(["text", "image"]), undefined, "v4.1"),
+        ).rejects.toThrow("could not be resolved");
+        await expect(
+            assertImageInputSupported(resolver(["text", "image"]), "deepseek-official", undefined),
+        ).rejects.toThrow("could not be resolved");
+    });
+
+    it("refuses when the route cannot be verified", async () => {
+        await expect(
+            assertImageInputSupported(undefined, "deepseek-official", "v4.1"),
+        ).rejects.toThrow("could not be verified");
+        const failing = {
+            resolveModelInfo: async (_provider: string, _model: string): Promise<{ inputModalities?: readonly string[] }> => {
+                throw new Error("probe failed");
+            },
+        };
+        await expect(
+            assertImageInputSupported(failing, "deepseek-official", "v4.1"),
+        ).rejects.toThrow("could not be verified");
     });
 });
