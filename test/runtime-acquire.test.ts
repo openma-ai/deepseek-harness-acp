@@ -19,6 +19,19 @@ import { resolveStandaloneRuntime, RuntimeUnavailableError } from "../src/runtim
 
 const DSH_VERSION = "0.2.1-rc.5";
 
+/** sherpa-onnx platform package name for a Node (platform, arch) pair. */
+function sherpaPackage(platform: string = process.platform, arch: string = process.arch): string {
+    const os = platform === "win32" ? "win" : platform;
+    return `sherpa-onnx-${os}-${arch}`;
+}
+
+function sherpaConstraints(name: string): { os: string[]; cpu: string[] } {
+    const id = name.replace(/^sherpa-onnx-/, "");
+    if (id.startsWith("win-")) return { os: ["win32"], cpu: [id.slice(4)] };
+    const dash = id.lastIndexOf("-");
+    return { os: [id.slice(0, dash)], cpu: [id.slice(dash + 1)] };
+}
+
 const roots: string[] = [];
 
 function makeRoot(prefix: string): string {
@@ -302,25 +315,25 @@ describe("standalone runtime acquisition", () => {
 
 describe("standalone native packages", () => {
     it("installs the host platform packages and skips the other platforms", async () => {
-        const native = await buildNativePackage("sherpa-onnx-linux-x64", "1.13.8");
-        const foreign = await buildNativePackage("sherpa-onnx-darwin-arm64", "1.13.8");
+        const host = sherpaPackage();
+        const foreign = host === "sherpa-onnx-darwin-arm64" ? "sherpa-onnx-linux-x64" : "sherpa-onnx-darwin-arm64";
+        const native = await buildNativePackage(host, "1.13.8");
+        const other = await buildNativePackage(foreign, "1.13.8");
         const registry = await startRegistry({
-            "sherpa-onnx-linux-x64": native,
-            "sherpa-onnx-darwin-arm64": foreign,
+            [host]: native,
+            [foreign]: other,
         });
         const { root, archive } = await makePackageRoot({
             externalPackages: {
-                "sherpa-onnx-linux-x64": {
+                [host]: {
                     version: "1.13.8",
                     integrity: native.integrity,
-                    os: ["linux"],
-                    cpu: ["x64"],
+                    ...sherpaConstraints(host),
                 },
-                "sherpa-onnx-darwin-arm64": {
+                [foreign]: {
                     version: "1.13.8",
-                    integrity: foreign.integrity,
-                    os: ["darwin"],
-                    cpu: ["arm64"],
+                    integrity: other.integrity,
+                    ...sherpaConstraints(foreign),
                 },
             },
         });
@@ -330,12 +343,12 @@ describe("standalone native packages", () => {
         process.env["DSH_ACP_REGISTRY"] = registry.url;
         try {
             const target = await resolveStandaloneRuntime(root);
-            const installed = join(target, "node_modules", "sherpa-onnx-linux-x64");
+            const installed = join(target, "node_modules", host);
             expect(existsSync(join(installed, "package.json"))).toBe(true);
             expect(JSON.parse(readFileSync(join(installed, "package.json"), "utf8")).version).toBe("1.13.8");
             // A package for another platform is never fetched nor installed.
-            expect(existsSync(join(target, "node_modules", "sherpa-onnx-darwin-arm64"))).toBe(false);
-            expect(registry.requests.some((path) => path.includes("darwin-arm64"))).toBe(false);
+            expect(existsSync(join(target, "node_modules", foreign))).toBe(false);
+            expect(registry.requests.some((path) => path.includes(foreign))).toBe(false);
         } finally {
             delete process.env["DSH_ACP_CACHE_DIR"];
             delete process.env["DSH_ACP_RUNTIME_TARBALL"];
@@ -345,15 +358,15 @@ describe("standalone native packages", () => {
     });
 
     it("keeps booting when a native package fails its integrity check", async () => {
-        const native = await buildNativePackage("sherpa-onnx-linux-x64", "1.13.8");
-        const registry = await startRegistry({ "sherpa-onnx-linux-x64": native });
+        const host = sherpaPackage();
+        const native = await buildNativePackage(host, "1.13.8");
+        const registry = await startRegistry({ [host]: native });
         const { root, archive } = await makePackageRoot({
             externalPackages: {
-                "sherpa-onnx-linux-x64": {
+                [host]: {
                     version: "1.13.8",
                     integrity: "sha512-not-the-real-digest",
-                    os: ["linux"],
-                    cpu: ["x64"],
+                    ...sherpaConstraints(host),
                 },
             },
         });
@@ -364,7 +377,7 @@ describe("standalone native packages", () => {
         try {
             const target = await resolveStandaloneRuntime(root);
             expect(existsSync(join(target, ".dsh-acp-runtime"))).toBe(true);
-            expect(existsSync(join(target, "node_modules", "sherpa-onnx-linux-x64", "package.json"))).toBe(false);
+            expect(existsSync(join(target, "node_modules", host, "package.json"))).toBe(false);
         } finally {
             delete process.env["DSH_ACP_CACHE_DIR"];
             delete process.env["DSH_ACP_RUNTIME_TARBALL"];

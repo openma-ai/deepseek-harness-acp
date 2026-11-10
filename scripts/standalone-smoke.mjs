@@ -6,7 +6,6 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
-import * as tar from "tar";
 
 const INITIALIZE_TIMEOUT_MS = 900_000;
 const REQUEST_TIMEOUT_MS = 600_000;
@@ -143,8 +142,10 @@ async function serve(label, env, run) {
 let binary;
 try {
     // The slim shell must not carry the runtime archive.
-    const entries = [];
-    tar.t({ file: archive, sync: true, onentry: (entry) => entries.push(entry.path) });
+    // Use the system `tar` so this script can run in CI without `npm ci`
+    // (the job only checks out the repo and downloads packed artifacts).
+    const entries = execFileSync("tar", ["-tzf", archive], { encoding: "utf8" })
+        .split(/\r?\n/).filter(Boolean);
     assert(!entries.some((path) => path.endsWith("dsh-runtime.tgz")), "the shell tarball must not contain the runtime archive");
     assert(entries.some((path) => path === "package/vendor/runtime.json"), "the shell tarball must carry the pinned runtime manifest");
 
