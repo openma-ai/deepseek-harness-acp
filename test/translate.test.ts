@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
     presentViewFromToolCall,
@@ -371,7 +372,7 @@ describe("SessionProjection tool calls", () => {
         ).toEqual([
             expect.objectContaining({
                 sessionUpdate: "tool_call",
-                locations: [{ path: "/work/session/src/main.c", line: 42 }],
+                locations: [{ path: resolve("/work/session", "src/main.c"), line: 42 }],
             }),
         ]);
 
@@ -386,7 +387,7 @@ describe("SessionProjection tool calls", () => {
         ).toEqual([
             expect.objectContaining({
                 sessionUpdate: "tool_call_update",
-                locations: [{ path: "/work/session/src/main.c", line: 42 }],
+                locations: [{ path: resolve("/work/session", "src/main.c"), line: 42 }],
             }),
         ]);
     });
@@ -406,7 +407,7 @@ describe("SessionProjection tool calls", () => {
         ).toEqual([
             expect.objectContaining({
                 sessionUpdate: "tool_call",
-                locations: [{ path: "/work/session/src/a.ts", line: 7 }],
+                locations: [{ path: resolve("/work/session", "src/a.ts"), line: 7 }],
             }),
         ]);
     });
@@ -942,8 +943,8 @@ describe("SessionProjection tool calls", () => {
         expect(created[0]).toMatchObject({
             sessionUpdate: "tool_call",
             kind: "edit",
-            locations: [{ path: "/work/src/new.ts" }],
-            content: [{ type: "diff", path: "/work/src/new.ts", newText: "hello\n" }],
+            locations: [{ path: resolve("/work", "src/new.ts") }],
+            content: [{ type: "diff", path: resolve("/work", "src/new.ts"), newText: "hello\n" }],
         });
         expect((created[0] as { content: Record<string, unknown>[] }).content[0]).not.toHaveProperty("oldText");
 
@@ -968,7 +969,7 @@ describe("SessionProjection tool calls", () => {
         expect(done[0]).toMatchObject({
             sessionUpdate: "tool_call_update",
             status: "completed",
-            content: [{ type: "diff", path: "/work/src/new.ts", newText: "hello\n" }],
+            content: [{ type: "diff", path: resolve("/work", "src/new.ts"), newText: "hello\n" }],
         });
 
         // Without a staged value (replay, older hosts) the pending diff card
@@ -999,7 +1000,7 @@ describe("SessionProjection tool calls", () => {
         );
         expect(replayed[0]).toMatchObject({
             sessionUpdate: "tool_call_update",
-            content: [{ type: "diff", path: "/work/src/new.ts", newText: "world\n" }],
+            content: [{ type: "diff", path: resolve("/work", "src/new.ts"), newText: "world\n" }],
         });
 
         // An authoritative "update" with no meta diffs means no change: the
