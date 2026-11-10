@@ -125,9 +125,11 @@ import {
     withInteractionMode,
 } from "./interaction-mode.ts";
 import {
+    assertImageInputSupported,
     attachmentIngestOf,
     convertPrompt,
     deliverPrompt,
+    promptHasImages,
     PromptImageError,
     UnsupportedPromptContentError,
 } from "./prompt.ts";
@@ -2967,6 +2969,10 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 }
                 let converted;
                 try {
+                    if (promptHasImages(parsed.data.prompt)) {
+                        const route = routeOf(record);
+                        await assertImageInputSupported(llm, route.provider, route.model);
+                    }
                     converted = await convertPrompt(parsed.data.prompt, attachmentIngestOf(ctx.get("attachments")));
                 } catch (error: unknown) {
                     if (error instanceof UnsupportedPromptContentError || error instanceof PromptImageError) {
@@ -3003,6 +3009,10 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 const record = await requireOrRestoreSession(params.sessionId);
                 let converted;
                 try {
+                    if (promptHasImages(params.prompt)) {
+                        const route = routeOf(record);
+                        await assertImageInputSupported(llm, route.provider, route.model);
+                    }
                     converted = await convertPrompt(
                         params.prompt,
                         attachmentIngestOf(ctx.get("attachments")),
