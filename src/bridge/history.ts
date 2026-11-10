@@ -10,7 +10,7 @@
  * fact).
  */
 
-import type { SessionUpdate, HarnessEvent } from "./translate.ts";
+import type { SessionUpdate, HarnessEvent, ToolPresentView } from "./translate.ts";
 import { SessionProjection } from "./translate.ts";
 
 export interface ReplayResult {
@@ -66,8 +66,14 @@ function userMessage(data: Record<string, unknown> | undefined): { text?: string
 /**
  * Project a stored session log onto the replay update stream.
  */
-export function buildReplay(events: readonly HarnessEvent[]): ReplayResult {
-    const projection = new SessionProjection();
+export function buildReplay(
+    events: readonly HarnessEvent[],
+    options?: {
+        presentCall?: (name: string, args: unknown) => ToolPresentView | undefined;
+        cwd?: string;
+    },
+): ReplayResult {
+    const projection = new SessionProjection(undefined, options);
     const updates: SessionUpdate[] = [];
     let plan: SessionUpdate | undefined;
     let title: string | undefined;
