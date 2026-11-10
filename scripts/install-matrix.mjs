@@ -17,6 +17,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve, delimiter } from "node:path";
 import { createInterface } from "node:readline";
+import { listTarball } from "./list-tarball.mjs";
 
 const argv = process.argv.slice(2);
 const flag = (name) => {
@@ -50,10 +51,6 @@ function npm(args, opts = {}) {
         env: opts.env ?? process.env,
         cwd: opts.cwd ?? root,
     });
-}
-
-function listTarball(file) {
-    return execFileSync("tar", ["-tzf", file], { encoding: "utf8" }).split(/\r?\n/).filter(Boolean);
 }
 
 async function withServer(handler, fn) {
