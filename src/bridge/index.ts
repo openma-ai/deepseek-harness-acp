@@ -132,7 +132,14 @@ import {
     UnsupportedPromptContentError,
 } from "./prompt.ts";
 import { resolveSessionTitle } from "./session-title.ts";
-import { SessionProjection, turnEndToStopReason, type HarnessEvent, type SessionUpdate } from "./translate.ts";
+import {
+    presentViewFromToolCall,
+    SessionProjection,
+    turnEndToStopReason,
+    type HarnessEvent,
+    type SessionUpdate,
+    type ToolPresentView,
+} from "./translate.ts";
 import { advertisesCordis, CORDIS_CAPABILITY } from "./cordis-protocol.ts";
 import { AcpRpc, muxAcpStream } from "./rpc.ts";
 import type { TuiClientAdvertisement } from "./tui-client.ts";
@@ -468,6 +475,29 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     const setMultiRootScope = (sessionId: string, roots: readonly string[]): void => {
         multiRootScope()?.set(sessionId, roots);
     };
+
+    /**
+     * The `tools` registry's `presentCall` presenters for one agent scope.
+     * Tool plugins declare how each pending call renders — title, kind, and
+     * follow-along file locations including line numbers (e.g. `read`'s
+     * offset) — the same presentation the harness's own frontends consume.
+     * Resolved lazily because `tools` is an optional service on older hosts;
+     * a missing service or a throwing presenter falls back to the adapter's
+     * name heuristic inside the projection.
+     */
+    const toolPresenter =
+        (scope: object | undefined) =>
+        (name: string, args: unknown): ToolPresentView | undefined => {
+            const tools = ctx.get("tools");
+            if (tools === undefined || typeof tools.get !== "function") return undefined;
+            try {
+                const view = tools.get(name, scope)?.presentCall?.(args);
+                return view === undefined ? undefined : presentViewFromToolCall(view);
+            } catch (error: unknown) {
+                logDebug(`tool presenter failed for ${name}: ${String(error)}`);
+                return undefined;
+            }
+        };
 
     const sameRoots = (left: readonly string[], right: readonly string[]): boolean =>
         left.length === right.length && left.every((root, index) => root === right[index]);
@@ -1177,9 +1207,17 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                         sessionId,
                         requested.length > 0 ? requested : stored,
                     );
-                    if (options.replay) replay = buildReplay(events as unknown as HarnessEvent[]);
                     presetId = (await presets.resolve(presetFromLog(storedHeader, events))).id;
+                    // Mount before replaying so preset-scoped tool presenters
+                    // resolve against the same scope live calls will use.
                     await presets.mount(agentCtx, presetId);
+                    if (options.replay) {
+                        const replayCwd = options.cwd ?? storedHeader?.cwd;
+                        replay = buildReplay(events as unknown as HarnessEvent[], {
+                            presentCall: toolPresenter(agent),
+                            ...(replayCwd !== undefined ? { cwd: replayCwd } : {}),
+                        });
+                    }
                 },
             } as Parameters<typeof agents.resume>[0]);
         } catch (error: unknown) {
@@ -1192,6 +1230,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         const projection = new SessionProjection(restored.contextWindow, {
             terminalOutput: clientTerminalOutput,
             ...(cwd !== undefined ? { cwd } : {}),
+            presentCall: toolPresenter(handle.agent),
         });
         const title = resolveSessionTitle({
             projcacheTitle: storedHeader !== undefined ? cachedSessionTitle(storedHeader) : undefined,
@@ -1390,6 +1429,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 projection: new SessionProjection(undefined, {
                     terminalOutput: clientTerminalOutput,
                     ...(child?.session.header.cwd !== undefined ? { cwd: child.session.header.cwd } : {}),
+                    presentCall: toolPresenter(child ?? parent),
                     ...(!clientSubagents ? {
                         subagent: { childSessionId, parentToolCallId: toolCallId, provider: info.provider },
                     } : {}),
@@ -2264,6 +2304,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 new SessionProjection(undefined, {
                     terminalOutput: clientTerminalOutput,
                     ...(agent.session.header.cwd !== undefined ? { cwd: agent.session.header.cwd } : {}),
+                    presentCall: toolPresenter(agent),
                 }),
             modeId,
             model,
