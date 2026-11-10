@@ -122,7 +122,7 @@ export function resolveSettings(argv: string[]): Settings {
         throw new SettingsError("--bundle requires a value");
     }
     for (const name of parsed.flags.keys()) {
-        if (!FLAGS_WITH_VALUES.has(name) && name !== "no-thinking") {
+        if (!FLAGS_WITH_VALUES.has(name) && name !== "no-thinking" && name !== "prefetch-runtime") {
             throw new SettingsError(`unknown flag: --${name}`);
         }
     }
@@ -210,6 +210,8 @@ Options:
   --reasoning-effort <level>  off | high | max (DSH_REASONING_EFFORT, default high)
   --no-thinking               Disable model thinking output
   --bash-timeout <ms>         Foreground bash timeout (DSH_BASH_TIMEOUT_MS, default 60000)
+  --prefetch-runtime          Download and cache the pinned standalone
+                              runtime, then exit (no ACP session is served)
   --version                   Print version and exit
   --help                      Show this help
 
@@ -217,6 +219,14 @@ Environment:
   DSH_ACP_HOST                DeepSeek Harness installation (see --dsh-path);
                               'bundled' pins the packaged runtime — set by embedders
   DSH_PATH                    DeepSeek Harness installation (see --dsh-path)
+  DSH_ACP_CACHE_DIR           Where the pinned runtime is cached
+                              (default: the platform cache dir + /dsh-acp)
+  DSH_ACP_RUNTIME_TARBALL     Local runtime archive to use instead of the
+                              published one (prefetch, CI, offline install)
+  DSH_ACP_RUNTIME_PACK        Local packed runtime package (.tgz or directory)
+                              to use instead of the published one
+  DSH_ACP_REGISTRY            npm registry the runtime and its native packages
+                              are fetched from (default: registry.npmjs.org)
   DEEPSEEK_API_KEY            DeepSeek (or compatible) API credential
   DEEPSEEK_BASE_URL           OpenAI-compatible endpoint override
   DSH_ACP_DEBUG               Verbose stderr diagnostics

@@ -92,6 +92,7 @@ jobs:
   package:
     needs: verify-tag
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -99,11 +100,23 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      # prepack builds the pinned runtime and the slim shell tarball; the
+      # runtime travels as its own npm package, paired by version and by the
+      # sha256 recorded in vendor/runtime.json.
       - run: npm pack
+      - name: Collect the runtime artifact
+        run: |
+          mkdir -p "$RUNNER_TEMP/runtime"
+          cp vendor/openma-deepseek-harness-acp-runtime-*.tgz "$RUNNER_TEMP/runtime/"
+          node -e "const m=require('./vendor/runtime.json'); console.log('runtime sha256: '+m.sha256); console.log('runtime package: '+m.runtimePackage.name+'@'+m.runtimePackage.version)"
       - uses: actions/upload-artifact@v4
         with:
           name: package-tgz
           path: "*.tgz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-tgz
+          path: "${{ runner.temp }}/runtime/*.tgz"
 
   standalone:
     needs: package
@@ -123,9 +136,13 @@ jobs:
         with:
           name: package-tgz
           path: artifact
-      - name: Boot isolated bundled runtime
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-tgz
+          path: runtime
+      - name: Boot the pinned runtime from the local artifact
         shell: bash
-        run: node scripts/standalone-smoke.mjs artifact/*.tgz
+        run: node scripts/standalone-smoke.mjs artifact/*.tgz --runtime-pack runtime/*.tgz
 
   # Refuse the tag before npm publish when the generated or published release
   # notes omit a pull request merged since the previous v* tag, or when the
@@ -176,20 +193,30 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: package-tgz
-      - name: Publish the tested artifact to npm (OIDC)
+          path: shell
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-tgz
+          path: runtime
+      - name: Publish the tested artifacts to npm (OIDC)
         run: |
           case "$GITHUB_REF_NAME" in
             *-alpha.*|*-beta.*|*-rc.*) DIST_TAG=beta ;;
             *) DIST_TAG=latest ;;
           esac
           echo "publishing with dist-tag: $DIST_TAG"
-          TARBALL=$(find . -maxdepth 1 -name '*.tgz' -print -quit)
-          test -n "$TARBALL"
-          npm publish "$TARBALL" --tag "$DIST_TAG"
+          SHELL_TARBALL=$(find shell -maxdepth 1 -name '*.tgz' -print -quit)
+          RUNTIME_TARBALL=$(find runtime -maxdepth 1 -name '*.tgz' -print -quit)
+          test -n "$SHELL_TARBALL"
+          test -n "$RUNTIME_TARBALL"
+          # The shell and the runtime package ship the same version: the
+          # standalone launcher fetches the runtime by that exact version.
+          npm publish "$SHELL_TARBALL" --tag "$DIST_TAG"
+          npm publish "$RUNTIME_TARBALL" --tag "$DIST_TAG"
       - name: GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           PRERELEASE=""
           case "$GITHUB_REF_NAME" in *-*) PRERELEASE="--prerelease" ;; esac
-          gh release create "$GITHUB_REF_NAME" *.tgz --generate-notes --verify-tag $PRERELEASE
+          gh release create "$GITHUB_REF_NAME" shell/*.tgz runtime/*.tgz --generate-notes --verify-tag $PRERELEASE

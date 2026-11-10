@@ -23,9 +23,17 @@
   `src/bridge/` is the ACP ↔ harness session bridge; `cordis.patch.yml` is
   the bundle patch mounted by `dsh plugin add`.
 - Tests: `DSH_ACP_TEST_HOST=/tmp/dsh-probe npm test` (needs a dsh host tree).
-- Standalone always uses the vendored runtime unless a harness is named
+- Standalone always uses the pinned runtime unless a harness is named
   explicitly (`--dsh-path`/`DSH_PATH`/`DSH_ACP_HOST`, or `bundled`);
-  PATH/invoking-dir/global installs are never probed. Plugin mode uses the
-  mounting host dsh. Both are checked against the `engines.dsh` floor
+  PATH/invoking-dir/global installs are never probed. The runtime is not
+  shipped inside the package: the standalone launcher acquires the exact
+  pinned artifact on demand (`src/runtime.ts`), verifies its sha256, and
+  caches it under `DSH_ACP_CACHE_DIR`. Plugin mode uses the mounting host
+  dsh and never touches the runtime. Both are checked against the
+  `engines.dsh` floor
   (`>=`; no `@deepseek-ai/dsh` peer — npm/pnpm peers exclude prereleases); newer dsh versions are attempted, with
   feature detection for API differences — never add an exact-version pin.
+- The shell package ships without the ~175 MiB runtime. The runtime is a
+  separate package `@openma/deepseek-harness-acp-runtime` at the same
+  version; native packages pruned from the archive are fetched by the
+  standalone launcher for the host platform only.

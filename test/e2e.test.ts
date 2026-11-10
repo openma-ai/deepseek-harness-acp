@@ -1553,7 +1553,10 @@ describe.skipIf(HOST_TREE === undefined)("dsh-acp against a standalone host inst
 // hijack the runtime, and an explicit out-of-range selection is refused
 // with a message naming version, source and supported range.
 describe("harness selection", () => {
-    function spawnLauncher(env: Record<string, string | undefined>): Promise<{ code: number; stderr: string }> {
+    function spawnLauncher(
+        env: Record<string, string | undefined>,
+        options: { stopOn?: RegExp } = {},
+    ): Promise<{ code: number; stderr: string }> {
         const merged: Record<string, string | undefined> = {
             ...process.env,
             DEEPSEEK_API_KEY: "sk-test-e2e-not-a-real-key",
@@ -1567,11 +1570,18 @@ describe("harness selection", () => {
                 stdio: ["ignore", "ignore", "pipe"],
             });
             let stderr = "";
+            let settled = false;
+            const finish = (code: number): void => {
+                if (settled) return;
+                settled = true;
+                resolve({ code, stderr });
+            };
             child.stderr.on("data", (chunk: string) => {
                 stderr += chunk;
+                if (options.stopOn?.test(stderr) && !child.killed) child.kill("SIGTERM");
             });
             child.on("error", reject);
-            child.on("exit", (code) => resolve({ code: code ?? -1, stderr }));
+            child.on("exit", (code) => finish(code ?? -1));
         });
     }
 
@@ -1586,21 +1596,36 @@ describe("harness selection", () => {
         mkdirSync(join(ambient, "prefix", "bin"), { recursive: true });
         symlinkSync(join(stalePkg, "dsh", "lib", "bin.js"), join(ambient, "prefix", "bin", "dsh"));
         try {
-            const result = await spawnLauncher({
-                DSH_PATH: undefined,
-                DSH_ACP_HOST: undefined,
-                PATH: `${join(ambient, "prefix", "bin")}${delimiter}${process.env["PATH"] ?? ""}`,
-            });
-            // The dev checkout has no packaged runtime, so the launcher must
-            // fail on the bundled probe alone — proving the stale dsh on PATH
-            // was never consulted (its version must not appear anywhere).
-            expect(result.code).not.toBe(0);
-            expect(result.stderr).toContain("bundled standalone runtime");
-            expect(result.stderr).not.toContain("0.1.1-rc.2");
+            const cache = mkdtempSync(join(tmpdir(), "dsh-acp-ambient-cache-"));
+            try {
+                const result = await spawnLauncher({
+                    DSH_PATH: undefined,
+                    DSH_ACP_HOST: undefined,
+                    DSH_ACP_CACHE_DIR: cache,
+                    DSH_ACP_RUNTIME_TARBALL: undefined,
+                    DSH_ACP_RUNTIME_PACK: undefined,
+                    PATH: `${join(ambient, "prefix", "bin")}${delimiter}${process.env["PATH"] ?? ""}`,
+                }, { stopOn: /harness host:|could not find a usable DeepSeek Harness runtime/ });
+                // A clean checkout has no vendor archive, so acquisition fails.
+                // After `npm run runtime:pack` the archive is present and the
+                // launcher boots the pinned runtime. Either way the stale dsh
+                // on PATH must never be consulted (its version must not appear).
+                expect(result.stderr).toContain("bundled standalone runtime");
+                expect(result.stderr).not.toContain("0.1.1-rc.2");
+                if (result.stderr.includes("harness host:")) {
+                    expect(result.stderr).toMatch(
+                        /harness host: @deepseek-ai\/dsh \S+ via bundled standalone runtime/,
+                    );
+                } else {
+                    expect(result.code).not.toBe(0);
+                }
+            } finally {
+                rmSync(cache, { recursive: true, force: true });
+            }
         } finally {
             rmSync(ambient, { recursive: true, force: true });
         }
-    }, 60_000);
+    }, 120_000);
 
     it("refuses an explicit out-of-range dsh path, naming version, source and supported range", async () => {
         const stale = mkdtempSync(join(tmpdir(), "dsh-acp-stale-"));
