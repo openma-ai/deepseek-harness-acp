@@ -1,9 +1,10 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import semver from "semver";
 import { describe, expect, it } from "vitest";
 
-import { externalPackageRecords, runtimePackageManifest } from "../scripts/runtime-package.mjs";
+import { assertRuntimeManifest, externalPackageRecords, runtimePackageManifest } from "../scripts/runtime-package.mjs";
 
 const root = join(import.meta.dirname, "..");
 const shell = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
@@ -118,6 +119,34 @@ describe("ACP package manifest", () => {
         const published = manifest as unknown as Record<string, unknown>;
         expect(published["scripts"]).toBeUndefined();
         expect(published["dependencies"]).toBeUndefined();
+    });
+
+    it("refuses a runtime manifest whose sha256 or version is stale", () => {
+        const dir = mkdtempSync(join(tmpdir(), "dsh-acp-manifest-"));
+        try {
+            const archive = join(dir, "dsh-runtime.tgz");
+            const manifestPath = join(dir, "runtime.json");
+            writeFileSync(archive, "not-a-real-archive");
+            const matching = {
+                archive: "dsh-runtime.tgz",
+                dsh: "0.2.1-rc.5",
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                runtimePackage: { name: "@openma/deepseek-harness-acp-runtime", version: "0.4.41" },
+            };
+            // empty-string sha is the hash of zero bytes, not of this archive
+            writeFileSync(manifestPath, `${JSON.stringify(matching)}\n`);
+            expect(() => assertRuntimeManifest({ archive, manifestPath, shellVersion: "0.4.41" }))
+                .toThrow(/does not match/);
+            writeFileSync(manifestPath, `${JSON.stringify({
+                ...matching,
+                sha256: "03ef647a4f563f88e1ff5d60beba710f16a65b77b3206fc3d0f2f8c4d5d4a5e1",
+                runtimePackage: { name: "@openma/deepseek-harness-acp-runtime", version: "0.4.42" },
+            })}\n`);
+            expect(() => assertRuntimeManifest({ archive, manifestPath, shellVersion: "0.4.41" }))
+                .toThrow(/does not match shell/);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
     });
 
     it("records the pruned native packages with their locked integrity", () => {

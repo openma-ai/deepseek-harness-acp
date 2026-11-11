@@ -12,7 +12,8 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 /** The npm package the standalone launcher fetches its runtime from. */
@@ -80,6 +81,32 @@ export function externalPackageRecords(lock) {
 }
 
 /**
+ * Refuse to pack (or republish) a runtime package whose manifest does not
+ * match the archive it claims to carry, or whose version drifted from the
+ * shell. The pair is generated together at pack time; this check is what
+ * keeps a stale vendor/ tree from being published.
+ */
+export function assertRuntimeManifest({ archive, manifestPath, shellVersion }) {
+    if (!existsSync(archive)) throw new Error(`missing runtime archive: ${archive}`);
+    if (!existsSync(manifestPath)) throw new Error(`missing runtime manifest: ${manifestPath}`);
+    const meta = JSON.parse(readFileSync(manifestPath, "utf8"));
+    if (meta.runtimePackage?.name !== RUNTIME_PACKAGE_NAME) {
+        throw new Error(`runtime.json names ${String(meta.runtimePackage?.name)}, expected ${RUNTIME_PACKAGE_NAME}`);
+    }
+    if (meta.runtimePackage?.version !== shellVersion) {
+        throw new Error(`runtime.json version ${String(meta.runtimePackage?.version)} does not match shell ${shellVersion}`);
+    }
+    if (typeof meta.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(meta.sha256)) {
+        throw new Error("runtime.json sha256 is missing or not a 64-char hex digest");
+    }
+    const sha256 = createHash("sha256").update(readFileSync(archive)).digest("hex");
+    if (sha256 !== meta.sha256) {
+        throw new Error(`runtime.json sha256 ${meta.sha256} does not match ${archive} (${sha256})`);
+    }
+    return meta;
+}
+
+/**
  * Pack the runtime package from an already built runtime archive.
  *
  * The result is a normal npm tarball (`package/…`) holding the runtime
@@ -94,6 +121,11 @@ export function packRuntimePackage({ root, vendor, shellVersion }) {
     rmSync(staging, { recursive: true, force: true });
     mkdirSync(staging, { recursive: true });
     try {
+        assertRuntimeManifest({
+            archive,
+            manifestPath: join(vendor, "runtime.json"),
+            shellVersion,
+        });
         writeFileSync(
             join(staging, "package.json"),
             `${JSON.stringify(runtimePackageManifest(shellVersion), null, 2)}\n`,

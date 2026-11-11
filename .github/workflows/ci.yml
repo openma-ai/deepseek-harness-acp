@@ -29,6 +29,13 @@ jobs:
       - run: npm run build
       - run: npm pack
         if: matrix.os == 'ubuntu-latest' && matrix.node == 24
+      - name: Verify the shell and runtime artifacts are a matched pair
+        if: matrix.os == 'ubuntu-latest' && matrix.node == 24
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          node scripts/verify-release-artifacts.mjs \
+            --shell "openma-deepseek-harness-acp-${VERSION}.tgz" \
+            --runtime "vendor/openma-deepseek-harness-acp-runtime-${VERSION}.tgz"
       - name: Collect the runtime artifact
         if: matrix.os == 'ubuntu-latest' && matrix.node == 24
         run: |
@@ -74,6 +81,53 @@ jobs:
       - name: Boot the pinned runtime from the local artifact
         shell: bash
         run: node scripts/standalone-smoke.mjs artifact/*.tgz --runtime-pack runtime/*.tgz
+
+
+  # Isolated real-install matrix against the packed artifacts: prefix/global
+  # layout, omit-optional, npm exec, prefetch-then-offline first session,
+  # explicit DSH_PATH, concurrent prefetch, checksum/404/corrupt recovery.
+  # Plugin add needs a dsh host and runs on Ubuntu only. Windows is covered
+  # by standalone-smoke (cold + warm offline); the full matrix does several
+  # 175 MiB extracts, which is too slow there. The public registry path is
+  # recorded as untested while @openma/deepseek-harness-acp-runtime is 404.
+  install-matrix:
+    name: install matrix (${{ matrix.os }}, node ${{ matrix.node }})
+    needs: test
+    if: ${{ !cancelled() }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-tgz
+          path: artifact
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-tgz
+          path: runtime
+      - name: Install a dsh host for plugin add
+        if: startsWith(matrix.os, 'ubuntu')
+        timeout-minutes: 5
+        run: |
+          mkdir -p "$RUNNER_TEMP/dsh-host"
+          npm exec -- pnpm --dir "$RUNNER_TEMP/dsh-host" add --ignore-scripts --config.auto-install-peers=true "@deepseek-ai/dsh@$(node -p "require('./package.json').dshAcp.standaloneDsh")"
+      - name: Run the isolated install matrix
+        shell: bash
+        run: |
+          DSH_ARG=()
+          if [ -x "$RUNNER_TEMP/dsh-host/node_modules/@deepseek-ai/dsh/lib/bin.js" ]; then
+            DSH_ARG=(--dsh "$RUNNER_TEMP/dsh-host/node_modules/@deepseek-ai/dsh/lib/bin.js")
+          fi
+          node scripts/install-matrix.mjs --shell artifact/*.tgz --runtime-pack runtime/*.tgz "${DSH_ARG[@]}"
 
   compatibility-versions:
     runs-on: ubuntu-latest

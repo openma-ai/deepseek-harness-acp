@@ -104,6 +104,12 @@ jobs:
       # runtime travels as its own npm package, paired by version and by the
       # sha256 recorded in vendor/runtime.json.
       - run: npm pack
+      - name: Verify the shell and runtime artifacts are a matched pair
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          node scripts/verify-release-artifacts.mjs \
+            --shell "openma-deepseek-harness-acp-${VERSION}.tgz" \
+            --runtime "vendor/openma-deepseek-harness-acp-runtime-${VERSION}.tgz"
       - name: Collect the runtime artifact
         run: |
           mkdir -p "$RUNNER_TEMP/runtime"
@@ -144,6 +150,46 @@ jobs:
         shell: bash
         run: node scripts/standalone-smoke.mjs artifact/*.tgz --runtime-pack runtime/*.tgz
 
+  # Same isolated install matrix as CI. Ubuntu also runs plugin add.
+  # Windows stays on standalone-smoke only (several 175 MiB extracts).
+  install-matrix:
+    name: install matrix (${{ matrix.os }}, node ${{ matrix.node }})
+    needs: package
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-tgz
+          path: artifact
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-tgz
+          path: runtime
+      - name: Install a dsh host for plugin add
+        if: startsWith(matrix.os, 'ubuntu')
+        timeout-minutes: 5
+        run: |
+          mkdir -p "$RUNNER_TEMP/dsh-host"
+          npm exec -- pnpm --dir "$RUNNER_TEMP/dsh-host" add --ignore-scripts --config.auto-install-peers=true "@deepseek-ai/dsh@$(node -p "require('./package.json').dshAcp.standaloneDsh")"
+      - name: Run the isolated install matrix
+        shell: bash
+        run: |
+          DSH_ARG=()
+          if [ -x "$RUNNER_TEMP/dsh-host/node_modules/@deepseek-ai/dsh/lib/bin.js" ]; then
+            DSH_ARG=(--dsh "$RUNNER_TEMP/dsh-host/node_modules/@deepseek-ai/dsh/lib/bin.js")
+          fi
+          node scripts/install-matrix.mjs --shell artifact/*.tgz --runtime-pack runtime/*.tgz "${DSH_ARG[@]}"
+
   # Refuse the tag before npm publish when the generated or published release
   # notes omit a pull request merged since the previous v* tag, or when the
   # version, lockfile, README pin, and tag disagree. Minor and major bumps
@@ -170,7 +216,7 @@ jobs:
         run: node scripts/release-check.mjs --tag
 
   publish:
-    needs: [test, dsh-compatibility, standalone, release-check]
+    needs: [test, dsh-compatibility, standalone, install-matrix, release-check]
     runs-on: ubuntu-latest
     permissions:
       id-token: write # npm OIDC trusted publishing
@@ -209,10 +255,13 @@ jobs:
           RUNTIME_TARBALL=$(find runtime -maxdepth 1 -name '*.tgz' -print -quit)
           test -n "$SHELL_TARBALL"
           test -n "$RUNTIME_TARBALL"
-          # The shell and the runtime package ship the same version: the
-          # standalone launcher fetches the runtime by that exact version.
-          npm publish "$SHELL_TARBALL" --tag "$DIST_TAG"
+          # Pair the artifacts again immediately before publish: version and
+          # sha256 must still match. Publish the runtime package first so a
+          # slim shell never lands on the registry without its runtime (first
+          # standalone start would then 404).
+          node scripts/verify-release-artifacts.mjs --shell "$SHELL_TARBALL" --runtime "$RUNTIME_TARBALL"
           npm publish "$RUNTIME_TARBALL" --tag "$DIST_TAG"
+          npm publish "$SHELL_TARBALL" --tag "$DIST_TAG"
       - name: GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -158,8 +158,13 @@ dsh-acp --prefetch-runtime   # download and cache the pinned runtime, then exit
 ```
 
 The first standalone start after a slim install therefore needs **either** the
-network (it fetches the exact pinned artifact) **or** a runtime artifact that
-is already on disk:
+network (it fetches the exact pinned artifact from the registry) **or** a
+runtime artifact that is already on disk. A slim-only install with no
+prefetch, no local artifact, and no network **cannot** complete that first
+start. This is a deliberate change from 0.4.41, which bundled the runtime and
+could start offline immediately after `npm install`. Use
+`dsh-acp --prefetch-runtime` (online) before going offline, or hand the
+launcher a local artifact:
 
 ```bash
 # an archive or a packed runtime package you already have
