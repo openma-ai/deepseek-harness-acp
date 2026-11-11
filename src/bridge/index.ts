@@ -1075,7 +1075,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
 
     const requireCredential = async (provider?: string): Promise<void> => {
         const route = provider ?? defaultProvider();
-        if (await credentialPresent(route)) return;
+        // Preserve the existing default credential behavior for non-subscription routes.
+        if (await credentialPresent(provider)) return;
         // Only accept a subscription when its provider is registered in this host.
         const routes = await listProviderRoutes();
         if (route && routes.some((entry) => entry.id === route) &&
