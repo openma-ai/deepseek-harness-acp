@@ -61,6 +61,8 @@ import {
 import { z } from "zod";
 import type { Context } from "@deepseek-ai/cordis";
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
+import { resolveDshHome } from "@deepseek-ai/dsh-home-paths";
+import { hasSubscriptionLogin } from "./subscription-auth.ts";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import { ReasoningEffortId, type createUserMessage, type errorChain } from "@deepseek-ai/dsh-llm";
 import {
@@ -1072,7 +1074,12 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     };
 
     const requireCredential = async (provider?: string): Promise<void> => {
-        if (await credentialPresent(provider)) return;
+        const route = provider ?? defaultProvider();
+        if (await credentialPresent(route)) return;
+        // Only accept a subscription when its provider is registered in this host.
+        const routes = await listProviderRoutes();
+        if (route && routes.some((entry) => entry.id === route) &&
+            await hasSubscriptionLogin(resolveDshHome(), route)) return;
         throw authError(
             "no credential found for this provider: call authenticate with `_meta[\"api-key\"].apiKey` or `_meta.gateway`, pick an advertised auth method, run `dsh-acp login`, or save a key in the dsh Web UI (Settings → Models)",
         );
@@ -2113,7 +2120,17 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 logWarn(`auth status describe failed for ${route.id}: ${String(error)}`);
                 continue;
             }
-            if (!info.configured) continue;
+            if (!info.configured) {
+                if (await hasSubscriptionLogin(resolveDshHome(), route.id)) {
+                    providers.push({
+                        providerId: route.id,
+                        ...(route.name !== undefined ? { name: route.name } : {}),
+                        kind: "other",
+                        label: "Subscription login",
+                    });
+                }
+                continue;
+            }
             let baseUrlConfigured = false;
             try {
                 baseUrlConfigured = (

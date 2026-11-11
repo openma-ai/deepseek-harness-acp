@@ -5,6 +5,9 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { Context } from "@deepseek-ai/cordis";
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
 import { AgentContext } from "@agentclientprotocol/sdk/unstable";
@@ -280,6 +283,32 @@ describe("ACP auth methods by capability", () => {
 });
 
 describe("authenticate paths", () => {
+    it("allows only a registered provider with a matching subscription session", async () => {
+        const home = await mkdtemp(join(tmpdir(), "acp-auth-integration-"));
+        const previous = process.env["DSH_HOME"];
+        process.env["DSH_HOME"] = home;
+        try {
+            const dir = join(home, "plugins", "subscriptions");
+            await mkdir(dir, { recursive: true });
+            const session = { accessToken: "test-access", refreshToken: "test-refresh", expiresAt: 0 };
+            await writeFile(join(dir, "auth.json"), JSON.stringify({ codex: { accounts: { a: session } } }));
+            const good = await boot({ provider: "codex", providers: [{ id: "codex" }] });
+            try {
+                await good.client.request("initialize", { protocolVersion: 1 });
+                const response = await good.client.request("session/new", { cwd: "/ws", mcpServers: [] });
+                expect((response["result"] as { sessionId?: string })?.sessionId).toBeTruthy();
+            } finally { await good.ctx.fiber.dispose(); }
+            const missing = await boot({ provider: "codex", providers: [] });
+            try {
+                await missing.client.request("initialize", { protocolVersion: 1 });
+                const response = await missing.client.request("session/new", { cwd: "/ws", mcpServers: [] });
+                expect((response["error"] as { code?: number })?.code).toBe(-32000);
+            } finally { await missing.ctx.fiber.dispose(); }
+        } finally {
+            if (previous === undefined) delete process.env["DSH_HOME"]; else process.env["DSH_HOME"] = previous;
+            await rm(home, { recursive: true, force: true });
+        }
+    });
     it("rejects session/new with -32000 carrying data.authMethods when nothing is stored", async () => {
         const { ctx, client } = await boot({ providers: [{ id: "deepseek-official" }] });
         try {
