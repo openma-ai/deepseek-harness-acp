@@ -34,13 +34,13 @@
     "package.json",
     "profile-root.cordis.yml",
     "vendor/*.json",
-    "vendor/*.tgz",
     "assets/icon.svg"
   ],
   "scripts": {
     "prepack": "npm run build && npm run runtime:pack",
     "build": "node build.mjs",
     "runtime:pack": "node scripts/pack-runtime.mjs",
+    "runtime:package": "node scripts/pack-runtime-package.mjs",
     "start": "node --import tsx src/index.ts",
     "pretest": "npm run build",
     "test": "vitest run",
@@ -148,22 +148,10 @@
   },
   "dshAcp": {
     "standaloneDsh": "0.2.1-rc.5",
+    "runtimePackage": "@openma/deepseek-harness-acp-runtime",
     "hostCompatibility": {
       "cordisProtocol": 0,
       "policy": "capability-negotiated"
     }
-  },
-  "optionalDependencies": {
-    "@deepseek-ai/libreoffice-kit-darwin-arm64": "0.1.5",
-    "@deepseek-ai/libreoffice-kit-darwin-x64": "0.1.5",
-    "@deepseek-ai/libreoffice-kit-wasm": "0.1.5",
-    "@deepseek-ai/libreoffice-kit-win32-arm64": "0.1.5",
-    "@deepseek-ai/libreoffice-kit-win32-x64": "0.1.5",
-    "sherpa-onnx-darwin-arm64": "1.13.8",
-    "sherpa-onnx-darwin-x64": "1.13.8",
-    "sherpa-onnx-linux-arm64": "1.13.8",
-    "sherpa-onnx-linux-x64": "1.13.8",
-    "sherpa-onnx-win-ia32": "1.13.8",
-    "sherpa-onnx-win-x64": "1.13.8"
   }
 }

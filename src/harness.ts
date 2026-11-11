@@ -7,8 +7,9 @@
  *     prefix, or any directory whose `node_modules` carries the
  *     `@deepseek-ai` scope (the literal value {@link BUNDLED_HOST} names the
  *     packaged runtime explicitly);
- *   - otherwise, the package's own integrity-checked, cached standalone
- *     runtime — always, no matter who launched the process.
+ *   - otherwise, the package's own pinned, integrity-checked standalone
+ *     runtime — acquired on demand and cached, always, no matter who
+ *     launched the process.
  *
  * Implicit discovery (a `dsh` on PATH, in the invoking directory, or in
  * global npm) is deliberately absent: an unrelated or stale install must
@@ -35,7 +36,7 @@ import { pathToFileURL } from "node:url";
 
 import { dshVersionSupported, dshVersionUntested, refusalMessage, supportedDshRange, untestedMessage } from "./compat.ts";
 import { logDebug, logWarn } from "./log.ts";
-import { resolveVendoredRuntime } from "./runtime.ts";
+import { resolveStandaloneRuntime, RuntimeUnavailableError } from "./runtime.ts";
 
 export { supportedDshRange };
 
@@ -58,7 +59,7 @@ export interface HarnessHost {
 }
 
 export class HarnessNotFoundError extends Error {
-    constructor(probed: string[], explicit?: string) {
+    constructor(probed: string[], explicit?: string, detail?: string) {
         super(
             explicit !== undefined
                 ? [
@@ -73,8 +74,14 @@ export class HarnessNotFoundError extends Error {
                 : [
                       "could not find a usable DeepSeek Harness runtime.",
                       "",
-                      "The bundled DeepSeek Harness runtime is missing or invalid.",
-                      "Reinstall @openma/deepseek-harness-acp, or point it at an existing installation:",
+                      "The pinned standalone DeepSeek Harness runtime could not be acquired.",
+                      ...(detail !== undefined ? ["", detail] : []),
+                      "",
+                      "Acquire it once, with network access:",
+                      "    dsh-acp --prefetch-runtime",
+                      "or point at a local runtime archive:",
+                      "    DSH_ACP_RUNTIME_TARBALL=/path/to/dsh-runtime.tgz dsh-acp",
+                      "or use an existing installation:",
                       "    DSH_PATH=/path/to/dsh dsh-acp        (dsh binary, package dir, or npm root)",
                       "",
                       probed.length > 0
@@ -177,14 +184,15 @@ function hostFromExplicit(explicit: string): HarnessHost | undefined {
  * Resolve the single DeepSeek Harness installation this process uses.
  *
  * An explicit selection is validated and compatibility-checked; with no
- * selection (or the literal {@link BUNDLED_HOST}) the packaged runtime is
- * the only host — ambient installs are never consulted.
+ * selection (or the literal {@link BUNDLED_HOST}) the pinned runtime is
+ * acquired on demand and cached — ambient installs are never consulted.
  *
- * @throws HarnessNotFoundError when the selection names nothing usable.
+ * @throws HarnessNotFoundError when the selection names nothing usable, or
+ *         when the pinned runtime cannot be acquired.
  * @throws HarnessCompatibilityError when it names an install below the floor;
  *         one newer than any tested dsh is used with a warning.
  */
-export function resolveHost(explicit?: string): HarnessHost {
+export async function resolveHost(explicit?: string): Promise<HarnessHost> {
     if (explicit !== undefined && explicit !== BUNDLED_HOST) {
         const host = hostFromExplicit(explicit);
         if (host !== undefined) {
@@ -196,8 +204,16 @@ export function resolveHost(explicit?: string): HarnessHost {
         // silently using another installation would be worse than failing.
         throw new HarnessNotFoundError([`--dsh-path/DSH_PATH: ${explicit}`], explicit);
     }
-    const vendored = resolveVendoredRuntime();
-    const host = vendored === undefined ? undefined : hostAt(vendored, "bundled standalone runtime");
+    let runtime: string;
+    try {
+        runtime = await resolveStandaloneRuntime();
+    } catch (error: unknown) {
+        if (error instanceof RuntimeUnavailableError) {
+            throw new HarnessNotFoundError(["bundled standalone runtime"], undefined, error.message);
+        }
+        throw error;
+    }
+    const host = hostAt(runtime, "bundled standalone runtime");
     if (host === undefined) throw new HarnessNotFoundError(["bundled standalone runtime"]);
     if (!dshVersionSupported(host.dshVersion)) throw new HarnessCompatibilityError(host, supportedDshRange());
     return host;

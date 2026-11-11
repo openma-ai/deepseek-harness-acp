@@ -16,7 +16,10 @@ const argvFor = (...args: string[]) => ["node", "dsh-acp", ...args];
 
 function mockLog() {
     const logError = vi.fn();
-    vi.doMock("../src/log.ts", () => ({ logError }));
+    const logDebug = vi.fn();
+    const logInfo = vi.fn();
+    const logWarn = vi.fn();
+    vi.doMock("../src/log.ts", () => ({ logDebug, logError, logInfo, logWarn }));
     return { logError };
 }
 
