@@ -30,6 +30,12 @@ export declare function runtimePackageTarballName(shellVersion: string): string;
 
 export declare function externalPackageRecords(lock: unknown): Record<string, ExternalPackageRecord>;
 
+export declare function assertRuntimeManifest(options: {
+    archive: string;
+    manifestPath: string;
+    shellVersion: string;
+}): unknown;
+
 export declare function packRuntimePackage(options: {
     root: string;
     vendor: string;
