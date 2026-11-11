@@ -280,9 +280,17 @@ try {
     });
 
     // --- 7 explicit --dsh-path must not download ---
+    // Prefer --dsh (CI hands a prefix-installed host). The repo's
+    // node_modules tree is only present after a local npm ci.
+    const dshHost = [
+        dshBin ? resolve(dshBin, "..", "..") : "",
+        resolve("node_modules/@deepseek-ai/dsh"),
+    ].find((candidate) => candidate && existsSync(join(candidate, "package.json")));
+    if (!dshHost) {
+        record("standalone/explicit-dsh-path-no-download", "skip", "no dsh host available (pass --dsh or npm ci)");
+    } else {
     await runCase("standalone/explicit-dsh-path-no-download", async () => {
-        const host = resolve("node_modules/@deepseek-ai/dsh");
-        assert(existsSync(join(host, "package.json")), "dev dsh tree missing; cannot exercise --dsh-path");
+        const host = dshHost;
         const cache = join(root, "cache-dshpath");
         mkdirSync(cache);
         const { init, stderr } = await acpInitialize(bin, baseEnv({
@@ -297,6 +305,7 @@ try {
         assert.match(stderr, /via --dsh-path\/DSH_PATH|via DSH_PATH/);
         return "explicit host used; cache stayed empty";
     });
+    }
 
     // --- 8 concurrent prefetch ---
     await runCase("standalone/concurrent-prefetch", async () => {

@@ -181,6 +181,9 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/dsh-host"
           npm exec -- pnpm --dir "$RUNNER_TEMP/dsh-host" add --ignore-scripts --config.auto-install-peers=true "@deepseek-ai/dsh@$(node -p "require('./package.json').dshAcp.standaloneDsh")"
+      - name: Make pnpm available for dsh plugin add
+        if: startsWith(matrix.os, 'ubuntu')
+        run: npm install -g pnpm
       - name: Run the isolated install matrix
         shell: bash
         run: |
