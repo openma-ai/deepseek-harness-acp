@@ -17,6 +17,7 @@ export interface RuntimePackageManifest {
     version: string;
     description: string;
     license: string;
+    repository: { type: string; url: string };
     publishConfig: { access: string };
     files: string[];
     engines: { node: string };
