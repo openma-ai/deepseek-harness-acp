@@ -1,9 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 import { AttachmentId } from "@deepseek-ai/dsh-attachment";
 import {
+    advertisesImageCapability,
+    assertImageInputSupported,
     attachmentIngestOf,
     convertPrompt,
     deliverPrompt,
+    imageConsumerFromHost,
+    imageConsumerOf,
+    imageConsumptionFor,
+    promptHasImages,
     PromptImageError,
     UnsupportedPromptContentError,
     type AttachmentIngest,
@@ -240,6 +246,34 @@ describe("convertPrompt", () => {
             })),
         ).rejects.toMatchObject({ name: "PromptImageError", message: "disk full" });
     });
+
+    it("uses a verified text-route consumer after saving, without emitting an image block", async () => {
+        const consumeImage = vi.fn(async ({ attachment }: { attachment: { attachmentId: string } }) =>
+            `image-consumed:${attachment.attachmentId}`,
+        );
+        const consumer = {
+            protocol: "dsh-acp.image-consumer" as const,
+            version: 1 as const,
+            consumeImage,
+        };
+        const result = await convertPrompt(
+            [
+                { type: "text", text: "inspect " },
+                { type: "image", data: "AQ==", mimeType: "image/png" },
+                { type: "text", text: " now" },
+            ],
+            mockIngest(),
+            { kind: "consumer", consumer, route: { provider: "p", model: "text-only" } },
+        );
+        expect(result.blocks).toEqual([
+            { type: "text", text: "inspect image-consumed:sha256:mock-1 now" },
+        ]);
+        expect(consumeImage).toHaveBeenCalledWith({
+            attachment: expect.objectContaining({ attachmentId: "sha256:mock-1" }),
+            route: { provider: "p", model: "text-only" },
+        });
+        expect(result.blocks.some((block) => block.type === "image")).toBe(false);
+    });
 });
 
 describe("attachmentIngestOf", () => {
@@ -254,5 +288,111 @@ describe("attachmentIngestOf", () => {
                 validateImage: async () => {},
             }),
         ).toBeUndefined();
+    });
+});
+
+describe("promptHasImages", () => {
+    it("reports whether any prompt block is an inline image", () => {
+        expect(promptHasImages([{ type: "text", text: "hello" }])).toBe(false);
+        expect(
+            promptHasImages([
+                { type: "text", text: "look" },
+                { type: "image", data: "aGk=", mimeType: "image/png" },
+            ]),
+        ).toBe(true);
+    });
+});
+
+describe("assertImageInputSupported", () => {
+    const resolver = (inputModalities?: readonly string[]) => ({
+        resolveModelInfo: async (_provider: string, _model: string) => ({ inputModalities }),
+    });
+
+    it("admits a model that declares image input", async () => {
+        await expect(
+            assertImageInputSupported(resolver(["text", "image"]), "deepseek-official", "v4.1"),
+        ).resolves.toBeUndefined();
+    });
+
+    it("refuses a text-only model", async () => {
+        const attempt = assertImageInputSupported(resolver(["text"]), "deepseek-official", "v4.1");
+        await expect(attempt).rejects.toBeInstanceOf(PromptImageError);
+        await expect(
+            assertImageInputSupported(resolver(["text"]), "deepseek-official", "v4.1"),
+        ).rejects.toThrow('model "v4.1" does not declare image input');
+    });
+
+    it("refuses when the model declares no modalities at all", async () => {
+        await expect(
+            assertImageInputSupported(resolver(undefined), "deepseek-official", "v4.1"),
+        ).rejects.toThrow("does not declare image input");
+    });
+
+    it("refuses an unresolved route instead of guessing", async () => {
+        await expect(
+            assertImageInputSupported(resolver(["text", "image"]), undefined, "v4.1"),
+        ).rejects.toThrow("could not be resolved");
+        await expect(
+            assertImageInputSupported(resolver(["text", "image"]), "deepseek-official", undefined),
+        ).rejects.toThrow("could not be resolved");
+    });
+
+    it("refuses when the route cannot be verified", async () => {
+        await expect(
+            assertImageInputSupported(undefined, "deepseek-official", "v4.1"),
+        ).rejects.toThrow("could not be verified");
+        const failing = {
+            resolveModelInfo: async (_provider: string, _model: string): Promise<{ inputModalities?: readonly string[] }> => {
+                throw new Error("probe failed");
+            },
+        };
+        await expect(
+            assertImageInputSupported(failing, "deepseek-official", "v4.1"),
+        ).rejects.toThrow("could not be verified");
+    });
+});
+
+describe("image consumption capability", () => {
+    const consumer = {
+        protocol: "dsh-acp.image-consumer" as const,
+        version: 1 as const,
+        consumeImage: async () => "consumed",
+    };
+
+    it("accepts only the explicit versioned consumer contract", () => {
+        expect(imageConsumerOf(consumer)).toBe(consumer);
+        expect(imageConsumerOf({ name: "vision" })).toBeUndefined();
+        expect(imageConsumerOf({ protocol: "dsh-acp.image-consumer", version: 2, consumeImage: consumer.consumeImage })).toBeUndefined();
+    });
+
+    it("finds a consumer from a host service or currently visible tool", () => {
+        expect(imageConsumerFromHost(consumer)).toBe(consumer);
+        let visible = false;
+        const definitions = vi.fn(() => visible ? [{ name: "reader", acpImageConsumer: consumer }] : []);
+        expect(imageConsumerFromHost(undefined, { definitions })).toBeUndefined();
+        visible = true;
+        expect(imageConsumerFromHost(undefined, { definitions }, "session")).toBe(consumer);
+        visible = false;
+        expect(imageConsumerFromHost(undefined, { definitions }, "session")).toBeUndefined();
+        expect(definitions).toHaveBeenCalledWith(undefined);
+    });
+
+    it("uses model metadata first, then a verified consumer, and otherwise fails closed", async () => {
+        const vision = { resolveModelInfo: async () => ({ inputModalities: ["text", "image"] as const }) };
+        await expect(imageConsumptionFor(vision, { provider: "p", model: "vision" }, consumer)).resolves.toEqual({ kind: "model" });
+        const text = { resolveModelInfo: async () => ({ inputModalities: ["text"] as const }) };
+        await expect(imageConsumptionFor(text, { provider: "p", model: "text" }, consumer)).resolves.toMatchObject({ kind: "consumer" });
+        await expect(imageConsumptionFor(text, { provider: "p", model: "text" })).resolves.toBeUndefined();
+        await expect(imageConsumptionFor(undefined, {})).resolves.toBeUndefined();
+    });
+
+    it("advertises only a mounted ingest with a verified initial consumption path", async () => {
+        const vision = { resolveModelInfo: async () => ({ inputModalities: ["image"] as const }) };
+        const text = { resolveModelInfo: async () => ({ inputModalities: ["text"] as const }) };
+        await expect(advertisesImageCapability(false, vision, { provider: "p", model: "vision" })).resolves.toBe(false);
+        await expect(advertisesImageCapability(true, vision, { provider: "p", model: "vision" })).resolves.toBe(true);
+        await expect(advertisesImageCapability(true, text, { provider: "p", model: "text" })).resolves.toBe(false);
+        await expect(advertisesImageCapability(true, text, { provider: "p", model: "text" }, consumer)).resolves.toBe(true);
+        await expect(advertisesImageCapability(true, undefined, {})).resolves.toBe(false);
     });
 });

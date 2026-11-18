@@ -8,11 +8,13 @@
  * file mentions this way).
  *
  * When the composition provides `ctx.attachments`, ACP `image` blocks are
- * decoded, batch-validated, and committed with `saveImage` into harness
- * `{ type: "image", attachment }` blocks. Block order is preserved: adjacent
- * text / resource_link / embedded text stay one text block; an image flushes
- * the text stream so 图文交替 survives. Binary `resource` payloads and audio
- * are still rejected — silently dropping them would be worse than refusing.
+ * decoded, batch-validated, and committed with `saveImage`. A model-capable
+ * route receives harness `{ type: "image", attachment }` blocks. A text-only
+ * route may instead provide the explicit ACP image-consumer contract below;
+ * that consumer receives the durable reference and returns text, so the image
+ * is never silently omitted or sent as an image block to a text model.
+ * Binary `resource` payloads and audio are still rejected — silently dropping
+ * them would be worse than refusing.
  */
 
 import type { ContentBlock as AcpContentBlock } from "@agentclientprotocol/sdk/unstable";
@@ -57,6 +59,34 @@ export interface HarnessImageBlock {
 
 export type HarnessContentBlock = HarnessTextBlock | HarnessImageBlock;
 
+/** The exact route selected for the prompt being admitted. */
+export interface ImagePromptRoute {
+    provider?: string;
+    model?: string;
+}
+
+/**
+ * Public host contract for a text-route image consumer.
+ *
+ * The bridge never infers this capability from a tool name or description.
+ * A host pipeline/tool must publish this versioned object under the
+ * `acpImageConsumer` context service, or as a tool definition's
+ * `acpImageConsumer` property. Its function is the consumption path: it gets
+ * the saved attachment reference and must return the text that the current
+ * text-only route can use. Implementations may call a tool, enqueue a vision
+ * subagent, or perform another host-owned read, but they own that routing.
+ */
+export interface AcpImageConsumer {
+    readonly protocol: "dsh-acp.image-consumer";
+    readonly version: 1;
+    consumeImage(input: { attachment: HarnessImageAttachment; route: ImagePromptRoute }): Promise<string>;
+}
+
+/** Exact image path selected for one prompt. */
+export type ImageConsumption =
+    | { kind: "model" }
+    | { kind: "consumer"; consumer: AcpImageConsumer; route: ImagePromptRoute };
+
 export interface ConvertedPrompt {
     /** Harness user-message content blocks, in wire order. */
     blocks: HarnessContentBlock[];
@@ -96,6 +126,153 @@ export class PromptImageError extends Error {
     constructor(message: string, options?: ErrorOptions) {
         super(message, options);
         this.name = "PromptImageError";
+    }
+}
+
+/** Duck-typed `ctx.llm` lookup used to verify the pinned route accepts images. */
+export interface ModelInfoResolver {
+    resolveModelInfo(
+        provider: string,
+        model: string,
+        signal?: AbortSignal,
+    ): Promise<{ inputModalities?: readonly string[] | undefined } | undefined>;
+}
+
+/** A live tool registry surface used only for capability inspection. */
+export interface ToolDefinitions {
+    definitions(scope?: unknown): readonly unknown[];
+}
+
+/**
+ * Validate the explicit image-consumer contract. Unknown values fail closed;
+ * in particular, names such as `vision` or `image` are never sufficient.
+ */
+export function imageConsumerOf(value: unknown): AcpImageConsumer | undefined {
+    if (value === null || typeof value !== "object") return undefined;
+    const candidate = value as Partial<AcpImageConsumer>;
+    if (
+        candidate.protocol !== "dsh-acp.image-consumer" ||
+        candidate.version !== 1 ||
+        typeof candidate.consumeImage !== "function"
+    ) {
+        return undefined;
+    }
+    return candidate as AcpImageConsumer;
+}
+
+/**
+ * Find a consumer published by a host service or by a currently visible tool.
+ * The registry is read on every call so session-scoped tools can appear or
+ * disappear without changing the connection-level initialize response.
+ */
+export function imageConsumerFromHost(
+    service: unknown,
+    tools?: ToolDefinitions,
+    scope?: unknown,
+): AcpImageConsumer | undefined {
+    const direct = imageConsumerOf(service);
+    if (direct !== undefined) return direct;
+    if (tools === undefined || typeof tools.definitions !== "function") return undefined;
+    let definitions: readonly unknown[];
+    try {
+        definitions = tools.definitions(scope);
+    } catch {
+        return undefined;
+    }
+    for (const definition of definitions) {
+        if (definition === null || typeof definition !== "object") continue;
+        const consumer = imageConsumerOf((definition as { acpImageConsumer?: unknown }).acpImageConsumer);
+        if (consumer !== undefined) return consumer;
+    }
+    return undefined;
+}
+
+/**
+ * Resolve the live route's image consumption path. A declared model modality
+ * wins. If that route is text-only or cannot be verified, an explicit host
+ * consumer may handle the saved attachment; otherwise this returns undefined.
+ */
+export async function imageConsumptionFor(
+    llm: ModelInfoResolver | undefined,
+    route: ImagePromptRoute,
+    consumer?: AcpImageConsumer,
+): Promise<ImageConsumption | undefined> {
+    if (route.provider !== undefined && route.model !== undefined && llm !== undefined) {
+        const controller = new AbortController();
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        const deadline = new Promise<undefined>((resolve) => {
+            timeout = setTimeout(() => {
+                controller.abort();
+                resolve(undefined);
+            }, 1_000);
+        });
+        try {
+            const info = await Promise.race([
+                llm.resolveModelInfo(route.provider, route.model, controller.signal),
+                deadline,
+            ]);
+            if (info?.inputModalities?.includes("image") === true) return { kind: "model" };
+        } catch {
+            // A consumer path can still be authoritative when the model path
+            // is unavailable; without one, the caller fails closed.
+        } finally {
+            if (timeout !== undefined) clearTimeout(timeout);
+        }
+    }
+    return consumer === undefined ? undefined : { kind: "consumer", consumer, route };
+}
+
+/**
+ * Compute the one-shot initialize advertisement. Ingest alone is never a
+ * capability: without a verified route or host consumer, the answer is false.
+ */
+export async function advertisesImageCapability(
+    attachmentsMounted: boolean,
+    llm: ModelInfoResolver | undefined,
+    route: ImagePromptRoute,
+    consumer?: AcpImageConsumer,
+): Promise<boolean> {
+    if (!attachmentsMounted) return false;
+    return (await imageConsumptionFor(llm, route, consumer)) !== undefined;
+}
+
+/** Whether any ACP prompt block carries an inline image. */
+export function promptHasImages(prompt: readonly AcpContentBlock[]): boolean {
+    return prompt.some((block) => block.type === "image");
+}
+
+/**
+ * Refuse inline images when the pinned route's model does not declare image
+ * input. Callers that also have a verified {@link AcpImageConsumer} should use
+ * {@link imageConsumptionFor} instead, so a text route can consume the saved
+ * attachment without receiving a harness image block.
+ *
+ * @param llm - live model-info service, absent only outside a harness host
+ * @param provider - pinned provider route for the session
+ * @param model - pinned model id for the session
+ * @throws PromptImageError when the route is unknown or the model is text-only
+ */
+export async function assertImageInputSupported(
+    llm: ModelInfoResolver | undefined,
+    provider: string | undefined,
+    model: string | undefined,
+): Promise<void> {
+    if (provider === undefined || model === undefined) {
+        throw new PromptImageError("the current model route could not be resolved for image input");
+    }
+    if (llm === undefined) {
+        throw new PromptImageError("the current model route could not be verified for image input");
+    }
+    let info: { inputModalities?: readonly string[] | undefined } | undefined;
+    try {
+        info = await llm.resolveModelInfo(provider, model);
+    } catch (error: unknown) {
+        throw new PromptImageError("the current model route could not be verified for image input", {
+            cause: error,
+        });
+    }
+    if (info?.inputModalities === undefined || !info.inputModalities.includes("image")) {
+        throw new PromptImageError(`model "${model}" does not declare image input`);
     }
 }
 
@@ -203,6 +380,7 @@ function flushText(parts: string[], blocks: HarnessContentBlock[]): void {
 export async function convertPrompt(
     prompt: AcpContentBlock[],
     attachments?: AttachmentIngest,
+    consumption: ImageConsumption = { kind: "model" },
 ): Promise<ConvertedPrompt> {
     const preparedImages: PreparedImage[] = [];
     for (const block of prompt) {
@@ -263,7 +441,6 @@ export async function convertPrompt(
                 const prepared = preparedImages[imageIndex];
                 imageIndex += 1;
                 if (prepared === undefined) throw new PromptImageError("image block was not prepared");
-                flushText(parts, blocks);
                 let attachment: HarnessImageAttachment;
                 try {
                     attachment = await attachments.saveImage(saveInput(prepared));
@@ -271,7 +448,22 @@ export async function convertPrompt(
                     const message = error instanceof Error ? error.message : String(error);
                     throw new PromptImageError(message, { cause: error });
                 }
-                blocks.push({ type: "image", attachment });
+                if (consumption.kind === "consumer") {
+                    let text: string;
+                    try {
+                        text = await consumption.consumer.consumeImage({ attachment, route: consumption.route });
+                    } catch (error: unknown) {
+                        const message = error instanceof Error ? error.message : String(error);
+                        throw new PromptImageError(`image consumer failed: ${message}`, { cause: error });
+                    }
+                    if (typeof text !== "string" || text.trim().length === 0) {
+                        throw new PromptImageError("image consumer returned no text");
+                    }
+                    parts.push(text);
+                } else {
+                    flushText(parts, blocks);
+                    blocks.push({ type: "image", attachment });
+                }
                 break;
             }
             default:
