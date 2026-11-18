@@ -71,15 +71,18 @@ plus the `next` dist-tag. The bundled runtime is
 
 Runtime selection has exactly two rules (Martty issue #157):
 
-- **Standalone** (`dsh-acp` bin): the packaged runtime is always used —
-  ambient installs in the invoking directory, on PATH, or in global npm are
-  never consulted. An explicit `--dsh-path`/`DSH_PATH`/`DSH_ACP_HOST`
-  (or the literal value `bundled`) selects an installation instead, and is
-  refused with a message naming the version found, its source, and the
-  supported range when it falls outside it.
+- **Standalone** (`dsh-acp` bin): the pinned runtime is used — ambient
+  installs in the invoking directory, on PATH, or in global npm are never
+  consulted. It is acquired on demand (see *Runtime acquisition*), verified
+  against the sha256 recorded in the package, and cached. An explicit
+  `--dsh-path`/`DSH_PATH`/`DSH_ACP_HOST` (or the literal value `bundled`)
+  selects an installation instead, and is refused with a message naming the
+  version found, its source, and the supported range when it falls outside
+  it.
 - **Plugin mode** (`dsh plugin add`, Martty launched as a dsh plugin): the
   hosting dsh is the runtime, checked against the same range at mount time;
-  an out-of-range host fails with the same refusal message.
+  an out-of-range host fails with the same refusal message. The plugin never
+  downloads or loads the pinned runtime.
 
 The resolved runtime is always reported: the launcher logs
 `harness host: @deepseek-ai/dsh <version> via <source>` to stderr, and the
@@ -136,12 +139,54 @@ dsh-acp login        # interactive; or save the key in the dsh Web UI
 }
 ```
 
-The standalone binary uses the runtime archived inside this package unless a
-harness is named explicitly via `--dsh-path` / `DSH_PATH` / `DSH_ACP_HOST`.
+The standalone binary uses the pinned runtime unless a harness is named
+explicitly via `--dsh-path` / `DSH_PATH` / `DSH_ACP_HOST`.
 DSH is declared as an `engines.dsh` floor (see *DSH compatibility*), never an
 npm-installed dependency: plugin mode uses the
 Host's tree, while standalone maps the same imports to the private runtime.
 When a real `$DSH_HOME/profiles/acp` exists, that profile owns the composition.
+
+#### Runtime acquisition (standalone)
+
+The npm package is **slim**: it does not carry the ~175 MiB private runtime,
+and it installs no native binaries either — a plugin install stays small and
+never reaches the network for a runtime. The standalone launcher acquires the
+pinned runtime itself, on demand, and caches it:
+
+```bash
+dsh-acp --prefetch-runtime   # download and cache the pinned runtime, then exit
+```
+
+The first standalone start after a slim install therefore needs **either** the
+network (it fetches the exact pinned artifact from the registry) **or** a
+runtime artifact that is already on disk. A slim-only install with no
+prefetch, no local artifact, and no network **cannot** complete that first
+start. This is a deliberate change from 0.4.41, which bundled the runtime and
+could start offline immediately after `npm install`. Use
+`dsh-acp --prefetch-runtime` (online) before going offline, or hand the
+launcher a local artifact:
+
+```bash
+# an archive or a packed runtime package you already have
+DSH_ACP_RUNTIME_TARBALL=/path/to/dsh-runtime.tgz dsh-acp
+DSH_ACP_RUNTIME_PACK=/path/to/openma-deepseek-harness-acp-runtime-0.4.41.tgz dsh-acp
+```
+
+After the cache is warm, the standalone launcher starts offline, exactly as
+before. The cache lives in `DSH_ACP_CACHE_DIR` (or the platform cache
+directory, under `dsh-acp`), keyed by the runtime version and the sha256 of
+the archive.
+
+| Variable | Effect |
+|---|---|
+| `DSH_ACP_CACHE_DIR` | Where the pinned runtime is cached |
+| `DSH_ACP_RUNTIME_TARBALL` | Use this local runtime archive instead of the published one |
+| `DSH_ACP_RUNTIME_PACK` | Use this local packed runtime package instead of the published one |
+| `DSH_ACP_REGISTRY` | Registry the runtime and its native packages are fetched from |
+
+The runtime is fetched by **exact version**, never `latest`, and never from
+PATH, the invoking directory, or a global npm install. A corrupted or
+mismatched archive is refused instead of booted.
 
 ## Plugin and extension model
 
@@ -293,7 +338,7 @@ another provider.
 - **Plans & usage** — `todo_write` snapshots as ACP plans; token accounting as `usage_update` and per-turn usage.
 - **Sessions** — `session/resume` restores a durable session without replaying its transcript; `session/load` remains the full-history path. Also supports `session/list`, silent restore when a client prompts an old session after an agent restart, and titles as `session_info_update`. **Multi-root sessions** are supported through the bundled multi-root plugin: `initialize` advertises `sessionCapabilities.additionalDirectories: {}`, and `session/new`, `session/load`, `session/resume`, and `session/fork` accept absolute directory paths (`cwd` stays the base for relative paths). Additional roots are readable in every mode and writable under `workspace-write` (not under `read-only`); omitted or empty input on `session/new` is exactly the single-root path. The list is persisted as a session plugin record: `load`/`resume`/`fork` restore it when the client omits `additionalDirectories`, while a non-empty request replaces it. The plugin replaces the core `fs-sandbox`/`sandbox` rows with thin in-tree subclasses and widens bwrap/Landlock/Seatbelt profiles; a profile shape it cannot widen fails closed rather than silently dropping the roots. Residual limits: the Windows ACL backend cannot widen its singular workspace grant (additional-root writes are unsupported there, though reads still work), Windows UNC/device paths are refused, and widening is coupled to the profile shapes emitted by `@deepseek-ai/dsh-sandbox-local`.
 - **Fork** — `initialize` advertises `sessionCapabilities.fork: {}` and `agentCapabilities._meta.jetbrains.air.fork = { version: 1, inclusive: true }` (deep-merged next to `dsh.cordis`). `session/fork` creates a new session id and leaves the source session unchanged. Without `_meta.jetbrains.air.fork`, the new session copies the source's committed log. With that block, the copy keeps the selected assistant message and everything before it, and drops every later message. `messageId` is the ACP id `<turn>:<step>` (a `<id>:segment:<n>` id is also matched as `<id>`). An optional `messageFingerprint` (`sha256:` + SHA-256 of the assistant text) and 1-based `messageOccurrence` disambiguate. A bad version, a bad fingerprint, a missing id, or a point that is not in the log is JSON-RPC `-32602` — the adapter does not silently copy the whole session. Unknown session ids and subagent child sessions are also `-32602`. Only persisted assistant messages are fork points; a running turn's live stream is ignored. If the selected message itself contains tool calls, those calls are removed from the copied message (their results are stored after the message, so keeping the calls would leave an illegal transcript and would make `session/load` replay continue past the message). Tool calls and results from earlier messages stay. `session/load` on the new session replays through that assistant message and no further; `session/prompt` continues from there. The fork response carries the same `modes` and `configOptions` shape as `session/new`.
-- **MCP servers** — per-session `mcpServers` mount `@deepseek-ai/dsh-mcp-client` instances (stdio + streamable HTTP); tools join as `mcp__<server>__<tool>`; a failing server never takes the session down.
+- **MCP servers** — per-session `mcpServers` mount `@deepseek-ai/dsh-mcp-client` instances (stdio + streamable HTTP); tools join as `mcp__<server>__<tool>`; `session/new`, `session/load`, `session/resume` and `session/fork` answer once the listed servers have connected and listed their tools (waiting at most 10 s), so the first turn sees them; a failing server never takes the session down.
 - **Steering** — the initialize response advertises `_meta.steering.supported: true`. Send `_session/steering` with `{ sessionId, prompt, _meta: { steering: { idleBehavior: "promptRequired" } } }` to inject into an active turn; `{ outcome: "injected" }` leaves its original prompt request and output stream in charge. If that turn ends before injection, the response is `{ outcome: "promptRequired", reason: "noRunningTurn" }` and the client sends an ordinary `session/prompt`. Omitting `idleBehavior` uses the same behavior. Concurrent `session/prompt` steering remains supported.
 - **Real cancellation** — `session/cancel` interrupts the live turn through the harness agent.
 
@@ -337,7 +382,8 @@ dsh-acp
    ├─ src/bin.ts              selects one DSH tree before Host imports evaluate
    ├─ src/profile-boot.ts     boots the harness's own profile machinery
    │                          (dsh-base + this bundle + $DSH_HOME layers)
-   ├─ src/harness.ts          host discovery (DSH_PATH → cwd → PATH → npm -g → bundled runtime)
+   ├─ src/harness.ts          host selection (explicit path, else the pinned
+   │                          runtime acquired on demand by src/runtime.ts)
    └─ src/bridge/             the ACP bridge (a cordis plugin)
         ├─ index.ts           sessions, prompts, cancel, modes, options,
         │                     commands, credentials, MCP mounts

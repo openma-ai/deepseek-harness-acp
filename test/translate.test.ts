@@ -1,5 +1,7 @@
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+    presentViewFromToolCall,
     SessionProjection,
     classifyToolCall,
     diffsFromToolMeta,
@@ -49,6 +51,43 @@ describe("classifyToolCall", () => {
         expect(classifyToolCall("grep_search", JSON.stringify({ query: "foo" })).kind).toBe("search");
         expect(classifyToolCall("web_fetch", JSON.stringify({ url: "https://x" })).kind).toBe("fetch");
         expect(classifyToolCall("mystery", "{}").kind).toBe("other");
+    });
+
+    it("derives a location line from read offset and str_replace_editor insert_line", () => {
+        expect(
+            classifyToolCall("read", JSON.stringify({ file_path: "/w/a.ts", offset: 40 })).locations,
+        ).toEqual([{ path: "/w/a.ts", line: 40 }]);
+        expect(
+            classifyToolCall(
+                "str_replace_editor",
+                JSON.stringify({ command: "insert", path: "/w/a.ts", insert_line: 4 }),
+            ).locations,
+        ).toEqual([{ path: "/w/a.ts", line: 5 }]);
+        expect(classifyToolCall("read", JSON.stringify({ file_path: "/w/a.ts" })).locations).toEqual([
+            { path: "/w/a.ts" },
+        ]);
+    });
+});
+
+describe("presentViewFromToolCall", () => {
+    it("maps the card union and drops malformed locations", () => {
+        expect(
+            presentViewFromToolCall({
+                card: "generic",
+                title: "Read a",
+                kind: "read",
+                locations: [{ path: "a", line: 2 }, { line: 3 }, "x"],
+            }),
+        ).toEqual({ title: "Read a", kind: "read", locations: [{ path: "a", line: 2 }] });
+        expect(presentViewFromToolCall({ card: "terminal", title: "npm test" })).toEqual({
+            title: "npm test",
+            kind: "execute",
+        });
+        expect(
+            presentViewFromToolCall({ card: "diff", title: "Write a", locations: [{ path: "a" }] }),
+        ).toEqual({ title: "Write a", kind: "edit", locations: [{ path: "a" }] });
+        expect(presentViewFromToolCall({ card: "generic" })).toBeUndefined();
+        expect(presentViewFromToolCall(null)).toBeUndefined();
     });
 });
 
@@ -306,6 +345,73 @@ describe("SessionProjection streaming", () => {
 });
 
 describe("SessionProjection tool calls", () => {
+    it("carries presentCall locations with line numbers into call and update payloads", () => {
+        const p = new SessionProjection(undefined, {
+            cwd: "/work/session",
+            presentCall: (name) =>
+                name === "read"
+                    ? {
+                          card: "generic",
+                          title: "Read src/main.c",
+                          kind: "read",
+                          locations: [{ path: "src/main.c", line: 42 }],
+                      }
+                    : undefined,
+        });
+
+        expect(
+            p.onEvent(
+                event("tool/call", {
+                    turn: 1,
+                    step: 0,
+                    callId: "c1",
+                    name: "read",
+                    arguments: JSON.stringify({ file_path: "src/main.c", offset: 42 }),
+                }),
+            ),
+        ).toEqual([
+            expect.objectContaining({
+                sessionUpdate: "tool_call",
+                locations: [{ path: resolve("/work/session", "src/main.c"), line: 42 }],
+            }),
+        ]);
+
+        expect(
+            p.onEvent(
+                event("assistant/chunk", {
+                    turn: 1,
+                    step: 0,
+                    chunk: { type: "tool-call-delta", index: 0, id: "c1", argumentsDelta: "" },
+                }),
+            ),
+        ).toEqual([
+            expect.objectContaining({
+                sessionUpdate: "tool_call_update",
+                locations: [{ path: resolve("/work/session", "src/main.c"), line: 42 }],
+            }),
+        ]);
+    });
+
+    it("resolves relative fallback locations against the session cwd", () => {
+        const p = new SessionProjection(undefined, { cwd: "/work/session" });
+        expect(
+            p.onEvent(
+                event("tool/call", {
+                    turn: 1,
+                    step: 0,
+                    callId: "c1",
+                    name: "read",
+                    arguments: JSON.stringify({ file_path: "src/a.ts", offset: 7 }),
+                }),
+            ),
+        ).toEqual([
+            expect.objectContaining({
+                sessionUpdate: "tool_call",
+                locations: [{ path: resolve("/work/session", "src/a.ts"), line: 7 }],
+            }),
+        ]);
+    });
+
     it("publishes a live tool request and streams later input into the same row", () => {
         const p = new SessionProjection();
 
@@ -800,6 +906,158 @@ describe("SessionProjection tool calls", () => {
             status: "completed",
             content: [{ type: "diff", path: "/w/a.ts", oldText: "a", newText: "b" }],
         });
+    });
+
+    it("sends pending diff-card content and synthesizes write-create diffs", () => {
+        const p = new SessionProjection(undefined, {
+            cwd: "/work",
+            presentCall: (name, args) => {
+                const input = args as { file_path?: unknown; content?: unknown };
+                if (name !== "write" || typeof input.file_path !== "string") return undefined;
+                return {
+                    card: "diff",
+                    title: `Write ${input.file_path}`,
+                    diffs: [
+                        {
+                            path: input.file_path,
+                            oldText: null,
+                            newText: typeof input.content === "string" ? input.content : "",
+                        },
+                    ],
+                    locations: [{ path: input.file_path }],
+                };
+            },
+        });
+        const writeArgs = (content: string) =>
+            JSON.stringify({ file_path: "src/new.ts", content });
+
+        const created = p.onEvent(
+            event("tool/call", {
+                turn: 1,
+                step: 0,
+                callId: "w1",
+                name: "write",
+                arguments: writeArgs("hello\n"),
+            }),
+        );
+        expect(created[0]).toMatchObject({
+            sessionUpdate: "tool_call",
+            kind: "edit",
+            locations: [{ path: resolve("/work", "src/new.ts") }],
+            content: [{ type: "diff", path: resolve("/work", "src/new.ts"), newText: "hello\n" }],
+        });
+        expect((created[0] as { content: Record<string, unknown>[] }).content[0]).not.toHaveProperty("oldText");
+
+        // The staged canonical value reports operation:"create"; meta.diffs is
+        // empty for creations, so the whole-file diff is synthesized.
+        p.recordToolResult("w1", { path: "src/new.ts", operation: "create", before: null, after: "hello\n" });
+        const done = p.onEvent(
+            event("tool/result", {
+                turn: 1,
+                step: 0,
+                message: {
+                    content: [
+                        {
+                            type: "tool-result",
+                            toolCallId: "w1",
+                            content: [{ type: "text", text: "Created file src/new.ts" }],
+                        },
+                    ],
+                },
+            }),
+        );
+        expect(done[0]).toMatchObject({
+            sessionUpdate: "tool_call_update",
+            status: "completed",
+            content: [{ type: "diff", path: resolve("/work", "src/new.ts"), newText: "hello\n" }],
+        });
+
+        // Without a staged value (replay, older hosts) the pending diff card
+        // is the fallback file-change description.
+        p.onEvent(
+            event("tool/call", {
+                turn: 1,
+                step: 1,
+                callId: "w2",
+                name: "write",
+                arguments: writeArgs("world\n"),
+            }),
+        );
+        const replayed = p.onEvent(
+            event("tool/result", {
+                turn: 1,
+                step: 1,
+                message: {
+                    content: [
+                        {
+                            type: "tool-result",
+                            toolCallId: "w2",
+                            content: [{ type: "text", text: "Created file src/new.ts" }],
+                        },
+                    ],
+                },
+            }),
+        );
+        expect(replayed[0]).toMatchObject({
+            sessionUpdate: "tool_call_update",
+            content: [{ type: "diff", path: resolve("/work", "src/new.ts"), newText: "world\n" }],
+        });
+
+        // An authoritative "update" with no meta diffs means no change: the
+        // pending create-shaped diff must not leak into the result.
+        p.onEvent(
+            event("tool/call", {
+                turn: 1,
+                step: 2,
+                callId: "w3",
+                name: "write",
+                arguments: writeArgs("same\n"),
+            }),
+        );
+        p.recordToolResult("w3", { path: "src/new.ts", operation: "update", before: "same\n", after: "same\n" });
+        const noChange = p.onEvent(
+            event("tool/result", {
+                turn: 1,
+                step: 2,
+                message: {
+                    content: [
+                        {
+                            type: "tool-result",
+                            toolCallId: "w3",
+                            content: [{ type: "text", text: "Updated file src/new.ts" }],
+                        },
+                    ],
+                },
+            }),
+        );
+        const updateContent = (noChange[0] as { content?: { type: string }[] }).content ?? [];
+        expect(updateContent.every((block) => block.type !== "diff")).toBe(true);
+    });
+
+    it("does not invoke presentCall until the arguments parse", () => {
+        const calls: string[] = [];
+        const p = new SessionProjection(undefined, {
+            presentCall: (name) => {
+                calls.push(name);
+                return undefined;
+            },
+        });
+        p.onEvent(
+            event("assistant/chunk", {
+                turn: 1,
+                step: 0,
+                chunk: { type: "tool-call-delta", index: 0, id: "c", name: "read", argumentsDelta: '{"file_path":' },
+            }),
+        );
+        expect(calls).toEqual([]);
+        p.onEvent(
+            event("assistant/chunk", {
+                turn: 1,
+                step: 0,
+                chunk: { type: "tool-call-delta", index: 0, id: "c", argumentsDelta: '"/a.ts"}' },
+            }),
+        );
+        expect(calls).toEqual(["read"]);
     });
 });
 

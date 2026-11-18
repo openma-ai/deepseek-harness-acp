@@ -11,6 +11,8 @@
  * harness runtime and reused verbatim for `session/load` history replay.
  */
 
+import { isAbsolute, resolve } from "node:path";
+
 import type {
     ContentBlock as AcpContentBlock,
     PlanEntry,
@@ -68,6 +70,8 @@ export interface ToolCallFacts {
     kind: ToolKind;
     title: string;
     locations: ToolCallLocation[];
+    /** Pending file changes declared by the tool's `presentCall` diff card. */
+    diffs: FileDiffMeta[];
     rawInput: unknown;
 }
 
@@ -88,12 +92,30 @@ function asString(value: unknown): string | undefined {
     return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+/**
+ * The 1-based line a call is anchored to, when its arguments carry one:
+ * `read`-style `offset`, or `str_replace_editor`'s 0-based `insert_line`
+ * (ACP lines are 1-based, so the insertion point is `insert_line + 1`).
+ */
+function locationLine(args: Record<string, unknown>): number | undefined {
+    const offset = args["offset"];
+    if (typeof offset === "number" && Number.isInteger(offset) && offset > 0) return offset;
+    if (asString(args["command"]) === "insert") {
+        const insertLine = args["insert_line"];
+        if (typeof insertLine === "number" && Number.isInteger(insertLine) && insertLine >= 0) {
+            return insertLine + 1;
+        }
+    }
+    return undefined;
+}
+
 function pathLocations(args: Record<string, unknown>): ToolCallLocation[] {
     const locations: ToolCallLocation[] = [];
     for (const key of ["path", "file_path", "filePath", "file"]) {
         const path = asString(args[key]);
         if (path !== undefined) {
-            locations.push({ path });
+            const line = locationLine(args);
+            locations.push(line === undefined ? { path } : { path, line });
             break;
         }
     }
@@ -124,6 +146,7 @@ export function classifyToolCall(name: string, rawArguments: string): ToolCallFa
         kind,
         title,
         locations,
+        diffs: [],
         rawInput: args,
     });
 
@@ -200,6 +223,16 @@ export function diffsFromToolMeta(meta: unknown): FileDiffMeta[] {
         result.push({ path, oldText: typeof oldText === "string" ? oldText : null, newText });
     }
     return result;
+}
+
+/** Render file diffs as ACP `diff` tool-call content blocks. */
+function diffContents(diffs: readonly FileDiffMeta[]): ToolCallContent[] {
+    return diffs.map((diff) => ({
+        type: "diff",
+        path: diff.path,
+        ...(diff.oldText !== null ? { oldText: diff.oldText } : {}),
+        newText: diff.newText,
+    }));
 }
 
 interface ToolResultFacts {
@@ -397,6 +430,8 @@ export interface ToolPresentView {
     title?: string;
     kind?: string;
     locations?: { path: string; line?: number }[];
+    /** `DiffCallView.diffs`: pending file changes, `oldText: null` = no prior content. */
+    diffs?: { path: string; oldText: string | null; newText: string }[];
 }
 
 const TOOL_KINDS = new Set<ToolKind>([
@@ -436,7 +471,77 @@ function factsFromPresentCall(
                       : { path: location.path, line: location.line },
               )
             : fallback.locations;
-    return { kind, title, locations, rawInput: fallback.rawInput };
+    const diffs =
+        presented.diffs !== undefined && presented.diffs.length > 0 ? presented.diffs : fallback.diffs;
+    return { kind, title, locations, diffs, rawInput: stripDiffedInputs(fallback.rawInput, diffs) };
+}
+
+/**
+ * Drop argument keys whose text a diff already carries (a `write`'s `content`,
+ * an `edit`'s `old_string`/`new_string`), so `rawInput` does not duplicate the
+ * file body the diff content sends. Values are matched verbatim, so unrelated
+ * keys are untouched.
+ */
+function stripDiffedInputs(rawInput: unknown, diffs: readonly FileDiffMeta[]): unknown {
+    if (diffs.length === 0 || rawInput === null || typeof rawInput !== "object" || Array.isArray(rawInput)) {
+        return rawInput;
+    }
+    const input = { ...(rawInput as Record<string, unknown>) };
+    for (const [key, value] of Object.entries(input)) {
+        if (typeof value !== "string" || value.length === 0) continue;
+        if (diffs.some((diff) => diff.newText === value || diff.oldText === value)) delete input[key];
+    }
+    return input;
+}
+
+/**
+ * Map one dsh `ToolCallView` (the `presentCall` card union: `generic`,
+ * `terminal`, or `diff`) onto the presentation fields ACP consumes. Returns
+ * undefined for malformed views so the caller falls back to
+ * {@link classifyToolCall}.
+ */
+export function presentViewFromToolCall(view: unknown): ToolPresentView | undefined {
+    if (view === null || typeof view !== "object") return undefined;
+    const card = view as Record<string, unknown>;
+    const title = asString(card["title"]);
+    if (title === undefined) return undefined;
+    const kind = card["card"] === "terminal" ? "execute" : card["card"] === "diff" ? "edit" : asString(card["kind"]);
+    let locations: { path: string; line?: number }[] | undefined;
+    if (Array.isArray(card["locations"])) {
+        const mapped = card["locations"].flatMap((entry): { path: string; line?: number }[] => {
+            if (entry === null || typeof entry !== "object") return [];
+            const location = entry as Record<string, unknown>;
+            const path = asString(location["path"]);
+            if (path === undefined) return [];
+            const line = location["line"];
+            return [
+                {
+                    path,
+                    ...(typeof line === "number" && Number.isInteger(line) && line > 0 ? { line } : {}),
+                },
+            ];
+        });
+        if (mapped.length > 0) locations = mapped;
+    }
+    let diffs: { path: string; oldText: string | null; newText: string }[] | undefined;
+    if (Array.isArray(card["diffs"])) {
+        const mappedDiffs = card["diffs"].flatMap((entry): { path: string; oldText: string | null; newText: string }[] => {
+            if (entry === null || typeof entry !== "object") return [];
+            const diff = entry as Record<string, unknown>;
+            const path = asString(diff["path"]);
+            const newText = diff["newText"];
+            if (path === undefined || typeof newText !== "string") return [];
+            const oldText = diff["oldText"];
+            return [{ path, oldText: typeof oldText === "string" ? oldText : null, newText }];
+        });
+        if (mappedDiffs.length > 0) diffs = mappedDiffs;
+    }
+    return {
+        title,
+        ...(kind !== undefined ? { kind } : {}),
+        ...(locations !== undefined ? { locations } : {}),
+        ...(diffs !== undefined ? { diffs } : {}),
+    };
 }
 
 /**
@@ -801,6 +906,7 @@ export class SessionProjection {
             status: "pending",
             rawInput: state.facts.rawInput,
             ...(state.facts.locations.length > 0 ? { locations: state.facts.locations } : {}),
+            ...(state.facts.diffs.length > 0 ? { content: diffContents(state.facts.diffs) } : {}),
         } as SessionUpdate];
     }
 
@@ -876,6 +982,7 @@ export class SessionProjection {
             kind: state.facts.kind,
             rawInput: state.facts.rawInput,
             locations: state.facts.locations,
+            ...(state.facts.diffs.length > 0 ? { content: diffContents(state.facts.diffs) } : {}),
         } as SessionUpdate];
     }
 
@@ -959,21 +1066,49 @@ export class SessionProjection {
     }
 
     private toolCallFacts(name: string, rawArguments: string): ToolCallFacts {
-        let parsedArgs: unknown = {};
+        let parsedArgs: unknown;
         try {
             parsedArgs = JSON.parse(rawArguments);
         } catch {
-            parsedArgs = { arguments: rawArguments };
+            parsedArgs = undefined;
         }
-        const presented = this.presentCall?.(name, parsedArgs);
-        return presented !== undefined
-            ? factsFromPresentCall(name, rawArguments, presented)
-            : classifyToolCall(name, rawArguments);
+        // `presentCall` expects complete arguments; mid-stream prefixes are not
+        // valid JSON and would make presenters fabricate fields ("Write
+        // undefined"), so only parsed argument objects reach them.
+        const presented =
+            parsedArgs !== null && typeof parsedArgs === "object" && !Array.isArray(parsedArgs)
+                ? this.presentCall?.(name, parsedArgs)
+                : undefined;
+        const facts =
+            presented !== undefined
+                ? factsFromPresentCall(name, rawArguments, presented)
+                : classifyToolCall(name, rawArguments);
+        return this.absolutePaths(facts);
+    }
+
+    /**
+     * ACP `locations[].path` and diff `path`s are absolute filesystem paths;
+     * resolve the model-facing relative paths tools report against the
+     * session cwd.
+     */
+    private absolutePaths(facts: ToolCallFacts): ToolCallFacts {
+        const cwd = this.cwd;
+        if (cwd === undefined) return facts;
+        const absolutize = (path: string): string => (isAbsolute(path) ? path : resolve(cwd, path));
+        return {
+            ...facts,
+            locations: facts.locations.map((location) => ({ ...location, path: absolutize(location.path) })),
+            diffs: facts.diffs.map((diff) => ({ ...diff, path: absolutize(diff.path) })),
+        };
     }
 
     private toolCallCreated(state: ProjectedToolCall): SessionUpdate {
         const { callId, name, facts, status } = state;
         const displayTerminal = this.terminalOutput && facts.kind === "execute";
+        const content: ToolCallContent[] = [
+            ...(displayTerminal ? [{ type: "terminal" as const, terminalId: callId }] : []),
+            ...diffContents(facts.diffs),
+        ];
         return {
             sessionUpdate: "tool_call",
             toolCallId: callId,
@@ -983,9 +1118,9 @@ export class SessionProjection {
             status,
             rawInput: facts.rawInput,
             ...(facts.locations.length > 0 ? { locations: facts.locations } : {}),
+            ...(content.length > 0 ? { content } : {}),
             ...(displayTerminal
                 ? {
-                      content: [{ type: "terminal", terminalId: callId }],
                       _meta: {
                           terminal_info: {
                               terminal_id: callId,
@@ -1017,6 +1152,7 @@ export class SessionProjection {
             status: "in_progress",
             rawInput: facts.rawInput,
             locations: facts.locations,
+            ...(facts.diffs.length > 0 ? { content: diffContents(facts.diffs) } : {}),
         } as SessionUpdate];
     }
 
@@ -1051,6 +1187,35 @@ export class SessionProjection {
         const liveValue = this.toolResultValues.get(callId);
         this.toolResultValues.delete(callId);
         const toolResultValue = hasLiveValue ? liveValue : typedToolAcknowledgement(state, text, failed);
+        // `write` reports `operation: "create"` with `before: null` and emits no
+        // meta diffs for creations; synthesize the whole-file diff from the
+        // staged value (the same shape codex-acp sends for file additions).
+        // Without an authoritative value (history replay, older hosts) the
+        // pending diff card is the only file-change description available.
+        let effectiveDiffs = diffs;
+        const operation =
+            liveValue !== null && typeof liveValue === "object" && !Array.isArray(liveValue)
+                ? asString((liveValue as Record<string, unknown>)["operation"])
+                : undefined;
+        if (effectiveDiffs.length === 0) {
+            if (operation === "create" && liveValue !== null && typeof liveValue === "object") {
+                const value = liveValue as Record<string, unknown>;
+                const newText = value["after"];
+                const diffPath = asString(value["path"]) ?? state?.facts.locations[0]?.path;
+                if (typeof newText === "string" && diffPath !== undefined) {
+                    effectiveDiffs = [{ path: diffPath, oldText: null, newText }];
+                }
+            } else if (operation === undefined) {
+                effectiveDiffs = state?.facts.diffs ?? [];
+            }
+        }
+        const cwd = this.cwd;
+        if (cwd !== undefined) {
+            effectiveDiffs = effectiveDiffs.map((diff) => ({
+                ...diff,
+                path: isAbsolute(diff.path) ? diff.path : resolve(cwd, diff.path),
+            }));
+        }
         const toolResultMeta =
             toolResultValue === undefined
                 ? undefined
@@ -1062,14 +1227,9 @@ export class SessionProjection {
                       },
                   };
         const rawOutput = text.length > 0 ? { output: text, isError: failed } : undefined;
-        const content: ToolCallContent[] = diffs.map((diff) => ({
-            type: "diff",
-            path: diff.path,
-            ...(diff.oldText !== null ? { oldText: diff.oldText } : {}),
-            newText: diff.newText,
-        }));
+        const content: ToolCallContent[] = diffContents(effectiveDiffs);
         const isCommand = facts?.kind === "execute";
-        if (text.length > 0 && diffs.length === 0 && !(this.terminalOutput && isCommand)) {
+        if (text.length > 0 && effectiveDiffs.length === 0 && !(this.terminalOutput && isCommand)) {
             // Fenced output renders in tool-call cards (raw text does not in
             // every client); markdown-ish tool output passes through as is.
             const block: AcpContentBlock = {

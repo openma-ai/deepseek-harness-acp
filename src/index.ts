@@ -14,6 +14,7 @@ import { HarnessCompatibilityError, HarnessNotFoundError, resolveHost } from "./
 import { bootAcpProfile, type BootedContext } from "./profile-boot.ts";
 import { runLogin } from "./login.ts";
 import { logError, logInfo } from "./log.ts";
+import { prefetchStandaloneRuntime } from "./runtime.ts";
 import { explicitDshPath, HELP_TEXT, resolveSettings, SettingsError } from "./settings.ts";
 import { VERSION } from "./version.ts";
 
@@ -28,13 +29,25 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
         console.log(HELP_TEXT.trimEnd());
         return;
     }
+    if (argv.includes("--prefetch-runtime")) {
+        // Warm the runtime cache without booting a host. The standalone
+        // launcher intercepts this flag first; it is handled here too so that
+        // a direct `node dist/index.js --prefetch-runtime` works.
+        try {
+            await prefetchStandaloneRuntime();
+        } catch (error: unknown) {
+            logError(error instanceof Error ? error.message : String(error));
+            process.exitCode = 1;
+        }
+        return;
+    }
     if (argv[0] === "login") {
         // CLI login: interactive credential setup, then exit. Boots
         // the same composition as serving (minus the stdio server) so the
         // key lands in the shared harness credential store.
         let booted: BootedContext;
         try {
-            const host = resolveHost(explicitDshPath(argv));
+            const host = await resolveHost(explicitDshPath(argv));
             booted = await bootAcpProfile(host, { serve: false });
         } catch (error: unknown) {
             if (error instanceof HarnessNotFoundError || error instanceof HarnessCompatibilityError) {
@@ -95,7 +108,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 
     let ctx: { fiber: { dispose(): Promise<void> } };
     try {
-        const host = resolveHost(settings.dshPath);
+        const host = await resolveHost(settings.dshPath);
         // Always visible on stderr: the resolved runtime is the first thing a
         // user needs to know when ambient dsh installs exist (issue #157).
         logInfo(`harness host: @deepseek-ai/dsh ${host.dshVersion ?? "unknown version"} via ${host.source} (${host.base})`);

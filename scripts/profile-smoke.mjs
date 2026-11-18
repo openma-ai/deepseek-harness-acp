@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -36,6 +36,8 @@ const env = {
     DEEPSEEK_API_KEY: "sk-test-profile-not-a-real-key",
     DEEPSEEK_BASE_URL: `http://127.0.0.1:${provider.address().port}`,
     DSH_TELEMETRY_DISABLED: "1",
+    DSH_ACP_CACHE_DIR: join(root, "runtime-cache"),
+    DSH_ACP_REGISTRY: "http://127.0.0.1:1",
 };
 delete env.DSH_PATH;
 delete env.DSH_PERMISSION_MODE;
@@ -79,6 +81,23 @@ try {
     });
     const init = await request("initialize", { protocolVersion: 1, clientCapabilities: {} });
     assert.equal(init.agentInfo.name, "dsh-acp");
+    // Plugin mode must not acquire the private standalone runtime.
+    const cache = env.DSH_ACP_CACHE_DIR;
+    const cached = existsSync(cache)
+        ? readdirSync(cache, { recursive: true }).filter((name) => String(name).includes("dsh-acp-runtime") || String(name).includes("dsh-runtime"))
+        : [];
+    assert.equal(cached.length, 0, `plugin start materialized a runtime cache: ${cached.join(", ")}`);
+    const walk = (dir, found = []) => {
+        if (!existsSync(dir)) return found;
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+            const path = join(dir, entry.name);
+            if (entry.isDirectory()) walk(path, found);
+            else if (entry.name === "dsh-runtime.tgz" || entry.name.includes("deepseek-harness-acp-runtime")) found.push(path);
+        }
+        return found;
+    };
+    const leaked = walk(env.DSH_HOME);
+    assert.equal(leaked.length, 0, `plugin install pulled a runtime artifact: ${leaked.join(", ")}`);
     const session = await request("session/new", { cwd: root, mcpServers: [] });
     assert(session.sessionId);
     await request("session/set_mode", { sessionId: session.sessionId, modeId: "read-only" });
