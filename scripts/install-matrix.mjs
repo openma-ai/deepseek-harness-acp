@@ -17,7 +17,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve, delimiter } from "node:path";
 import { createInterface } from "node:readline";
-import { listTarball } from "./list-tarball.mjs";
+import { listTarball, readTarGzEntries } from "./list-tarball.mjs";
 
 const argv = process.argv.slice(2);
 const flag = (name) => {
@@ -165,6 +165,10 @@ try {
     const entries = listTarball(shell);
     assert(!entries.some((p) => p.endsWith("dsh-runtime.tgz")), "shell tarball still contains dsh-runtime.tgz");
     assert(entries.some((p) => p === "package/vendor/runtime.json"), "shell tarball missing vendor/runtime.json");
+    const shellManifest = readTarGzEntries(shell, ["package/package.json"]).get("package/package.json");
+    assert(shellManifest, "shell tarball missing package/package.json");
+    const shellVersion = JSON.parse(shellManifest.toString("utf8")).version;
+    assert.equal(typeof shellVersion, "string", "shell package version is missing");
     record("pack/slim-inventory", "pass", `${entries.length} files, no dsh-runtime.tgz, has vendor/runtime.json`);
 
     // --- 2 + omit-optional: isolated "global" prefix ---
@@ -210,7 +214,8 @@ try {
         const prefix = join(root, "npm-exec");
         mkdirSync(prefix);
         const out = npm(["exec", "--yes", "--prefix", prefix, "--package", shell, "--", "dsh-acp", "--version"]);
-        assert.match(out, /@openma\/deepseek-harness-acp 0\.4\.41|0\.4\.41/);
+        const escapedVersion = shellVersion.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        assert.match(out, new RegExp(`(?:@openma/deepseek-harness-acp )?${escapedVersion}(?:\\r?\\n|$)`, "m"));
         return out.trim().split("\n").pop();
     });
 
