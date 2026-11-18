@@ -58,6 +58,11 @@ assert(archive && archive.length > 0, "runtime package is missing dsh-runtime.tg
 assert.equal(shellPkg.name, "@openma/deepseek-harness-acp");
 assert.equal(runtimePkg.name, RUNTIME_PACKAGE_NAME);
 assert.equal(runtimePkg.version, shellPkg.version, "runtime package version must match the shell");
+assert.equal(typeof shellPkg.repository?.url, "string");
+assert(shellPkg.repository.url.length > 0, "shell package repository.url is missing or empty");
+assert.equal(typeof runtimePkg.repository?.url, "string");
+assert(runtimePkg.repository.url.length > 0, "runtime package repository.url is missing or empty");
+assert.equal(runtimePkg.repository.url, shellPkg.repository.url, "runtime package repository.url must match the shell");
 assert.equal(shellManifest.runtimePackage?.name, RUNTIME_PACKAGE_NAME);
 assert.equal(shellManifest.runtimePackage?.version, shellPkg.version);
 assert.deepEqual(runtimeManifest, shellManifest, "shell and runtime package must carry the same runtime.json");

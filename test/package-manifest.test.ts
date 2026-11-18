@@ -10,6 +10,7 @@ const root = join(import.meta.dirname, "..");
 const shell = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
     name?: string;
     version?: string;
+    repository?: { type?: string; url?: string };
     dependencies?: Record<string, string>;
     devDependencies?: Record<string, string>;
     peerDependencies?: Record<string, string>;
@@ -113,6 +114,8 @@ describe("ACP package manifest", () => {
         const manifest = runtimePackageManifest(shell.version!);
         expect(manifest.name).toBe("@openma/deepseek-harness-acp-runtime");
         expect(manifest.version).toBe(shell.version);
+        expect(manifest.repository).toEqual(shell.repository);
+        expect(manifest.repository?.url).toBe("git+https://github.com/openma-ai/deepseek-harness-acp.git");
         expect(manifest.files).toEqual(["dsh-runtime.tgz", "runtime.json"]);
         // The runtime package carries the archive, not a live npm install,
         // and installs no lifecycle script.

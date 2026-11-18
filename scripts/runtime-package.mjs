@@ -20,6 +20,7 @@ import { join } from "node:path";
 export const RUNTIME_PACKAGE_NAME = "@openma/deepseek-harness-acp-runtime";
 
 const EXACT_VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+const SHELL_PACKAGE = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 
 /**
  * The publishable manifest of the runtime package.
@@ -37,6 +38,7 @@ export function runtimePackageManifest(shellVersion) {
         description:
             "Pinned DeepSeek Harness runtime for @openma/deepseek-harness-acp — the standalone ACP launcher acquires it from here.",
         license: "Apache-2.0",
+        repository: SHELL_PACKAGE.repository,
         publishConfig: { access: "public" },
         files: ["dsh-runtime.tgz", "runtime.json"],
         engines: { node: ">=22.15" },
