@@ -258,6 +258,10 @@ jobs:
           RUNTIME_TARBALL=$(find runtime -maxdepth 1 -name '*.tgz' -print -quit)
           test -n "$SHELL_TARBALL"
           test -n "$RUNTIME_TARBALL"
+          # npm 11 treats a relative path such as runtime/file.tgz as a
+          # GitHub owner/repository shorthand. Resolve both paths first.
+          SHELL_TARBALL=$(node scripts/resolve-release-artifact.mjs "$SHELL_TARBALL")
+          RUNTIME_TARBALL=$(node scripts/resolve-release-artifact.mjs "$RUNTIME_TARBALL")
           # Pair the artifacts again immediately before publish: version and
           # sha256 must still match. Publish the runtime package first so a
           # slim shell never lands on the registry without its runtime (first
