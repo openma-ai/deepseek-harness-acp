@@ -70,6 +70,31 @@ describe("release provenance", () => {
         expect(jobs?.["standalone"]?.steps?.some((step) => step.run?.includes("scripts/standalone-smoke.mjs"))).toBe(true);
         if (workflow === "release.yml") expect(jobs?.["publish"]?.needs).toContain("standalone");
     });
+
+    it.each(["ci.yml", "release.yml"])("ships the runtime as its own artifact in %s", (workflow) => {
+        const jobs = readWorkflow(workflow).jobs;
+        const uploads = Object.values(jobs ?? {})
+            .flatMap((job) => job?.steps ?? [])
+            .filter((step) => step.uses?.startsWith("actions/upload-artifact"));
+        const names = uploads.map((step) => step.with?.["name"]);
+        expect(names).toContain("package-tgz");
+        expect(names).toContain("runtime-tgz");
+        // The standalone job installs the slim shell only and hands the
+        // runtime over through the environment: the runtime package is not on
+        // the public registry yet.
+        const standalone = jobs?.["standalone"]?.steps ?? [];
+        expect(standalone.some((step) => step.with?.["name"] === "runtime-tgz")).toBe(true);
+        const smoke = standalone.find((step) => step.run?.includes("scripts/standalone-smoke.mjs"));
+        expect(smoke?.run).toContain("--runtime-pack");
+    });
+
+    it("publishes the shell and the runtime package with the same dist-tag", () => {
+        const publishSteps = readWorkflow("release.yml").jobs?.["publish"]?.steps ?? [];
+        const publishRun = publishSteps.map((step) => step.run ?? "").join("\n");
+        expect(publishRun).toContain('npm publish "$SHELL_TARBALL" --tag "$DIST_TAG"');
+        expect(publishRun).toContain('npm publish "$RUNTIME_TARBALL" --tag "$DIST_TAG"');
+    });
+
     it("gates release tests on verifying that the tag commit belongs to main", () => {
         const jobs = readWorkflow("release.yml").jobs;
         const guardCommands = jobs?.["verify-tag"]?.steps?.flatMap((step) => step.run ?? []);
@@ -108,6 +133,6 @@ describe("release check", () => {
         expect(steps.some((step) => step.run?.includes("node scripts/release-check.mjs --tag"))).toBe(true);
         expect(jobs?.["publish"]?.needs).toContain("release-check");
         expect(publishRun).toContain("npm publish");
-        expect(publishRun).toContain('gh release create "$GITHUB_REF_NAME" *.tgz --generate-notes --verify-tag $PRERELEASE');
+        expect(publishRun).toContain('gh release create "$GITHUB_REF_NAME" shell/*.tgz runtime/*.tgz --generate-notes --verify-tag $PRERELEASE');
     });
 });

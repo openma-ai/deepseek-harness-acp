@@ -28,9 +28,18 @@ describe("standalone and plugin entrypoint boundary", () => {
         expect(plugin).toMatch(/ctx\.plugin\(server, config\)/);
     });
 
+    it("keeps the runtime acquisition out of every plugin entrypoint", () => {
+        // A dsh plugin install must never download or load the private
+        // runtime: neither the plugin nor the profile bundle may reach the
+        // standalone acquisition module.
+        for (const entrypoint of ["plugin.ts", "bundle.ts", "server.ts", "stdio.ts"]) {
+            expect(source(entrypoint), entrypoint).not.toMatch(/from "\.\/runtime\.ts"/);
+        }
+    });
+
     it("makes the private runtime a standalone-only fallback", () => {
         const harness = source("harness.ts");
-        expect(harness).toMatch(/resolveVendoredRuntime\(/);
+        expect(harness).toMatch(/resolveStandaloneRuntime\(/);
         expect(harness).toMatch(/bundled standalone runtime/);
     });
 

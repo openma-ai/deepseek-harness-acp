@@ -3,11 +3,20 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
-const vendoredDir = vi.hoisted(() => ({ dir: undefined as string | undefined }));
+const runtimeDir = vi.hoisted(() => ({ dir: undefined as string | undefined }));
 
-vi.mock("../src/runtime.ts", () => ({
-    resolveVendoredRuntime: () => vendoredDir.dir,
-}));
+vi.mock("../src/runtime.ts", async (importOriginal) => {
+    const actual = await importOriginal<typeof import("../src/runtime.ts")>();
+    return {
+        ...actual,
+        // The runtime is acquired on demand now: a missing runtime is an
+        // acquisition failure, not an absent value.
+        resolveStandaloneRuntime: async (): Promise<string> => {
+            if (runtimeDir.dir === undefined) throw new actual.RuntimeUnavailableError("runtime not acquired");
+            return runtimeDir.dir;
+        },
+    };
+});
 
 import {
     HarnessCompatibilityError,
@@ -77,7 +86,7 @@ afterEach(() => {
     if (originalEnv.DSH_ACP_HOST === undefined) delete process.env["DSH_ACP_HOST"];
     else process.env["DSH_ACP_HOST"] = originalEnv.DSH_ACP_HOST;
     process.chdir(originalCwd);
-    vendoredDir.dir = undefined;
+    runtimeDir.dir = undefined;
     vi.restoreAllMocks();
 });
 
@@ -95,58 +104,58 @@ function stderrWrites(): string[] {
 }
 
 describe("resolveHost", () => {
-    it("accepts a directory whose node_modules carries the harness", () => {
+    it("accepts a directory whose node_modules carries the harness", async () => {
         const root = makeTree();
         writeHost(root);
-        const host = resolveHost(root);
+        const host = await resolveHost(root);
         expect(host.base).toBe(root);
         expect(host.version).toBe(SUPPORTED_VERSION);
         expect(host.dshVersion).toBe(SUPPORTED_VERSION);
         expect(host.source).toContain(root);
     });
 
-    it("accepts an npm prefix (lib/node_modules layout)", () => {
+    it("accepts an npm prefix (lib/node_modules layout)", async () => {
         const root = makeTree();
         writeHost(join(root, "lib", "node_modules"));
-        const host = resolveHost(root);
+        const host = await resolveHost(root);
         expect(host.base).toBe(join(root, "lib", "node_modules"));
     });
 
-    it("accepts the dsh launcher path and walks up through symlinks", () => {
+    it("accepts the dsh launcher path and walks up through symlinks", async () => {
         const root = makeTree();
         const dsh = writeGlobalLayout(root);
-        const host = resolveHost(dsh);
+        const host = await resolveHost(dsh);
         expect(host.version).toBe(SUPPORTED_VERSION);
     });
 
-    it("fails loudly naming the configured source when the explicit path has no harness", () => {
+    it("fails loudly naming the configured source when the explicit path has no harness", async () => {
         const root = makeTree();
-        expect(() => resolveHost(root)).toThrow(HarnessNotFoundError);
+        await expect(resolveHost(root)).rejects.toThrow(HarnessNotFoundError);
         // The refusal names the explicit path, not the bundled runtime.
-        expect(() => resolveHost(root)).toThrow(/--dsh-path\/DSH_PATH is missing or invalid/);
-        expect(() => resolveHost(root)).toThrow(root);
-        expect(() => resolveHost(root)).toThrow(/--dsh-path bundled/);
+        await expect(resolveHost(root)).rejects.toThrow(/--dsh-path\/DSH_PATH is missing or invalid/);
+        await expect(resolveHost(root)).rejects.toThrow(root);
+        await expect(resolveHost(root)).rejects.toThrow(/--dsh-path bundled/);
     });
 
-    it("rejects a partial module tree that has dsh-agent but not the dsh profile launcher", () => {
+    it("rejects a partial module tree that has dsh-agent but not the dsh profile launcher", async () => {
         const root = makeTree();
         writePackage(join(root, "node_modules", "@deepseek-ai", "dsh-agent"), "@deepseek-ai/dsh-agent");
-        expect(() => resolveHost(root)).toThrow(HarnessNotFoundError);
+        await expect(resolveHost(root)).rejects.toThrow(HarnessNotFoundError);
     });
 
 });
 
 describe("resolveHost default selection", () => {
-    it("uses the packaged runtime with no explicit selection", () => {
-        const vendored = makeTree();
-        writeHost(vendored);
-        vendoredDir.dir = vendored;
-        const host = resolveHost();
-        expect(host.base).toBe(vendored);
+    it("uses the packaged runtime with no explicit selection", async () => {
+        const runtime = makeTree();
+        writeHost(runtime);
+        runtimeDir.dir = runtime;
+        const host = await resolveHost();
+        expect(host.base).toBe(runtime);
         expect(host.source).toBe("bundled standalone runtime");
     });
 
-    it("ignores ambient dsh installs in the invoking directory, on PATH and in global npm", () => {
+    it("ignores ambient dsh installs in the invoking directory, on PATH and in global npm", async () => {
         // Stale installs must never hijack the runtime (Martty issue #157):
         // implicit discovery is gone entirely, so these fixtures stay unused.
         const ambient = makeTree();
@@ -156,32 +165,39 @@ describe("resolveHost default selection", () => {
         process.chdir(ambient);
         process.env["PATH"] = [join(ambient, "prefix", "bin"), join(ambient, "shim"), originalEnv.PATH].join(delimiter);
 
-        const vendored = makeTree();
-        writeHost(vendored);
-        vendoredDir.dir = vendored;
+        const runtime = makeTree();
+        writeHost(runtime);
+        runtimeDir.dir = runtime;
 
         const writes = stderrWrites();
-        const host = resolveHost();
-        expect(host.base).toBe(vendored);
+        const host = await resolveHost();
+        expect(host.base).toBe(runtime);
         expect(host.source).toBe("bundled standalone runtime");
         expect(writes.join("")).not.toContain(STALE_VERSION);
     });
 
-    it("fails when the packaged runtime is missing and nothing was selected", () => {
-        vendoredDir.dir = undefined;
-        expect(() => resolveHost()).toThrow(HarnessNotFoundError);
-        expect(() => resolveHost()).toThrow(/bundled standalone runtime/);
+    it("fails when the packaged runtime is missing and nothing was selected", async () => {
+        runtimeDir.dir = undefined;
+        await expect(resolveHost()).rejects.toThrow(HarnessNotFoundError);
+        await expect(resolveHost()).rejects.toThrow(/bundled standalone runtime/);
     });
 
-    it("fails when the packaged runtime resolves to a tree without the dsh packages", () => {
-        vendoredDir.dir = makeTree();
-        expect(() => resolveHost()).toThrow(HarnessNotFoundError);
-        expect(() => resolveHost()).toThrow(/bundled standalone runtime/);
+    it("names how to acquire the runtime when the acquisition fails", async () => {
+        runtimeDir.dir = undefined;
+        await expect(resolveHost()).rejects.toThrow(/--prefetch-runtime/);
+        await expect(resolveHost()).rejects.toThrow(/DSH_ACP_RUNTIME_TARBALL/);
+        await expect(resolveHost()).rejects.toThrow(/DSH_PATH=/);
+    });
+
+    it("fails when the packaged runtime resolves to a tree without the dsh packages", async () => {
+        runtimeDir.dir = makeTree();
+        await expect(resolveHost()).rejects.toThrow(HarnessNotFoundError);
+        await expect(resolveHost()).rejects.toThrow(/bundled standalone runtime/);
     });
 });
 
 describe("resolveHost bundled selection", () => {
-    it("resolves the packaged runtime and ignores ambient installs", () => {
+    it("resolves the packaged runtime and ignores ambient installs", async () => {
         // A stale dsh in the invoking directory, on PATH and in global npm must
         // never hijack the bundled selection (Martty issue #157).
         const ambient = makeTree();
@@ -191,56 +207,56 @@ describe("resolveHost bundled selection", () => {
         process.chdir(ambient);
         process.env["PATH"] = [join(ambient, "prefix", "bin"), join(ambient, "shim"), originalEnv.PATH].join(delimiter);
 
-        const vendored = makeTree();
-        writeHost(vendored);
-        vendoredDir.dir = vendored;
+        const runtime = makeTree();
+        writeHost(runtime);
+        runtimeDir.dir = runtime;
 
-        const host = resolveHost("bundled");
-        expect(host.base).toBe(vendored);
+        const host = await resolveHost("bundled");
+        expect(host.base).toBe(runtime);
         expect(host.source).toBe("bundled standalone runtime");
     });
 
-    it("fails when the packaged runtime is missing", () => {
-        vendoredDir.dir = undefined;
-        expect(() => resolveHost("bundled")).toThrow(HarnessNotFoundError);
+    it("fails when the packaged runtime is missing", async () => {
+        runtimeDir.dir = undefined;
+        await expect(resolveHost("bundled")).rejects.toThrow(HarnessNotFoundError);
     });
 });
 
 describe("resolveHost compatibility checks", () => {
-    it("refuses an explicit path outside the supported range, naming version, source and range", () => {
+    it("refuses an explicit path outside the supported range, naming version, source and range", async () => {
         const root = makeTree();
         writeHost(root, STALE_VERSION);
-        expect(() => resolveHost(root)).toThrow(HarnessCompatibilityError);
-        expect(() => resolveHost(root)).toThrow(new RegExp(STALE_VERSION.replaceAll(".", "\\.")));
-        expect(() => resolveHost(root)).toThrow(/supported versions:/);
-        expect(() => resolveHost(root)).toThrow(root);
+        await expect(resolveHost(root)).rejects.toThrow(HarnessCompatibilityError);
+        await expect(resolveHost(root)).rejects.toThrow(new RegExp(STALE_VERSION.replaceAll(".", "\\.")));
+        await expect(resolveHost(root)).rejects.toThrow(/supported versions:/);
+        await expect(resolveHost(root)).rejects.toThrow(root);
     });
 
     it("reports the supported range from package metadata", () => {
         expect(supportedDshRange()).toBe(">=0.1.7-rc.2");
     });
 
-    it("refuses a packaged runtime outside the supported range", () => {
-        const vendored = makeTree();
-        writeHost(vendored, STALE_VERSION);
-        vendoredDir.dir = vendored;
+    it("refuses a packaged runtime outside the supported range", async () => {
+        const runtime = makeTree();
+        writeHost(runtime, STALE_VERSION);
+        runtimeDir.dir = runtime;
         for (const pick of [undefined, "bundled"] as const) {
-            expect(() => resolveHost(pick)).toThrow(HarnessCompatibilityError);
-            expect(() => resolveHost(pick)).toThrow(new RegExp(STALE_VERSION.replaceAll(".", "\\.")));
-            expect(() => resolveHost(pick)).toThrow(/bundled standalone runtime/);
+            await expect(resolveHost(pick)).rejects.toThrow(HarnessCompatibilityError);
+            await expect(resolveHost(pick)).rejects.toThrow(new RegExp(STALE_VERSION.replaceAll(".", "\\.")));
+            await expect(resolveHost(pick)).rejects.toThrow(/bundled standalone runtime/);
         }
     });
 
-    it("reports an unversioned packaged runtime as 'unknown version'", () => {
-        const vendored = makeTree();
+    it("reports an unversioned packaged runtime as 'unknown version'", async () => {
+        const runtime = makeTree();
         for (const name of ["dsh", "dsh-agent"]) {
-            const dir = join(vendored, "node_modules", "@deepseek-ai", name);
+            const dir = join(runtime, "node_modules", "@deepseek-ai", name);
             mkdirSync(dir, { recursive: true });
             writeFileSync(join(dir, "package.json"), JSON.stringify({ name: `@deepseek-ai/${name}` }));
         }
-        vendoredDir.dir = vendored;
-        expect(() => resolveHost()).toThrow(HarnessCompatibilityError);
-        expect(() => resolveHost()).toThrow(/unknown version/);
+        runtimeDir.dir = runtime;
+        await expect(resolveHost()).rejects.toThrow(HarnessCompatibilityError);
+        await expect(resolveHost()).rejects.toThrow(/unknown version/);
     });
 
     it("keeps the not-found message terse when nothing was probed", () => {
