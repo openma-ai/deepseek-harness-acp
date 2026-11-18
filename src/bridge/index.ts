@@ -333,6 +333,27 @@ interface MultiRootRecordData {
     additionalDirectories?: unknown;
 }
 
+/**
+ * How long a session request waits for its MCP servers to finish starting
+ * (connect + initial tools/list) before answering without them. A server
+ * still starting after this keeps connecting in the background, as before.
+ */
+const MCP_STARTUP_WAIT_MS = 10_000;
+
+/** The cordis fiber `ctx.plugin()` returns for an mcp-client mount; `await` settles once its startup has. */
+interface McpFiber {
+    dispose(): unknown;
+    await?(): Promise<unknown>;
+}
+
+/** One live mcp-client mount; `startupDeadline` bounds how long session requests wait for it to start. */
+interface McpMount {
+    serverName: string;
+    configJson: string;
+    fiber: McpFiber;
+    startupDeadline: number;
+}
+
 /** The structural shape of the optional `ctx.acpMultiRootScope` service. */
 interface MultiRootScopeLike {
     set(sessionId: string, roots: readonly string[]): void;
@@ -2753,7 +2774,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     params.additionalDirectories,
                     params.cwd,
                 );
-                syncMcpServers(params.mcpServers, params.cwd);
+                const mcpReady = syncMcpServers(params.mcpServers, params.cwd);
                 mark("request setup");
                 const sessionId = SessionId(randomUUID());
                 const presets = presetsService();
@@ -2792,6 +2813,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 }
                 ensureSelection(record);
                 queueMicrotask(() => publishCommands(String(sessionId)));
+                await mcpReady;
+                mark("mcp startup");
                 const options = await configOptions(record);
                 mark("response surface");
                 return {
@@ -2809,7 +2832,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     params.additionalDirectories,
                     params.cwd,
                 );
-                syncMcpServers(params.mcpServers, params.cwd);
+                const mcpReady = syncMcpServers(params.mcpServers, params.cwd);
                 requirePersistence();
                 await assertAcpVisibleSession(params.sessionId);
                 const record = await restoreSession(params.sessionId, {
@@ -2817,6 +2840,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     cwd: params.cwd,
                     additionalDirectories,
                 });
+                await mcpReady;
                 const options = await configOptions(record);
                 return {
                     modes: modeState(record),
@@ -2832,7 +2856,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     params.additionalDirectories,
                     params.cwd,
                 );
-                syncMcpServers(params.mcpServers, params.cwd);
+                const mcpReady = syncMcpServers(params.mcpServers, params.cwd);
                 // Invalid fork meta fails before a missing session can hide it,
                 // and never degrades into a whole-session copy.
                 const request = parseForkRequest(params._meta);
@@ -2896,6 +2920,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 }
                 ensureSelection(record);
                 queueMicrotask(() => publishCommands(childId));
+                await mcpReady;
                 const options = await configOptions(record);
                 return {
                     sessionId: childId,
@@ -2912,7 +2937,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     params.additionalDirectories,
                     params.cwd,
                 );
-                syncMcpServers(params.mcpServers, params.cwd);
+                const mcpReady = syncMcpServers(params.mcpServers, params.cwd);
                 requirePersistence();
                 await assertAcpVisibleSession(params.sessionId);
                 const record = await restoreSession(params.sessionId, {
@@ -2920,6 +2945,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     cwd: params.cwd,
                     additionalDirectories,
                 });
+                await mcpReady;
                 const options = await configOptions(record);
                 return {
                     modes: modeState(record),
@@ -3341,8 +3367,43 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
      * send one configured list to every session, and tool names
      * (`mcp__<name>__…`) stay stable for prompt caching.
      */
-    const mcpMounts = new Map<string, { configJson: string; fiber: { dispose(): unknown } }>();
+    const mcpMounts = new Map<string, McpMount>();
     let warnedNoMcpClient = false;
+
+    /**
+     * Waits until each mount has finished starting: mcp-client's plugin
+     * startup settles after its first connection attempt and initial tool
+     * sync. Each mount is waited on until its own startup deadline at most,
+     * so a server that never answers delays the request that mounted it by
+     * MCP_STARTUP_WAIT_MS once, and later requests reusing it not at all.
+     * Never rejects: a server that failed to start must not take the session
+     * down either.
+     */
+    const settleMcpStartup = async (mounts: readonly McpMount[]): Promise<void> => {
+        const late: string[] = [];
+        await Promise.all(
+            mounts.map(async ({ serverName, fiber, startupDeadline }) => {
+                // Older cordis fibers have no await(); keep the previous behavior for them.
+                if (typeof fiber.await !== "function") return;
+                const remaining = startupDeadline - Date.now();
+                if (remaining <= 0) return;
+                let timer: ReturnType<typeof setTimeout> | undefined;
+                const started = await Promise.race([
+                    fiber.await().then(() => true, () => true),
+                    new Promise<boolean>((resolve) => {
+                        timer = setTimeout(() => resolve(false), remaining);
+                    }),
+                ]);
+                clearTimeout(timer);
+                if (!started) late.push(serverName);
+            }),
+        );
+        if (late.length > 0) {
+            logWarn(
+                `MCP server(s) ${late.map((name) => `"${name}"`).join(", ")} still starting after ${MCP_STARTUP_WAIT_MS}ms; their tools join once they connect`,
+            );
+        }
+    };
 
     /** mcp-client requires `[A-Za-z0-9_-]{1,32}`; ACP names are free-form. */
     const sanitizeServerName = (raw: string): string => {
@@ -3388,9 +3449,16 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
         return undefined;
     };
 
-    /** Mounts/reuses/replaces mcp-client instances for a session's server list. */
-    const syncMcpServers = (servers: NewSessionRequest["mcpServers"] | undefined, cwd: string): void => {
-        if (servers === undefined || servers.length === 0) return;
+    /**
+     * Mounts/reuses/replaces mcp-client instances for a session's server
+     * list. Mounting starts synchronously; the returned promise settles once
+     * the listed servers have started (see settleMcpStartup), so the session
+     * request can answer only after their tools are registered — otherwise
+     * the first turn after session/new, or after a load that remounts a
+     * server, runs without them.
+     */
+    const syncMcpServers = (servers: NewSessionRequest["mcpServers"] | undefined, cwd: string): Promise<void> => {
+        if (servers === undefined || servers.length === 0) return Promise.resolve();
         const mcpClient = harness.mcpClient;
         if (mcpClient === undefined) {
             if (!warnedNoMcpClient) {
@@ -3399,8 +3467,9 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                     `ignoring ${servers.length} MCP server(s): this DeepSeek Harness installation lacks @deepseek-ai/dsh-mcp-client`,
                 );
             }
-            return;
+            return Promise.resolve();
         }
+        const listed: McpMount[] = [];
         const taken = new Set<string>();
         for (const entry of servers) {
             const server = entry as unknown as Record<string, unknown>;
@@ -3417,6 +3486,8 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             if (existing !== undefined) {
                 if (existing.configJson === configJson) {
                     taken.add(serverName);
+                    // A reused mount may still be starting for an earlier session.
+                    listed.push(existing);
                     continue;
                 }
                 try {
@@ -3428,15 +3499,23 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             }
             try {
                 const fiber = (
-                    ctx as unknown as { plugin(module: unknown, config: unknown): { dispose(): unknown } }
+                    ctx as unknown as { plugin(module: unknown, config: unknown): McpFiber }
                 ).plugin(mcpClient, cfg);
-                mcpMounts.set(serverName, { configJson, fiber });
+                const mount: McpMount = {
+                    serverName,
+                    configJson,
+                    fiber,
+                    startupDeadline: Date.now() + MCP_STARTUP_WAIT_MS,
+                };
+                mcpMounts.set(serverName, mount);
                 taken.add(serverName);
+                listed.push(mount);
                 logDebug(`mounted MCP server "${serverName}" (${String(cfg["transport"])})`);
             } catch (error: unknown) {
                 logWarn(`failed to mount MCP server "${serverName}": ${String(error)}`);
             }
         }
+        return settleMcpStartup(listed);
     };
 
     // ------------------------------------------------------------------ //
