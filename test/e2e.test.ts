@@ -748,6 +748,133 @@ describe("live tool output", () => {
     }, 90_000);
 });
 
+// A stdio MCP server that answers `initialize` only after SLOW_MCP_DELAY_MS, or never when it is "never".
+const SLOW_MCP_SERVER = `
+const delay = process.env.SLOW_MCP_DELAY_MS;
+const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("end", () => process.exit(0));
+process.stdin.on("data", (chunk) => {
+    buffer += chunk;
+    for (let index = buffer.indexOf("\\n"); index >= 0; index = buffer.indexOf("\\n")) {
+        const line = buffer.slice(0, index).trim();
+        buffer = buffer.slice(index + 1);
+        if (line.length > 0) handle(JSON.parse(line));
+    }
+});
+function handle(message) {
+    if (message.id === undefined) return;
+    const reply = (result) => send({ jsonrpc: "2.0", id: message.id, result });
+    if (message.method === "initialize") {
+        if (delay === "never") return;
+        setTimeout(() => reply({
+            protocolVersion: "2025-11-25",
+            capabilities: { tools: {} },
+            serverInfo: { name: "slow", version: "1.0.0" },
+        }), Number(delay));
+        return;
+    }
+    if (message.method === "tools/list") {
+        reply({ tools: [{ name: "echo", description: "Echo the input.", inputSchema: { type: "object", properties: {} } }] });
+        return;
+    }
+    if (message.method === "ping") {
+        reply({});
+        return;
+    }
+    send({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "Method not found" } });
+}
+`;
+
+describe("session MCP servers", () => {
+    let root: string;
+    let workspace: string;
+    let serverScript: string;
+    let provider: Server;
+    let baseUrl: string;
+    const agentRequests: string[][] = [];
+
+    beforeAll(async () => {
+        root = mkdtempSync(join(tmpdir(), "dsh-acp-mcp-startup-"));
+        workspace = mkdtempSync(join(tmpdir(), "dsh-acp-mcp-workspace-"));
+        serverScript = join(root, "slow-mcp-server.cjs");
+        writeFileSync(serverScript, SLOW_MCP_SERVER);
+        provider = createServer(async (request, response) => {
+            let body = "";
+            for await (const chunk of request) body += String(chunk);
+            const payload = JSON.parse(body) as { system?: unknown; tools?: Array<{ name: string }> };
+            if (!(typeof payload.system === "string" && payload.system.startsWith("Create a concise title"))) {
+                agentRequests.push((payload.tools ?? []).map((tool) => tool.name));
+            }
+            response.writeHead(200, { "content-type": "text/event-stream" });
+            response.end(mockModelStream("Done.", request.url));
+        });
+        await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
+        baseUrl = `http://127.0.0.1:${(provider.address() as { port: number }).port}`;
+    });
+
+    afterAll(async () => {
+        provider.closeAllConnections();
+        await new Promise<void>((resolve) => provider.close(() => resolve()));
+        rmSync(root, { recursive: true, force: true });
+        rmSync(workspace, { recursive: true, force: true });
+    });
+
+    const slowServer = (delay: string) => ({
+        name: "slow",
+        command: process.execPath,
+        args: [serverScript],
+        env: [{ name: "SLOW_MCP_DELAY_MS", value: delay }],
+    });
+
+    it("lists a slow server's tools to the first prompt after session/new and after a session/load that remounts it", async () => {
+        const client = new AcpTestClient(join(root, "sessions"), workspace, undefined, { DEEPSEEK_BASE_URL: baseUrl });
+        try {
+            await client.request("initialize", { protocolVersion: 1 }, 60_000);
+            const { sessionId } = await client.request("session/new", {
+                cwd: workspace,
+                mcpServers: [slowServer("1500")],
+            }) as { sessionId: string };
+            agentRequests.length = 0;
+            await client.request("session/prompt", { sessionId, prompt: [{ type: "text", text: "First turn." }] }, 60_000);
+            expect(agentRequests[0]).toContain("mcp__slow__echo");
+
+            // A changed spec replaces the mount; the first turn after the load must not run before the new one is listed.
+            await client.request("session/load", { sessionId, cwd: workspace, mcpServers: [slowServer("1501")] });
+            agentRequests.length = 0;
+            await client.request("session/prompt", { sessionId, prompt: [{ type: "text", text: "After load." }] }, 60_000);
+            expect(agentRequests[0]).toContain("mcp__slow__echo");
+        } finally {
+            await client.close();
+        }
+    }, 90_000);
+
+    it("bounds the wait for a server that never finishes initializing, once per mount", async () => {
+        const client = new AcpTestClient(join(root, "sessions-hung"), workspace, undefined, { DEEPSEEK_BASE_URL: baseUrl });
+        const hung = { ...slowServer("never"), name: "hung" };
+        try {
+            await client.request("initialize", { protocolVersion: 1 }, 60_000);
+            let started = Date.now();
+            const first = await client.request("session/new", { cwd: workspace, mcpServers: [hung] }, 30_000) as {
+                sessionId: string;
+            };
+            expect(first.sessionId).toBeTruthy();
+            expect(Date.now() - started).toBeLessThan(20_000);
+
+            // The same spec reuses the mount whose startup bound has already elapsed.
+            started = Date.now();
+            const second = await client.request("session/new", { cwd: workspace, mcpServers: [hung] }, 30_000) as {
+                sessionId: string;
+            };
+            expect(second.sessionId).toBeTruthy();
+            expect(Date.now() - started).toBeLessThan(5_000);
+        } finally {
+            await client.close();
+        }
+    }, 90_000);
+});
+
 function persistedSessionHeaders(sessionRoot: string): Array<Record<string, unknown>> {
     const headers: Array<Record<string, unknown>> = [];
     const walk = (dir: string): void => {
