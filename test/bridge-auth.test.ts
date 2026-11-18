@@ -151,6 +151,10 @@ interface BootOptions {
     skills?: { name: string; description: string; invocation: { userInvocable: boolean } }[];
     env?: NodeJS.ProcessEnv;
     provider?: string;
+    model?: string;
+    inputModalities?: readonly string[];
+    attachments?: boolean;
+    imageConsumer?: unknown;
 }
 
 async function boot(options: BootOptions = {}) {
@@ -174,8 +178,22 @@ async function boot(options: BootOptions = {}) {
     ctx.set("llm", {
         listProviders: () => options.providers ?? [],
         listModels: async () => [{ id: "deepseek-chat", name: "DeepSeek Chat" }],
-        resolveModelInfo: async () => ({}),
+        resolveModelInfo: async () => ({
+            ...(options.inputModalities === undefined ? {} : { inputModalities: options.inputModalities }),
+        }),
     });
+    if (options.attachments === true) {
+        ctx.provide("attachments", {});
+        ctx.set("attachments", {
+            imageLimits: { maxImageBytes: 1024, maxImagesPerMessage: 4, maxMessageImageBytes: 4096 },
+            validateImage: async () => {},
+            saveImage: async () => ({ attachmentId: "sha256:mock", mediaType: "image/png", bytes: 1, width: 1, height: 1 }),
+        });
+    }
+    if (options.imageConsumer !== undefined) {
+        ctx.provide("acpImageConsumer", {});
+        ctx.set("acpImageConsumer", options.imageConsumer);
+    }
     ctx.set("agentDefaultModel", { currentSelection: () => ({}), saveSelection: async () => {} });
     ctx.set("sessionPersistence", {});
     ctx.set("approval", {});
@@ -208,6 +226,7 @@ async function boot(options: BootOptions = {}) {
         harness,
         env: options.env ?? { NODE_ENV: "production" },
         ...(options.provider !== undefined ? { provider: options.provider } : {}),
+        ...(options.model !== undefined ? { model: options.model } : {}),
     });
     return { ctx, client, creds, agents, createdAgents, ask: (request: unknown) => questionProvider!.ask(request) };
 }
@@ -276,6 +295,62 @@ describe("ACP auth methods by capability", () => {
             expect((await status)["params"]).toMatchObject({
                 authStatus: { kind: "none", label: "Not logged in", providers: [] },
             });
+        } finally {
+            await ctx.fiber.dispose();
+        }
+    });
+});
+
+describe("ACP image capability advertisement", () => {
+    const consumer = {
+        protocol: "dsh-acp.image-consumer" as const,
+        version: 1 as const,
+        consumeImage: async () => "consumed",
+    };
+
+    async function imageFlag(options: BootOptions): Promise<{ ctx: Context; image: unknown }> {
+        const { ctx, client } = await boot(options);
+        const response = await client.request("initialize", { protocolVersion: 1 });
+        return {
+            ctx,
+            image: ((response["result"] as { agentCapabilities?: { promptCapabilities?: { image?: unknown } } })
+                .agentCapabilities?.promptCapabilities?.image),
+        };
+    }
+
+    it("fails closed for ingest-only and unknown routes, and allows a verified path", async () => {
+        const ingestOnly = await imageFlag({ attachments: true, provider: "p", model: "m" });
+        const unknown = await imageFlag({ attachments: true, provider: "p", model: "m" });
+        const vision = await imageFlag({ attachments: true, provider: "p", model: "m", inputModalities: ["text", "image"] });
+        const textConsumer = await imageFlag({ attachments: true, provider: "p", model: "m", inputModalities: ["text"], imageConsumer: consumer });
+        try {
+            expect(ingestOnly.image).toBe(false);
+            expect(unknown.image).toBe(false);
+            expect(vision.image).toBe(true);
+            expect(textConsumer.image).toBe(true);
+        } finally {
+            await Promise.all([ingestOnly.ctx.fiber.dispose(), unknown.ctx.fiber.dispose(), vision.ctx.fiber.dispose(), textConsumer.ctx.fiber.dispose()]);
+        }
+    });
+
+    it("rejects a text-only image prompt with invalid params when no consumer is present", async () => {
+        const { ctx, client, creds } = await boot({
+            providers: [{ id: "deepseek-official" }],
+            provider: "deepseek-official",
+            model: "deepseek-chat",
+            inputModalities: ["text"],
+            attachments: true,
+        });
+        creds.values.set("DEEPSEEK_API_KEY", { value: "sk-test", source: "file" });
+        try {
+            await client.request("initialize", { protocolVersion: 1 });
+            const created = await client.request("session/new", { cwd: "/ws", mcpServers: [] });
+            const sessionId = (created["result"] as { sessionId: string }).sessionId;
+            const response = await client.request("session/prompt", {
+                sessionId,
+                prompt: [{ type: "image", data: "AQ==", mimeType: "image/png" }],
+            });
+            expect((response["error"] as { code?: number })?.code).toBe(-32602);
         } finally {
             await ctx.fiber.dispose();
         }

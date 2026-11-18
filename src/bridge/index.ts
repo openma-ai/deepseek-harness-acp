@@ -127,13 +127,17 @@ import {
     withInteractionMode,
 } from "./interaction-mode.ts";
 import {
-    assertImageInputSupported,
+    advertisesImageCapability,
     attachmentIngestOf,
     convertPrompt,
     deliverPrompt,
+    imageConsumerFromHost,
+    imageConsumptionFor,
     promptHasImages,
     PromptImageError,
     UnsupportedPromptContentError,
+    type ImageConsumption,
+    type ImagePromptRoute,
 } from "./prompt.ts";
 import { resolveSessionTitle } from "./session-title.ts";
 import {
@@ -485,6 +489,17 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
     const SANDBOX_MODES = harness.sandboxModes;
     const bridgeEnv = config.env ?? process.env;
     const sessions = new Map<string, SessionRecord>();
+
+    /**
+     * Image consumers are an explicit host contract, never a name heuristic.
+     * The registry is inspected at each prompt so session-scoped tools can
+     * appear or disappear after initialize without changing that response.
+     */
+    const imageConsumerFor = (scope?: unknown) => imageConsumerFromHost(
+        ctx.get("acpImageConsumer"),
+        ctx.get("tools") as { definitions(scope?: unknown): readonly unknown[] } | undefined,
+        scope,
+    );
 
     // ------------------------------------------------------------------ //
     // ACP additional directories (built-in multi-root plugin)             //
@@ -873,6 +888,27 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
             ...(provider !== undefined ? { provider } : {}),
             ...(model !== undefined ? { model } : {}),
         };
+    };
+
+    const imageConsumptionForRoute = async (
+        route: ImagePromptRoute,
+        scope?: unknown,
+    ): Promise<ImageConsumption | undefined> => imageConsumptionFor(
+        llm,
+        route,
+        imageConsumerFor(scope),
+    );
+
+    const imageConsumptionForPrompt = async (
+        record: SessionRecord,
+        prompt: Parameters<typeof promptHasImages>[0],
+    ): Promise<ImageConsumption> => {
+        if (!promptHasImages(prompt)) return { kind: "model" };
+        const consumption = await imageConsumptionForRoute(routeOf(record), record.agent);
+        if (consumption === undefined) {
+            throw new PromptImageError("the current image prompt has no verified consumer");
+        }
+        return consumption;
     };
 
     /** The conversation's last logged call config (provider/model/effort), when any request ran. */
@@ -2625,6 +2661,24 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 clientAuthCapabilities = params.clientCapabilities as ClientAuthCapabilities | undefined;
                 tuiClient.advertised = advertisesCordis(capsMeta);
                 const providers = await listProviderRoutes();
+                const imageIngest = attachmentIngestOf(ctx.get("attachments"));
+                const initialImageRoute: ImagePromptRoute = {
+                    ...(config.provider ?? defaultSelection().provider) !== undefined
+                        ? { provider: config.provider ?? defaultSelection().provider }
+                        : {},
+                    ...(config.model ?? defaultSelection().model) !== undefined
+                        ? { model: config.model ?? defaultSelection().model }
+                        : {},
+                };
+                // ACP initialize is connection-level. Session model switches
+                // and MCP mounts cannot rewrite this answer; prompt admission
+                // below rechecks the live route and visible consumer instead.
+                const imageCapability = await advertisesImageCapability(
+                    imageIngest !== undefined,
+                    llm,
+                    initialImageRoute,
+                    imageConsumerFor(),
+                );
                 // Clients ignore notifications arriving before this response;
                 // push the initial auth report right after it lands.
                 setTimeout(() => void publishAuthStatus(), 0);
@@ -2655,7 +2709,7 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                         },
                         loadSession: true,
                         promptCapabilities: {
-                            image: attachmentIngestOf(ctx.get("attachments")) !== undefined,
+                            image: imageCapability,
                             audio: false,
                             embeddedContext: true,
                         },
@@ -3013,11 +3067,12 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 }
                 let converted;
                 try {
-                    if (promptHasImages(parsed.data.prompt)) {
-                        const route = routeOf(record);
-                        await assertImageInputSupported(llm, route.provider, route.model);
-                    }
-                    converted = await convertPrompt(parsed.data.prompt, attachmentIngestOf(ctx.get("attachments")));
+                    const consumption = await imageConsumptionForPrompt(record, parsed.data.prompt);
+                    converted = await convertPrompt(
+                        parsed.data.prompt,
+                        attachmentIngestOf(ctx.get("attachments")),
+                        consumption,
+                    );
                 } catch (error: unknown) {
                     if (error instanceof UnsupportedPromptContentError || error instanceof PromptImageError) {
                         throw invalidParams(error.message);
@@ -3053,13 +3108,11 @@ export async function apply(ctx: Context, config: AcpBridgeConfig = {}): Promise
                 const record = await requireOrRestoreSession(params.sessionId);
                 let converted;
                 try {
-                    if (promptHasImages(params.prompt)) {
-                        const route = routeOf(record);
-                        await assertImageInputSupported(llm, route.provider, route.model);
-                    }
+                    const consumption = await imageConsumptionForPrompt(record, params.prompt);
                     converted = await convertPrompt(
                         params.prompt,
                         attachmentIngestOf(ctx.get("attachments")),
+                        consumption,
                     );
                 } catch (error: unknown) {
                     if (
