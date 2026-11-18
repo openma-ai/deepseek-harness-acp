@@ -199,15 +199,24 @@ export async function imageConsumptionFor(
 ): Promise<ImageConsumption | undefined> {
     if (route.provider !== undefined && route.model !== undefined && llm !== undefined) {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 1_000);
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        const deadline = new Promise<undefined>((resolve) => {
+            timeout = setTimeout(() => {
+                controller.abort();
+                resolve(undefined);
+            }, 1_000);
+        });
         try {
-            const info = await llm.resolveModelInfo(route.provider, route.model, controller.signal);
+            const info = await Promise.race([
+                llm.resolveModelInfo(route.provider, route.model, controller.signal),
+                deadline,
+            ]);
             if (info?.inputModalities?.includes("image") === true) return { kind: "model" };
         } catch {
             // A consumer path can still be authoritative when the model path
             // is unavailable; without one, the caller fails closed.
         } finally {
-            clearTimeout(timeout);
+            if (timeout !== undefined) clearTimeout(timeout);
         }
     }
     return consumer === undefined ? undefined : { kind: "consumer", consumer, route };
