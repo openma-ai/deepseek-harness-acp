@@ -1,11 +1,9 @@
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
-import { chmodSync } from "node:fs";
 import { gzipSync } from "node:zlib";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
-import { delimiter } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
@@ -46,17 +44,17 @@ function runtimeTarball(root, version = "0.4.42") { return packageTarball(root, 
 function shellTarball(root, version = "0.4.42") { return packageTarball(root, "@openma/deepseek-harness-acp", version, "shell.tgz"); }
 
 async function runPublishCli({ tarball, registry, allowPending = false, timeoutMs = 5000 }) {
-    const bin = join(resolve(tarball, ".."), "npm");
-    writeFileSync(join(resolve(bin, ".."), "npm.cjs"), "process.stderr.write('npm error 403 You cannot publish over the previously published versions: 0.4.42\\n'); process.exit(1);\n");
-    writeFileSync(bin, "#!/bin/sh\nexec node \"$(dirname \"$0\")/npm.cjs\" \"$@\"\n");
-    chmodSync(bin, 0o755);
-    writeFileSync(`${bin}.cmd`, "@echo off\r\nnode \"%~dp0npm.cjs\" %*\r\n");
+    const root = resolve(tarball, "..");
+    const npmExecPath = join(root, "npm-stub.cjs");
+    const marker = join(root, "npm-stub-invoked");
+    if (existsSync(marker)) unlinkSync(marker);
+    writeFileSync(npmExecPath, "require('node:fs').writeFileSync(process.env.PUBLISH_STUB_MARKER, 'invoked\\n'); process.stderr.write('npm error 403 You cannot publish over the previously published versions: 0.4.42\\n'); process.exit(1);\n");
     const args = [resolve(import.meta.dirname, "../scripts/publish-release-artifact.mjs"), "--tarball", tarball, "--tag", "latest", "--registry", registry, "--verification-timeout-ms", String(timeoutMs)];
     if (allowPending) args.push("--allow-pending-visibility");
     try {
-        await execFileAsync(process.execPath, args, { env: { ...process.env, PATH: `${resolve(bin, "..")}${delimiter}${process.env.PATH}` } });
-        return { status: 0 };
-    } catch (error) { return { status: error.code, stdout: error.stdout, stderr: error.stderr }; }
+        await execFileAsync(process.execPath, args, { env: { ...process.env, npm_execpath: npmExecPath, PUBLISH_STUB_MARKER: marker } });
+        return { status: 0, invoked: existsSync(marker) };
+    } catch (error) { return { status: error.code, invoked: existsSync(marker), stdout: error.stdout, stderr: error.stderr }; }
 }
 
 async function runWithServer(requestHandler, action) {
@@ -258,10 +256,13 @@ describe("release publish artifact paths", () => {
             const shell = shellTarball(root);
             await runWithServer((_request, responseValue) => { responseValue.statusCode = 404; responseValue.end(); }, async (registry) => {
                 const shellResult = await runPublishCli({ tarball: shell, registry });
+                expect(shellResult.invoked).toBe(true);
                 expect(shellResult.status).not.toBe(0);
                 const runtimeWithoutFlag = await runPublishCli({ tarball: runtime, registry });
+                expect(runtimeWithoutFlag.invoked).toBe(true);
                 expect(runtimeWithoutFlag.status).not.toBe(0);
                 const runtimeResult = await runPublishCli({ tarball: runtime, registry, allowPending: true });
+                expect(runtimeResult.invoked).toBe(true);
                 expect(runtimeResult.status).toBe(0);
             });
         } finally { rmSync(root, { recursive: true, force: true }); }
@@ -275,6 +276,7 @@ describe("release publish artifact paths", () => {
             const started = Date.now();
             await runWithServer((_request, responseValue) => { responseValue.writeHead(200, { "content-type": "application/json" }); responseValue.write('{"version":"0.4.42"'); }, async (registry) => {
                 const result = await runPublishCli({ tarball: runtime, registry, allowPending: true, timeoutMs: 150 });
+                expect(result.invoked).toBe(true);
                 expect(result.status).not.toBe(0);
             });
             expect(Date.now() - started).toBeLessThan(2000);

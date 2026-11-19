@@ -28,8 +28,13 @@ export async function publishReleaseArtifact({ tarball, tag, registryBaseUrl, al
 }
 
 async function defaultPublish(tarball, tag) {
+    // npm sets npm_execpath to npm-cli.js; invoking it through Node works on
+    // Windows and POSIX without relying on shell execution of npm.cmd.
+    const npmExecPath = process.env.npm_execpath;
+    const command = npmExecPath ? process.execPath : "npm";
+    const args = npmExecPath ? [npmExecPath, "publish", tarball, "--tag", tag] : ["publish", tarball, "--tag", tag];
     try {
-        const result = await execFileAsync("npm", ["publish", tarball, "--tag", tag], { encoding: "utf8", maxBuffer: 10 * 1024 * 1024 });
+        const result = await execFileAsync(command, args, { encoding: "utf8", maxBuffer: 10 * 1024 * 1024 });
         if (result.stdout) process.stdout.write(result.stdout);
         if (result.stderr) process.stderr.write(result.stderr);
     } catch (error) {
