@@ -2,6 +2,7 @@
 /** Publish one tested tarball, tolerating only a digest-verified immutable retry. */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { pathToFileURL } from "node:url";
 import { resolve } from "node:path";
 import { verifyPublishedArtifact } from "./wait-for-runtime-registry.mjs";
 
@@ -38,7 +39,7 @@ async function defaultPublish(tarball, tag) {
     }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
     const args = process.argv.slice(2);
     const value = (flag) => { const i = args.indexOf(flag); return i >= 0 ? args[i + 1] : undefined; };
     const tarball = value("--tarball");

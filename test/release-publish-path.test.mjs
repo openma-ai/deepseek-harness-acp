@@ -5,6 +5,7 @@ import { gzipSync } from "node:zlib";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { delimiter } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
@@ -44,14 +45,16 @@ function packageTarball(root, name, version = "0.4.42", filename = "runtime.tgz"
 function runtimeTarball(root, version = "0.4.42") { return packageTarball(root, "@openma/deepseek-harness-acp-runtime", version); }
 function shellTarball(root, version = "0.4.42") { return packageTarball(root, "@openma/deepseek-harness-acp", version, "shell.tgz"); }
 
-async function runPublishCli({ tarball, registry, allowPending = false, timeoutMs = 30 }) {
+async function runPublishCli({ tarball, registry, allowPending = false, timeoutMs = 5000 }) {
     const bin = join(resolve(tarball, ".."), "npm");
-    writeFileSync(bin, "#!/bin/sh\necho 'npm error 403 You cannot publish over the previously published versions: 0.4.42' >&2\nexit 1\n");
+    writeFileSync(join(resolve(bin, ".."), "npm.cjs"), "process.stderr.write('npm error 403 You cannot publish over the previously published versions: 0.4.42\\n'); process.exit(1);\n");
+    writeFileSync(bin, "#!/bin/sh\nexec node \"$(dirname \"$0\")/npm.cjs\" \"$@\"\n");
     chmodSync(bin, 0o755);
+    writeFileSync(`${bin}.cmd`, "@echo off\r\nnode \"%~dp0npm.cjs\" %*\r\n");
     const args = [resolve(import.meta.dirname, "../scripts/publish-release-artifact.mjs"), "--tarball", tarball, "--tag", "latest", "--registry", registry, "--verification-timeout-ms", String(timeoutMs)];
     if (allowPending) args.push("--allow-pending-visibility");
     try {
-        await execFileAsync(process.execPath, args, { env: { ...process.env, PATH: `${resolve(bin, "..")}:${process.env.PATH}` } });
+        await execFileAsync(process.execPath, args, { env: { ...process.env, PATH: `${resolve(bin, "..")}${delimiter}${process.env.PATH}` } });
         return { status: 0 };
     } catch (error) { return { status: error.code, stdout: error.stdout, stderr: error.stderr }; }
 }
@@ -271,7 +274,7 @@ describe("release publish artifact paths", () => {
             const runtime = runtimeTarball(root);
             const started = Date.now();
             await runWithServer((_request, responseValue) => { responseValue.writeHead(200, { "content-type": "application/json" }); responseValue.write('{"version":"0.4.42"'); }, async (registry) => {
-                const result = await runPublishCli({ tarball: runtime, registry, allowPending: true, timeoutMs: 30 });
+                const result = await runPublishCli({ tarball: runtime, registry, allowPending: true, timeoutMs: 150 });
                 expect(result.status).not.toBe(0);
             });
             expect(Date.now() - started).toBeLessThan(2000);
