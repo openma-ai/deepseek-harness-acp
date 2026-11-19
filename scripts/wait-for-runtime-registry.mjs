@@ -63,24 +63,30 @@ async function fetchBodyWithinDeadline(fetchImpl, url, deadline, nowImpl, read) 
     }
 }
 
-export async function verifyPublishedArtifact({ tarball, registryBaseUrl = PUBLIC_REGISTRY, fetchImpl = fetch }) {
+export async function verifyPublishedArtifact({ tarball, registryBaseUrl = PUBLIC_REGISTRY, timeoutMs = 30_000, fetchImpl = fetch, nowImpl = now }) {
     const identity = artifactIdentity(resolve(tarball));
     const base = registryBaseUrl.replace(/\/$/, "");
     const metadataUrl = `${base}/${encodeURIComponent(identity.name)}/${encodeURIComponent(identity.version)}`;
-    const metadataResponse = await fetchImpl(metadataUrl);
+    const deadline = nowImpl() + timeoutMs;
+    const { response: metadataResponse, body: metadata } = await fetchBodyWithinDeadline(fetchImpl, metadataUrl, deadline, nowImpl, (response) => {
+        if (response.status === 401 || response.status === 403) throw new PermanentRegistryError(`registry metadata returned HTTP ${response.status}`);
+        return response.ok ? response.json() : undefined;
+    });
     if (metadataResponse.status === 404) return undefined;
     if (!metadataResponse.ok) throw new Error(`registry metadata returned HTTP ${metadataResponse.status}`);
-    const metadata = exactMetadata(await metadataResponse.json(), identity.version);
-    if (!metadata) throw new Error(`metadata did not contain exact version ${identity.version}`);
-    const dist = metadata.dist;
+    const exact = exactMetadata(metadata, identity.version);
+    if (!exact) throw new Error(`metadata did not contain exact version ${identity.version}`);
+    const dist = exact.dist;
     if (!dist?.tarball) throw new Error("exact artifact metadata has no dist.tarball");
     if (dist.integrity && dist.integrity !== identity.integrity) throw new Error(`registry integrity mismatch for ${identity.name}@${identity.version}`);
     if (dist.shasum && dist.shasum !== identity.sha1) throw new Error(`registry shasum mismatch for ${identity.name}@${identity.version}`);
-    const tarballResponse = await fetchImpl(new URL(dist.tarball, `${base}/`).href);
+    const { response: tarballResponse, body: bytes } = await fetchBodyWithinDeadline(fetchImpl, new URL(dist.tarball, `${base}/`).href, deadline, nowImpl, (response) => {
+        if (response.status === 401 || response.status === 403) throw new PermanentRegistryError(`registry tarball returned HTTP ${response.status}`);
+        return response.ok ? response.arrayBuffer() : undefined;
+    });
     if (tarballResponse.status === 404) return undefined;
     if (!tarballResponse.ok) throw new Error(`published tarball returned HTTP ${tarballResponse.status}`);
-    const bytes = Buffer.from(await tarballResponse.arrayBuffer());
-    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    const sha256 = createHash("sha256").update(Buffer.from(bytes)).digest("hex");
     if (sha256 !== identity.sha256) throw new Error(`downloaded artifact sha256 mismatch for ${identity.name}@${identity.version}`);
     return { ...identity, metadataUrl, tarballUrl: dist.tarball };
 }

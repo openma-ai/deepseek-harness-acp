@@ -13,14 +13,15 @@ export function isAlreadyPublishedConflict(error) {
     return Number(error?.status) === 409 || conflictPattern.test(text);
 }
 
-export async function publishReleaseArtifact({ tarball, tag, registryBaseUrl, publishImpl = defaultPublish, fetchImpl = fetch }) {
+export async function publishReleaseArtifact({ tarball, tag, registryBaseUrl, allowPendingVisibility = false, verificationTimeoutMs = 30_000, publishImpl = defaultPublish, fetchImpl = fetch }) {
     const absoluteTarball = resolve(tarball);
     try {
         await publishImpl(absoluteTarball, tag);
         return { published: true, verifiedExisting: false };
     } catch (error) {
         if (!isAlreadyPublishedConflict(error)) throw error;
-        const verification = await verifyPublishedArtifact({ tarball: absoluteTarball, registryBaseUrl, fetchImpl });
+        const verification = await verifyPublishedArtifact({ tarball: absoluteTarball, registryBaseUrl, fetchImpl, timeoutMs: verificationTimeoutMs });
+        if (!verification && !allowPendingVisibility) throw new Error(`published artifact is not visible yet: ${absoluteTarball}`);
         return { published: false, verifiedExisting: Boolean(verification), pendingVisibility: !verification };
     }
 }
@@ -43,5 +44,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     const tarball = value("--tarball");
     const tag = value("--tag") || "latest";
     if (!tarball) { console.error("usage: node scripts/publish-release-artifact.mjs --tarball <file.tgz> --tag <tag>"); process.exit(2); }
-    await publishReleaseArtifact({ tarball, tag, registryBaseUrl: value("--registry") });
+    await publishReleaseArtifact({
+        tarball,
+        tag,
+        registryBaseUrl: value("--registry"),
+        allowPendingVisibility: args.includes("--allow-pending-visibility"),
+        verificationTimeoutMs: Number(value("--verification-timeout-ms") ?? 30_000),
+    });
 }

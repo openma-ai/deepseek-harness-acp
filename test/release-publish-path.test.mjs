@@ -1,12 +1,18 @@
 import { createHash } from "node:crypto";
+import { createServer } from "node:http";
+import { chmodSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { resolveReleaseArtifact } from "../scripts/resolve-release-artifact.mjs";
 import { isAlreadyPublishedConflict, publishReleaseArtifact } from "../scripts/publish-release-artifact.mjs";
 import { waitForRuntimeRegistry } from "../scripts/wait-for-runtime-registry.mjs";
+
+const execFileAsync = promisify(execFile);
 
 function tarEntry(name, contents) {
     const header = Buffer.alloc(512);
@@ -27,16 +33,35 @@ function tarEntry(name, contents) {
     return Buffer.concat([header, contents, padding]);
 }
 
-function packageTarball(root, name, version = "0.4.42") {
+function packageTarball(root, name, version = "0.4.42", filename = "runtime.tgz") {
     const packageJson = Buffer.from(JSON.stringify({ name, version }));
     const tar = Buffer.concat([tarEntry("package/package.json", packageJson), Buffer.alloc(1024)]);
-    const file = join(root, "runtime.tgz");
+    const file = join(root, filename);
     writeFileSync(file, gzipSync(tar));
     return file;
 }
 
 function runtimeTarball(root, version = "0.4.42") { return packageTarball(root, "@openma/deepseek-harness-acp-runtime", version); }
-function shellTarball(root, version = "0.4.42") { return packageTarball(root, "@openma/deepseek-harness-acp", version); }
+function shellTarball(root, version = "0.4.42") { return packageTarball(root, "@openma/deepseek-harness-acp", version, "shell.tgz"); }
+
+async function runPublishCli({ tarball, registry, allowPending = false, timeoutMs = 30 }) {
+    const bin = join(resolve(tarball, ".."), "npm");
+    writeFileSync(bin, "#!/bin/sh\necho 'npm error 403 You cannot publish over the previously published versions: 0.4.42' >&2\nexit 1\n");
+    chmodSync(bin, 0o755);
+    const args = [resolve(import.meta.dirname, "../scripts/publish-release-artifact.mjs"), "--tarball", tarball, "--tag", "latest", "--registry", registry, "--verification-timeout-ms", String(timeoutMs)];
+    if (allowPending) args.push("--allow-pending-visibility");
+    try {
+        await execFileAsync(process.execPath, args, { env: { ...process.env, PATH: `${resolve(bin, "..")}:${process.env.PATH}` } });
+        return { status: 0 };
+    } catch (error) { return { status: error.code, stdout: error.stdout, stderr: error.stderr }; }
+}
+
+async function runWithServer(requestHandler, action) {
+    const server = createServer(requestHandler);
+    await new Promise((resolvePromise) => server.listen(0, "127.0.0.1", resolvePromise));
+    try { return await action(`http://127.0.0.1:${server.address().port}`); }
+    finally { await new Promise((resolvePromise) => server.close(resolvePromise)); }
+}
 
 function response(status, body, bytes) {
     return { status, ok: status >= 200 && status < 300, json: async () => body, arrayBuffer: async () => { const value = bytes ?? Buffer.from(JSON.stringify(body)); return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength); } };
@@ -84,6 +109,8 @@ describe("release publish artifact paths", () => {
         }
         expect(workflow.indexOf('publish-release-artifact.mjs --tarball "$RUNTIME_TARBALL"')).toBeLessThan(workflow.indexOf("wait-for-runtime-registry.mjs"));
         expect(workflow.indexOf("wait-for-runtime-registry.mjs")).toBeLessThan(workflow.indexOf('publish-release-artifact.mjs --tarball "$SHELL_TARBALL"'));
+        expect(workflow).toContain('publish-release-artifact.mjs --tarball "$RUNTIME_TARBALL" --tag "$DIST_TAG" --allow-pending-visibility');
+        expect(workflow).not.toContain('publish-release-artifact.mjs --tarball "$SHELL_TARBALL" --tag "$DIST_TAG" --allow-pending-visibility');
         expect(workflow.indexOf('verify-release-artifacts.mjs --shell "$SHELL_TARBALL" --runtime "$RUNTIME_TARBALL"', firstPublish)).toBeGreaterThan(workflow.indexOf("wait-for-runtime-registry.mjs"));
     });
 
@@ -212,10 +239,42 @@ describe("release publish artifact paths", () => {
             const result = await publishReleaseArtifact({
                 tarball: runtime,
                 tag: "latest",
+                allowPendingVisibility: true,
                 publishImpl: async () => { throw new Error("E403 You cannot publish over the previously published versions: 0.4.42"); },
                 fetchImpl: async () => response(404, {}),
             });
             expect(result).toEqual({ published: false, verifiedExisting: false, pendingVisibility: true });
+        } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+
+    it("enforces the pending flag at the actual CLI boundary", async () => {
+        const root = join(tmpdir(), `dsh-acp-cli-${process.pid}-${Date.now()}`);
+        mkdirSync(root, { recursive: true });
+        try {
+            const runtime = runtimeTarball(root);
+            const shell = shellTarball(root);
+            await runWithServer((_request, responseValue) => { responseValue.statusCode = 404; responseValue.end(); }, async (registry) => {
+                const shellResult = await runPublishCli({ tarball: shell, registry });
+                expect(shellResult.status).not.toBe(0);
+                const runtimeWithoutFlag = await runPublishCli({ tarball: runtime, registry });
+                expect(runtimeWithoutFlag.status).not.toBe(0);
+                const runtimeResult = await runPublishCli({ tarball: runtime, registry, allowPending: true });
+                expect(runtimeResult.status).toBe(0);
+            });
+        } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+
+    it("bounds actual CLI resume verification when metadata never finishes", async () => {
+        const root = join(tmpdir(), `dsh-acp-cli-${process.pid}-${Date.now()}`);
+        mkdirSync(root, { recursive: true });
+        try {
+            const runtime = runtimeTarball(root);
+            const started = Date.now();
+            await runWithServer((_request, responseValue) => { responseValue.writeHead(200, { "content-type": "application/json" }); responseValue.write('{"version":"0.4.42"'); }, async (registry) => {
+                const result = await runPublishCli({ tarball: runtime, registry, allowPending: true, timeoutMs: 30 });
+                expect(result.status).not.toBe(0);
+            });
+            expect(Date.now() - started).toBeLessThan(2000);
         } finally { rmSync(root, { recursive: true, force: true }); }
     });
 
