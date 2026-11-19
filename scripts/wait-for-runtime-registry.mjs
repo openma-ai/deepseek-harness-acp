@@ -14,14 +14,14 @@ export const RUNTIME_PACKAGE_NAME = "@openma/deepseek-harness-acp-runtime";
 const sleep = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 const now = () => Date.now();
 
-function runtimeIdentity(runtimeTarball) {
-    const packageJson = readTarGzEntries(runtimeTarball, ["package/package.json"]).get("package/package.json");
-    if (!packageJson) throw new Error(`runtime tarball is missing package/package.json: ${runtimeTarball}`);
+export function artifactIdentity(tarball) {
+    const packageJson = readTarGzEntries(tarball, ["package/package.json"]).get("package/package.json");
+    if (!packageJson) throw new Error(`tarball is missing package/package.json: ${tarball}`);
     const pkg = JSON.parse(packageJson.toString("utf8"));
-    if (pkg.name !== RUNTIME_PACKAGE_NAME || typeof pkg.version !== "string") {
-        throw new Error(`runtime tarball is not ${RUNTIME_PACKAGE_NAME}@<version>`);
+    if (typeof pkg.name !== "string" || typeof pkg.version !== "string") {
+        throw new Error(`tarball is missing package name or version: ${tarball}`);
     }
-    const bytes = readFileSync(runtimeTarball);
+    const bytes = readFileSync(tarball);
     return {
         name: pkg.name,
         version: pkg.version,
@@ -37,8 +37,52 @@ function exactMetadata(body, version) {
     return undefined;
 }
 
-async function responseBytes(response) {
-    return Buffer.from(await response.arrayBuffer());
+class DeadlineExceededError extends Error {
+    constructor() { super("timed out: registry request exceeded its deadline"); this.name = "DeadlineExceededError"; }
+}
+
+class PermanentRegistryError extends Error {
+    constructor(message) { super(message); this.name = "PermanentRegistryError"; }
+}
+
+async function fetchBodyWithinDeadline(fetchImpl, url, deadline, nowImpl, read) {
+    const remaining = deadline - nowImpl();
+    if (remaining <= 0) throw new DeadlineExceededError();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), remaining);
+    try {
+        const response = await fetchImpl(url, { signal: controller.signal });
+        const body = await read(response);
+        if (nowImpl() > deadline) throw new DeadlineExceededError();
+        return { response, body };
+    } catch (error) {
+        if (error?.name === "AbortError") throw new DeadlineExceededError();
+        throw error;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+export async function verifyPublishedArtifact({ tarball, registryBaseUrl = PUBLIC_REGISTRY, fetchImpl = fetch }) {
+    const identity = artifactIdentity(resolve(tarball));
+    const base = registryBaseUrl.replace(/\/$/, "");
+    const metadataUrl = `${base}/${encodeURIComponent(identity.name)}/${encodeURIComponent(identity.version)}`;
+    const metadataResponse = await fetchImpl(metadataUrl);
+    if (metadataResponse.status === 404) return undefined;
+    if (!metadataResponse.ok) throw new Error(`registry metadata returned HTTP ${metadataResponse.status}`);
+    const metadata = exactMetadata(await metadataResponse.json(), identity.version);
+    if (!metadata) throw new Error(`metadata did not contain exact version ${identity.version}`);
+    const dist = metadata.dist;
+    if (!dist?.tarball) throw new Error("exact artifact metadata has no dist.tarball");
+    if (dist.integrity && dist.integrity !== identity.integrity) throw new Error(`registry integrity mismatch for ${identity.name}@${identity.version}`);
+    if (dist.shasum && dist.shasum !== identity.sha1) throw new Error(`registry shasum mismatch for ${identity.name}@${identity.version}`);
+    const tarballResponse = await fetchImpl(new URL(dist.tarball, `${base}/`).href);
+    if (tarballResponse.status === 404) return undefined;
+    if (!tarballResponse.ok) throw new Error(`published tarball returned HTTP ${tarballResponse.status}`);
+    const bytes = Buffer.from(await tarballResponse.arrayBuffer());
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    if (sha256 !== identity.sha256) throw new Error(`downloaded artifact sha256 mismatch for ${identity.name}@${identity.version}`);
+    return { ...identity, metadataUrl, tarballUrl: dist.tarball };
 }
 
 /**
@@ -60,33 +104,27 @@ export async function waitForRuntimeRegistry({
     sleepImpl = sleep,
     nowImpl = now,
 }) {
-    const identity = runtimeIdentity(resolve(runtimeTarball));
+    const identity = artifactIdentity(resolve(runtimeTarball));
+    if (identity.name !== RUNTIME_PACKAGE_NAME) throw new Error(`runtime tarball is not ${RUNTIME_PACKAGE_NAME}@<version>`);
     const base = registryBaseUrl.replace(/\/$/, "");
     const metadataUrl = `${base}/${encodeURIComponent(identity.name)}/${encodeURIComponent(identity.version)}`;
     const deadline = nowImpl() + timeoutMs;
     let lastPending = "registry metadata is not available yet";
-    const fetchWithinDeadline = async (url) => {
-        const remaining = Math.max(1, deadline - nowImpl());
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), remaining);
-        try {
-            return await fetchImpl(url, { signal: controller.signal });
-        } finally {
-            clearTimeout(timer);
-        }
-    };
 
     while (nowImpl() <= deadline) {
         try {
-            const metadataResponse = await fetchWithinDeadline(metadataUrl);
+            const { response: metadataResponse, body: metadata } = await fetchBodyWithinDeadline(fetchImpl, metadataUrl, deadline, nowImpl, (response) => {
+                if (response.status === 401 || response.status === 403) throw new PermanentRegistryError(`registry metadata returned HTTP ${response.status}`);
+                return response.ok ? response.json() : undefined;
+            });
             if (metadataResponse.status === 404) {
                 lastPending = `metadata returned 404 for ${identity.name}@${identity.version}`;
             } else if (!metadataResponse.ok) {
                 lastPending = `metadata returned HTTP ${metadataResponse.status}`;
             } else {
-                const metadata = exactMetadata(await metadataResponse.json(), identity.version);
-                if (!metadata) throw new Error(`metadata did not contain exact version ${identity.version}`);
-                const dist = metadata.dist;
+                const exact = exactMetadata(metadata, identity.version);
+                if (!exact) throw new Error(`metadata did not contain exact version ${identity.version}`);
+                const dist = exact.dist;
                 if (!dist?.tarball) throw new Error("exact runtime metadata has no dist.tarball");
                 if (dist.integrity && dist.integrity !== identity.integrity) {
                     throw new Error(`registry integrity mismatch for ${identity.name}@${identity.version}`);
@@ -94,17 +132,20 @@ export async function waitForRuntimeRegistry({
                 if (dist.shasum && dist.shasum !== identity.sha1) {
                     throw new Error(`registry shasum mismatch for ${identity.name}@${identity.version}`);
                 }
-                const tarballResponse = await fetchWithinDeadline(new URL(dist.tarball, `${base}/`).href);
+                const { response: tarballResponse, body: bytes } = await fetchBodyWithinDeadline(fetchImpl, new URL(dist.tarball, `${base}/`).href, deadline, nowImpl, (response) => {
+                    if (response.status === 401 || response.status === 403) throw new PermanentRegistryError(`registry tarball returned HTTP ${response.status}`);
+                    return response.ok ? response.arrayBuffer() : undefined;
+                });
                 if (!tarballResponse.ok) {
                     lastPending = `tarball returned HTTP ${tarballResponse.status}`;
                 } else {
-                    const bytes = await responseBytes(tarballResponse);
-                    const sha256 = createHash("sha256").update(bytes).digest("hex");
+                    const sha256 = createHash("sha256").update(Buffer.from(bytes)).digest("hex");
                     if (sha256 !== identity.sha256) throw new Error(`downloaded runtime sha256 mismatch for ${identity.name}@${identity.version}`);
                     return { ...identity, metadataUrl, tarballUrl: dist.tarball };
                 }
             }
         } catch (error) {
+            if (error instanceof DeadlineExceededError || error instanceof PermanentRegistryError) throw error;
             if (error?.message?.includes("integrity mismatch") || error?.message?.includes("shasum mismatch") || error?.message?.includes("sha256 mismatch") || error?.message?.includes("did not contain exact") || error?.message?.includes("no dist.tarball")) throw error;
             lastPending = `registry request failed: ${error?.message || error}`;
         }

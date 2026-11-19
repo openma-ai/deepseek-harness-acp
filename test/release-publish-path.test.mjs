@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { resolveReleaseArtifact } from "../scripts/resolve-release-artifact.mjs";
+import { isAlreadyPublishedConflict, publishReleaseArtifact } from "../scripts/publish-release-artifact.mjs";
 import { waitForRuntimeRegistry } from "../scripts/wait-for-runtime-registry.mjs";
 
 function tarEntry(name, contents) {
@@ -26,19 +27,28 @@ function tarEntry(name, contents) {
     return Buffer.concat([header, contents, padding]);
 }
 
-function runtimeTarball(root, version = "0.4.42") {
-    const packageJson = Buffer.from(JSON.stringify({ name: "@openma/deepseek-harness-acp-runtime", version }));
+function packageTarball(root, name, version = "0.4.42") {
+    const packageJson = Buffer.from(JSON.stringify({ name, version }));
     const tar = Buffer.concat([tarEntry("package/package.json", packageJson), Buffer.alloc(1024)]);
     const file = join(root, "runtime.tgz");
     writeFileSync(file, gzipSync(tar));
     return file;
 }
 
+function runtimeTarball(root, version = "0.4.42") { return packageTarball(root, "@openma/deepseek-harness-acp-runtime", version); }
+function shellTarball(root, version = "0.4.42") { return packageTarball(root, "@openma/deepseek-harness-acp", version); }
+
 function response(status, body, bytes) {
     return { status, ok: status >= 200 && status < 300, json: async () => body, arrayBuffer: async () => { const value = bytes ?? Buffer.from(JSON.stringify(body)); return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength); } };
 }
 
 describe("release publish artifact paths", () => {
+    it("recognizes npm's captured immutable-version error but rejects generic auth errors", () => {
+        expect(isAlreadyPublishedConflict({ code: "E403", stderr: "npm error 403 You cannot publish over the previously published versions: 0.4.42" })).toBe(true);
+        expect(isAlreadyPublishedConflict({ status: 403, stderr: "npm error 403 Forbidden" })).toBe(false);
+        expect(isAlreadyPublishedConflict({ status: 401, stderr: "npm error unauthorized" })).toBe(false);
+    });
+
     it.each(["runtime", "shell"])("turns a %s-relative tarball path into an absolute local file", (directory) => {
         const root = join(tmpdir(), `dsh-acp-release-path-${process.pid}-${Date.now()}`);
         const relative = join(directory, "openma-deepseek-harness-acp-0.4.42-beta.2.tgz");
@@ -62,10 +72,9 @@ describe("release publish artifact paths", () => {
         expect(workflow).toContain('SHELL_TARBALL=$(node scripts/resolve-release-artifact.mjs "$SHELL_TARBALL")');
         expect(workflow).toContain('RUNTIME_TARBALL=$(node scripts/resolve-release-artifact.mjs "$RUNTIME_TARBALL")');
 
-        const publishArgs = [...workflow.matchAll(/npm publish "([^"]+)"/g)].map((match) => match[1]);
+        const publishArgs = [...workflow.matchAll(/publish-release-artifact\.mjs --tarball "([^"]+)"/g)].map((match) => match[1]);
         expect(publishArgs).toEqual(["$RUNTIME_TARBALL", "$SHELL_TARBALL"]);
-        for (const arg of publishArgs) expect(arg).not.toMatch(/^(?:runtime|shell)\/.*\.tgz$/);
-        const firstPublish = workflow.indexOf("          npm publish");
+        const firstPublish = workflow.indexOf("publish-release-artifact.mjs");
         for (const resolution of [
             'SHELL_TARBALL=$(node scripts/resolve-release-artifact.mjs "$SHELL_TARBALL")',
             'RUNTIME_TARBALL=$(node scripts/resolve-release-artifact.mjs "$RUNTIME_TARBALL")',
@@ -73,8 +82,9 @@ describe("release publish artifact paths", () => {
             expect(workflow.indexOf(resolution)).toBeGreaterThanOrEqual(0);
             expect(workflow.indexOf(resolution)).toBeLessThan(firstPublish);
         }
-        expect(workflow.indexOf('npm publish "$RUNTIME_TARBALL"')).toBeLessThan(workflow.indexOf("wait-for-runtime-registry.mjs"));
-        expect(workflow.indexOf("wait-for-runtime-registry.mjs")).toBeLessThan(workflow.indexOf('npm publish "$SHELL_TARBALL"'));
+        expect(workflow.indexOf('publish-release-artifact.mjs --tarball "$RUNTIME_TARBALL"')).toBeLessThan(workflow.indexOf("wait-for-runtime-registry.mjs"));
+        expect(workflow.indexOf("wait-for-runtime-registry.mjs")).toBeLessThan(workflow.indexOf('publish-release-artifact.mjs --tarball "$SHELL_TARBALL"'));
+        expect(workflow.indexOf('verify-release-artifacts.mjs --shell "$SHELL_TARBALL" --runtime "$RUNTIME_TARBALL"', firstPublish)).toBeGreaterThan(workflow.indexOf("wait-for-runtime-registry.mjs"));
     });
 
     it("waits through a public 404, then verifies the exact runtime tarball", async () => {
@@ -116,6 +126,114 @@ describe("release publish artifact paths", () => {
         try {
             const runtime = runtimeTarball(root);
             await expect(waitForRuntimeRegistry({ runtimeTarball: runtime, fetchImpl: async () => response(200, { version: "0.4.42", dist: { tarball: "runtime.tgz", integrity: "sha512-wrong" } }) })).rejects.toThrow(/integrity mismatch/);
+        } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+
+    it("keeps the registry deadline armed while reading a delayed tarball body", async () => {
+        const root = join(tmpdir(), `dsh-acp-registry-${process.pid}-${Date.now()}`);
+        mkdirSync(root, { recursive: true });
+        try {
+            const runtime = runtimeTarball(root);
+            const bytes = readFileSync(runtime);
+            const delayed = (value, ms) => new Promise((resolveValue) => setTimeout(() => resolveValue(value), ms));
+            let calls = 0;
+            const fetchImpl = async () => {
+                calls++;
+                if (calls === 1) return response(200, { version: "0.4.42", dist: { tarball: "runtime.tgz" } });
+                return { status: 200, ok: true, json: async () => ({}), arrayBuffer: async () => delayed(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength), 30) };
+            };
+            await expect(waitForRuntimeRegistry({ runtimeTarball: runtime, timeoutMs: 10, intervalMs: 1, fetchImpl, sleepImpl: async () => {} })).rejects.toThrow(/deadline|timed out/);
+        } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+
+    it.each([401, 403])("fails immediately on metadata HTTP %s", async (status) => {
+        const root = join(tmpdir(), `dsh-acp-registry-${process.pid}-${Date.now()}`);
+        mkdirSync(root, { recursive: true });
+        try {
+            const runtime = runtimeTarball(root);
+            let calls = 0;
+            await expect(waitForRuntimeRegistry({ runtimeTarball: runtime, timeoutMs: 1000, fetchImpl: async () => { calls++; return response(status, {}); }, sleepImpl: async () => { throw new Error("must not sleep"); } })).rejects.toThrow(new RegExp(`HTTP ${status}`));
+            expect(calls).toBe(1);
+        } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+
+    it("fails immediately on a tarball HTTP 401 or 403", async () => {
+        const root = join(tmpdir(), `dsh-acp-registry-${process.pid}-${Date.now()}`);
+        mkdirSync(root, { recursive: true });
+        try {
+            const runtime = runtimeTarball(root);
+            for (const status of [401, 403]) {
+                let calls = 0;
+                await expect(waitForRuntimeRegistry({ runtimeTarball: runtime, timeoutMs: 1000, fetchImpl: async () => { calls++; return calls === 1 ? response(200, { version: "0.4.42", dist: { tarball: "runtime.tgz" } }) : response(status, {}); }, sleepImpl: async () => { throw new Error("must not sleep"); } })).rejects.toThrow(new RegExp(`HTTP ${status}`));
+                expect(calls).toBe(2);
+            }
+        } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+
+    it("publishes runtime, waits, then attempts shell, and safely resumes immutable retries", async () => {
+        const root = join(tmpdir(), `dsh-acp-publish-${process.pid}-${Date.now()}`);
+        mkdirSync(root, { recursive: true });
+        try {
+            const runtime = runtimeTarball(root);
+            const shell = shellTarball(root);
+            const events = [];
+            const publish = async (file) => { events.push(`publish:${file}`); };
+            await publishReleaseArtifact({ tarball: runtime, tag: "latest", publishImpl: publish });
+            events.push("wait");
+            await publishReleaseArtifact({ tarball: shell, tag: "latest", publishImpl: publish });
+            expect(events).toEqual([`publish:${resolve(runtime)}`, "wait", `publish:${resolve(shell)}`]);
+        } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+
+    it.each([
+        ["runtime", "runtime"],
+        ["shell", "shell"],
+    ])("continues an already-published %s only after matching digest verification", async (_label, kind) => {
+        const root = join(tmpdir(), `dsh-acp-publish-${process.pid}-${Date.now()}`);
+        mkdirSync(root, { recursive: true });
+        try {
+            const tarball = kind === "runtime" ? runtimeTarball(root) : shellTarball(root);
+            const bytes = readFileSync(tarball);
+            const sha1 = createHash("sha1").update(bytes).digest("hex");
+            const integrity = `sha512-${createHash("sha512").update(bytes).digest("base64")}`;
+            const fetchImpl = async (url) => String(url).endsWith("runtime.tgz") || String(url).endsWith("shell.tgz")
+                ? response(200, {}, bytes)
+                : response(200, { version: "0.4.42", dist: { tarball: `${kind}.tgz`, sha1, shasum: sha1, integrity } });
+            const result = await publishReleaseArtifact({ tarball, tag: "latest", publishImpl: async () => { throw new Error("E403 cannot publish over the previously published versions"); }, fetchImpl, registryBaseUrl: "https://registry.npmjs.org" });
+            expect(result).toEqual({ published: false, verifiedExisting: true, pendingVisibility: false });
+        } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+
+    it("continues an immutable retry while registry metadata is still 404 so the wait gate can retry", async () => {
+        const root = join(tmpdir(), `dsh-acp-publish-${process.pid}-${Date.now()}`);
+        mkdirSync(root, { recursive: true });
+        try {
+            const runtime = runtimeTarball(root);
+            const result = await publishReleaseArtifact({
+                tarball: runtime,
+                tag: "latest",
+                publishImpl: async () => { throw new Error("E403 You cannot publish over the previously published versions: 0.4.42"); },
+                fetchImpl: async () => response(404, {}),
+            });
+            expect(result).toEqual({ published: false, verifiedExisting: false, pendingVisibility: true });
+        } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+
+    it.each(["runtime", "shell"])("rejects an immutable %s retry when the registry digest differs", async (kind) => {
+        const root = join(tmpdir(), `dsh-acp-publish-${process.pid}-${Date.now()}`);
+        mkdirSync(root, { recursive: true });
+        try {
+            const tarball = kind === "runtime" ? runtimeTarball(root) : shellTarball(root);
+            await expect(publishReleaseArtifact({ tarball, tag: "latest", publishImpl: async () => { throw new Error("E409 cannot publish over the previously published versions"); }, fetchImpl: async () => response(200, { version: "0.4.42", dist: { tarball: `${kind}.tgz`, integrity: "sha512-wrong" } }) })).rejects.toThrow(/integrity mismatch/);
+        } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+
+    it("does not continue a non-conflict publish error", async () => {
+        const root = join(tmpdir(), `dsh-acp-publish-${process.pid}-${Date.now()}`);
+        mkdirSync(root, { recursive: true });
+        try {
+            const runtime = runtimeTarball(root);
+            await expect(publishReleaseArtifact({ tarball: runtime, tag: "latest", publishImpl: async () => { throw Object.assign(new Error("unauthorized"), { status: 401 }); }, fetchImpl: async () => { throw new Error("must not fetch"); } })).rejects.toThrow("unauthorized");
         } finally { rmSync(root, { recursive: true, force: true }); }
     });
 });
