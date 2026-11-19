@@ -64,10 +64,10 @@ prereleases, so a peer floor would reject every dsh prerelease. A newer dsh is
 always attempted: API differences between dsh generations are feature-detected
 where they are used (for example dsh 0.2.1's `subagents.drainDescendants`
 versus 0.2.0's `drainContinuableDescendants`), and a dsh newer than the newest
-tested version (`0.2.1-rc.2`) only logs a warning. Only a dsh below the floor
+tested version (`0.2.2-rc.5`) only logs a warning. Only a dsh below the floor
 is refused. CI exercises the tested profile matrix (`runtime/compatibility.json`)
 plus the `next` dist-tag. The bundled runtime is
-**DSH `0.2.0-rc.2`**, including the upstream cross-process session write lock.
+**DSH `0.2.2-rc.5`**, including the upstream cross-process session write lock.
 
 Runtime selection has exactly two rules (Martty issue #157):
 
@@ -329,7 +329,7 @@ another provider.
 ## Features
 
 - **Streaming** — assistant text and reasoning deltas; assembled-message fallback.
-- **Images** — `promptCapabilities.image` is advertised only when `ctx.attachments` is mounted and the initial route declares `inputModalities` including `"image"`, or the host publishes the versioned `dsh-acp.image-consumer` contract (`acpImageConsumer`). Ingest alone is not advertised. Vision routes store ACP `image` blocks as durable harness attachments; a text-only route may use the explicit consumer, which receives each saved attachment and returns text so no image block is sent to that model. Prompt and steering admission re-check the live route and currently visible consumer, so a model switch or tool removal can produce `-32602`; tools mounted only after `initialize` cannot change the already-sent capability advertisement. `resource_link` stays a textual file pointer.
+- **Images** — `promptCapabilities.image` is advertised only when `ctx.attachments` is mounted and the initial route declares `inputModalities` including `"image"`, or the host publishes the versioned `dsh-acp.image-consumer` contract (`acpImageConsumer`). Ingest alone is not advertised. Vision routes store ACP `image` blocks as durable harness attachments; a text-only route may use the explicit consumer, which receives each saved attachment and returns text so no image block is sent to that model. The adapter does not infer that consumer from a stock tool name such as `read_image`. Prompt and steering admission re-check the live route and currently visible consumer, so a model switch or tool removal can produce `-32602`; tools mounted only after `initialize` cannot change the already-sent capability advertisement. `resource_link` stays a textual file pointer.
 - **Tool calls** — ACP kinds, human titles, file locations, real diffs from fs-tool hunks, raw input/output; command output on a **display terminal** when the client supports one, fenced output otherwise.
 - **Permission presets as session modes** — `read-only` / `workspace-write` / `danger-full-access`, each a named `{sandbox, approval}` pair recorded as a durable session fact (also exposed as a config option for clients that only render those).
 - **Agent composition** — when the profile mounts `agentPresets`, an uncategorized config option `id: "agent"` lists the roster (`standard` / `code` / `minimal` / `cordis`, plus user copies). Switching rebuilds the agent live with history preserved. Authoring (copy/rm) stays on the Web settings page; there is no `/preset` slash.
