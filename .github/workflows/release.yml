@@ -267,8 +267,13 @@ jobs:
           # slim shell never lands on the registry without its runtime (first
           # standalone start would then 404).
           node scripts/verify-release-artifacts.mjs --shell "$SHELL_TARBALL" --runtime "$RUNTIME_TARBALL"
-          npm publish "$RUNTIME_TARBALL" --tag "$DIST_TAG"
-          npm publish "$SHELL_TARBALL" --tag "$DIST_TAG"
+          node scripts/publish-release-artifact.mjs --tarball "$RUNTIME_TARBALL" --tag "$DIST_TAG" --allow-pending-visibility
+          # npm accepting the publish does not mean the public registry has
+          # finished processing it. Do not expose the slim shell until the
+          # exact runtime is publicly downloadable and hash-verified.
+          node scripts/wait-for-runtime-registry.mjs --runtime "$RUNTIME_TARBALL"
+          node scripts/verify-release-artifacts.mjs --shell "$SHELL_TARBALL" --runtime "$RUNTIME_TARBALL"
+          node scripts/publish-release-artifact.mjs --tarball "$SHELL_TARBALL" --tag "$DIST_TAG"
       - name: GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
