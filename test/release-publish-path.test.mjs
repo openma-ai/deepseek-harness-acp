@@ -4,11 +4,13 @@ import { gzipSync } from "node:zlib";
 import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { resolveReleaseArtifact } from "../scripts/resolve-release-artifact.mjs";
 import { isAlreadyPublishedConflict, publishReleaseArtifact } from "../scripts/publish-release-artifact.mjs";
+import { isExecutedAsCli } from "../scripts/is-executed-as-cli.mjs";
 import { waitForRuntimeRegistry } from "../scripts/wait-for-runtime-registry.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -52,8 +54,8 @@ async function runPublishCli({ tarball, registry, allowPending = false, timeoutM
     const args = [resolve(import.meta.dirname, "../scripts/publish-release-artifact.mjs"), "--tarball", tarball, "--tag", "latest", "--registry", registry, "--verification-timeout-ms", String(timeoutMs)];
     if (allowPending) args.push("--allow-pending-visibility");
     try {
-        await execFileAsync(process.execPath, args, { env: { ...process.env, npm_execpath: npmExecPath, PUBLISH_STUB_MARKER: marker } });
-        return { status: 0, invoked: existsSync(marker) };
+        const result = await execFileAsync(process.execPath, args, { env: { ...process.env, npm_execpath: npmExecPath, PUBLISH_STUB_MARKER: marker }, encoding: "utf8" });
+        return { status: 0, invoked: existsSync(marker), stdout: result.stdout, stderr: result.stderr };
     } catch (error) { return { status: error.code, invoked: existsSync(marker), stdout: error.stdout, stderr: error.stderr }; }
 }
 
@@ -68,7 +70,25 @@ function response(status, body, bytes) {
     return { status, ok: status >= 200 && status < 300, json: async () => body, arrayBuffer: async () => { const value = bytes ?? Buffer.from(JSON.stringify(body)); return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength); } };
 }
 
+function expectStubInvoked(result) {
+    expect(result.invoked, `publish stub was not invoked (status=${result.status}, stdout=${result.stdout ?? ""}, stderr=${result.stderr ?? ""})`).toBe(true);
+}
+
 describe("release publish artifact paths", () => {
+    it("treats Windows drive-letter case as the same CLI invocation", () => {
+        const lower = "file:///d:/a/deepseek-harness-acp/deepseek-harness-acp/scripts/publish-release-artifact.mjs";
+        const argv = "D:\\a\\deepseek-harness-acp\\deepseek-harness-acp\\scripts\\publish-release-artifact.mjs";
+        expect(isExecutedAsCli(lower, argv, "win32")).toBe(true);
+        expect(isExecutedAsCli(lower, "file:///D:/a/deepseek-harness-acp/deepseek-harness-acp/scripts/publish-release-artifact.mjs", "win32")).toBe(true);
+        expect(isExecutedAsCli(lower, "D:\\a\\deepseek-harness-acp\\deepseek-harness-acp\\scripts\\other.mjs", "win32")).toBe(false);
+    });
+
+    it("recognizes this module as the CLI entry on the current platform", () => {
+        const script = resolve(import.meta.dirname, "../scripts/publish-release-artifact.mjs");
+        expect(isExecutedAsCli(pathToFileURL(script).href, script)).toBe(true);
+        expect(isExecutedAsCli(pathToFileURL(script).href, resolve(import.meta.dirname, "../scripts/wait-for-runtime-registry.mjs"))).toBe(false);
+    });
+
     it("recognizes npm's captured immutable-version error but rejects generic auth errors", () => {
         expect(isAlreadyPublishedConflict({ code: "E403", stderr: "npm error 403 You cannot publish over the previously published versions: 0.4.42" })).toBe(true);
         expect(isAlreadyPublishedConflict({ status: 403, stderr: "npm error 403 Forbidden" })).toBe(false);
@@ -256,13 +276,13 @@ describe("release publish artifact paths", () => {
             const shell = shellTarball(root);
             await runWithServer((_request, responseValue) => { responseValue.statusCode = 404; responseValue.end(); }, async (registry) => {
                 const shellResult = await runPublishCli({ tarball: shell, registry });
-                expect(shellResult.invoked).toBe(true);
+                expectStubInvoked(shellResult);
                 expect(shellResult.status).not.toBe(0);
                 const runtimeWithoutFlag = await runPublishCli({ tarball: runtime, registry });
-                expect(runtimeWithoutFlag.invoked).toBe(true);
+                expectStubInvoked(runtimeWithoutFlag);
                 expect(runtimeWithoutFlag.status).not.toBe(0);
                 const runtimeResult = await runPublishCli({ tarball: runtime, registry, allowPending: true });
-                expect(runtimeResult.invoked).toBe(true);
+                expectStubInvoked(runtimeResult);
                 expect(runtimeResult.status).toBe(0);
             });
         } finally { rmSync(root, { recursive: true, force: true }); }
@@ -276,7 +296,7 @@ describe("release publish artifact paths", () => {
             const started = Date.now();
             await runWithServer((_request, responseValue) => { responseValue.writeHead(200, { "content-type": "application/json" }); responseValue.write('{"version":"0.4.42"'); }, async (registry) => {
                 const result = await runPublishCli({ tarball: runtime, registry, allowPending: true, timeoutMs: 150 });
-                expect(result.invoked).toBe(true);
+                expectStubInvoked(result);
                 expect(result.status).not.toBe(0);
             });
             expect(Date.now() - started).toBeLessThan(2000);

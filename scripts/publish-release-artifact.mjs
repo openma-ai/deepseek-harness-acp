@@ -2,9 +2,9 @@
 /** Publish one tested tarball, tolerating only a digest-verified immutable retry. */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { pathToFileURL } from "node:url";
 import { resolve } from "node:path";
 import { verifyPublishedArtifact } from "./wait-for-runtime-registry.mjs";
+import { isExecutedAsCli } from "./is-executed-as-cli.mjs";
 
 const execFileAsync = promisify(execFile);
 const conflictPattern = /(?:E(?:PUBLISH)?CONFLICT|cannot publish over(?: the)? previously published versions|previously published versions|already published|cannot overwrite|version already exists)/i;
@@ -44,7 +44,7 @@ async function defaultPublish(tarball, tag) {
     }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+if (isExecutedAsCli(import.meta.url, process.argv[1])) {
     const args = process.argv.slice(2);
     const value = (flag) => { const i = args.indexOf(flag); return i >= 0 ? args[i + 1] : undefined; };
     const tarball = value("--tarball");

@@ -6,7 +6,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { isExecutedAsCli } from "./is-executed-as-cli.mjs";
 import { readTarGzEntries } from "./list-tarball.mjs";
 
 export const PUBLIC_REGISTRY = "https://registry.npmjs.org";
@@ -162,7 +162,7 @@ export async function waitForRuntimeRegistry({
     throw new Error(`timed out waiting for public runtime ${identity.name}@${identity.version}: ${lastPending}`);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+if (isExecutedAsCli(import.meta.url, process.argv[1])) {
     const args = process.argv.slice(2);
     const value = (flag) => { const index = args.indexOf(flag); return index >= 0 ? args[index + 1] : undefined; };
     const runtimeTarball = value("--runtime");
