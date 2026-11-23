@@ -91,8 +91,13 @@ describe("release provenance", () => {
     it("publishes the shell and the runtime package with the same dist-tag", () => {
         const publishSteps = readWorkflow("release.yml").jobs?.["publish"]?.steps ?? [];
         const publishRun = publishSteps.map((step) => step.run ?? "").join("\n");
-        expect(publishRun).toContain('npm publish "$SHELL_TARBALL" --tag "$DIST_TAG"');
-        expect(publishRun).toContain('npm publish "$RUNTIME_TARBALL" --tag "$DIST_TAG"');
+        const runtimePublish = 'node scripts/publish-release-artifact.mjs --tarball "$RUNTIME_TARBALL" --tag "$DIST_TAG" --allow-pending-visibility';
+        const shellPublish = 'node scripts/publish-release-artifact.mjs --tarball "$SHELL_TARBALL" --tag "$DIST_TAG"';
+        expect(publishRun).toContain(runtimePublish);
+        expect(publishRun).toContain(shellPublish);
+        expect(publishRun).not.toContain(`${shellPublish} --allow-pending-visibility`);
+        expect(publishRun.indexOf(runtimePublish)).toBeLessThan(publishRun.indexOf("node scripts/wait-for-runtime-registry.mjs"));
+        expect(publishRun.indexOf("node scripts/wait-for-runtime-registry.mjs")).toBeLessThan(publishRun.indexOf(shellPublish));
     });
 
     it("gates release tests on verifying that the tag commit belongs to main", () => {
@@ -132,7 +137,8 @@ describe("release check", () => {
         expect(jobs?.["release-check"]?.needs).toBe("verify-tag");
         expect(steps.some((step) => step.run?.includes("node scripts/release-check.mjs --tag"))).toBe(true);
         expect(jobs?.["publish"]?.needs).toContain("release-check");
-        expect(publishRun).toContain("npm publish");
+        expect(publishRun).toContain('node scripts/publish-release-artifact.mjs --tarball "$RUNTIME_TARBALL" --tag "$DIST_TAG" --allow-pending-visibility');
+        expect(publishRun).toContain('node scripts/publish-release-artifact.mjs --tarball "$SHELL_TARBALL" --tag "$DIST_TAG"');
         expect(publishRun).toContain('gh release create "$GITHUB_REF_NAME" shell/*.tgz runtime/*.tgz --generate-notes --verify-tag $PRERELEASE');
     });
 });
