@@ -11,7 +11,7 @@ import { describe, expect, it } from "vitest";
 import { resolveReleaseArtifact } from "../scripts/resolve-release-artifact.mjs";
 import { isAlreadyPublishedConflict, publishReleaseArtifact } from "../scripts/publish-release-artifact.mjs";
 import { isExecutedAsCli } from "../scripts/is-executed-as-cli.mjs";
-import { waitForRuntimeRegistry } from "../scripts/wait-for-runtime-registry.mjs";
+import { verifyPublishedArtifact, waitForRuntimeRegistry } from "../scripts/wait-for-runtime-registry.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -58,6 +58,16 @@ const OWNED_ENV_KEYS = new Set([
 ]);
 
 const PUBLISH_STUB_SOURCE = "require('node:fs').writeFileSync(process.env.PUBLISH_STUB_MARKER, 'invoked\\n'); process.stderr.write('npm error 403 You cannot publish over the previously published versions: 0.4.42\\n'); process.exit(1);\n";
+
+/**
+ * The same publish stub, but the immutable-version conflict only surfaces
+ * after `delayMs`. It models a slow publish attempt: the time spent before
+ * the resume verification starts must not be charged against the
+ * verification deadline.
+ */
+function delayedPublishStubSource(delayMs) {
+    return `setTimeout(() => {${PUBLISH_STUB_SOURCE}}, ${delayMs});\n`;
+}
 
 function findEnvKey(env, key) {
     const lower = key.toLowerCase();
@@ -119,13 +129,13 @@ function windowsNpmPowerShellShim(nodePath, stubPath) {
     return `& "${nodePath}" "${stubPath}" @args\nexit $LASTEXITCODE\n`;
 }
 
-async function runPublishCli({ tarball, registry, allowPending = false, timeoutMs = 5000, baseEnv = process.env }) {
+async function runPublishCli({ tarball, registry, allowPending = false, timeoutMs = 5000, baseEnv = process.env, stubDelayMs = 0 }) {
     const root = resolve(tarball, "..");
     const npmExecPath = join(root, "npm-stub.cjs");
     const stubBin = join(root, "npm-stub-bin");
     const marker = join(root, "npm-stub-invoked");
     if (existsSync(marker)) unlinkSync(marker);
-    writeFileSync(npmExecPath, PUBLISH_STUB_SOURCE);
+    writeFileSync(npmExecPath, stubDelayMs > 0 ? delayedPublishStubSource(stubDelayMs) : PUBLISH_STUB_SOURCE);
     // A stub npm earlier on PATH keeps the "npm" fallback of the publish
     // script away from the real client as well.
     mkdirSync(stubBin, { recursive: true });
@@ -136,17 +146,26 @@ async function runPublishCli({ tarball, registry, allowPending = false, timeoutM
     const args = [resolve(import.meta.dirname, "../scripts/publish-release-artifact.mjs"), "--tarball", tarball, "--tag", "latest", "--registry", registry, "--verification-timeout-ms", String(timeoutMs)];
     if (allowPending) args.push("--allow-pending-visibility");
     const env = buildIsolatedPublishEnv({ baseEnv, npmExecPath, marker, registry, pathPrefix: stubBin });
+    // `elapsedMs` covers the child process only. Process launch and runner
+    // scheduling are harness cost, never the product's verification deadline.
+    const started = Date.now();
     try {
         const result = await execFileAsync(process.execPath, args, { env, encoding: "utf8" });
-        return { status: 0, invoked: existsSync(marker), stdout: result.stdout, stderr: result.stderr };
-    } catch (error) { return { status: error.code, invoked: existsSync(marker), stdout: error.stdout, stderr: error.stderr }; }
+        return { status: 0, invoked: existsSync(marker), stdout: result.stdout, stderr: result.stderr, elapsedMs: Date.now() - started };
+    } catch (error) { return { status: error.code, invoked: existsSync(marker), stdout: error.stdout, stderr: error.stderr, elapsedMs: Date.now() - started }; }
 }
 
 async function runWithServer(requestHandler, action) {
     const server = createServer(requestHandler);
     await new Promise((resolvePromise) => server.listen(0, "127.0.0.1", resolvePromise));
     try { return await action(`http://127.0.0.1:${server.address().port}`); }
-    finally { await new Promise((resolvePromise) => server.close(resolvePromise)); }
+    finally {
+        // A fixture that never ends its response keeps the socket open, and
+        // `close()` alone waits for it. Dropping the connections first keeps
+        // the teardown (and the tests after it) off the fixture's clock.
+        if (typeof server.closeAllConnections === "function") server.closeAllConnections();
+        await new Promise((resolvePromise) => server.close(resolvePromise));
+    }
 }
 
 function response(status, body, bytes) {
@@ -432,22 +451,94 @@ describe("release publish artifact paths", () => {
                 expect(runtimeResult.status).toBe(0);
             });
         } finally { rmSync(root, { recursive: true, force: true }); }
-    });
+        // Three sequential CLI launches are harness cost, not product work: the
+        // vitest budget only has to be wide enough for a slow runner to spawn
+        // the processes. The product deadline and the pending-flag semantics
+        // are unchanged.
+    }, 30_000);
 
-    it("bounds actual CLI resume verification when metadata never finishes", async () => {
+    it("bounds the product verification deadline when registry metadata never finishes", async () => {
         const root = join(tmpdir(), `dsh-acp-cli-${process.pid}-${Date.now()}`);
         mkdirSync(root, { recursive: true });
         try {
             const runtime = runtimeTarball(root);
-            const started = Date.now();
-            await runWithServer((_request, responseValue) => { responseValue.writeHead(200, { "content-type": "application/json" }); responseValue.write('{"version":"0.4.42"'); }, async (registry) => {
+            await runWithServer((_request, responseValue) => {
+                // The metadata body never finishes: headers and a partial
+                // payload are written, the response is never ended.
+                responseValue.writeHead(200, { "content-type": "application/json" });
+                responseValue.write('{"version":"0.4.42"');
+            }, async (registry) => {
+                const timeoutMs = 150;
+                // The clock covers the verification request only. Server
+                // startup, process launch and fixture teardown are excluded,
+                // so this measures the product deadline and nothing else.
+                const started = Date.now();
+                await expect(verifyPublishedArtifact({ tarball: runtime, registryBaseUrl: registry, timeoutMs })).rejects.toThrow(/deadline|timed out/);
+                const elapsed = Date.now() - started;
+                // The deadline is armed: the request stayed in flight until
+                // the product gave up on it.
+                expect(elapsed).toBeGreaterThanOrEqual(100);
+                // ... and it gave up on it instead of running to a 5s or
+                // unbounded timeout.
+                expect(elapsed).toBeLessThanOrEqual(timeoutMs + 1000);
+            });
+        } finally { rmSync(root, { recursive: true, force: true }); }
+        // The outer timeout is only a kill switch for an unbounded
+        // implementation; the tight bound above is the real assertion.
+    }, 10_000);
+
+    it("fails the actual CLI resume verification on the product deadline when metadata never finishes", async () => {
+        const root = join(tmpdir(), `dsh-acp-cli-${process.pid}-${Date.now()}`);
+        mkdirSync(root, { recursive: true });
+        try {
+            const runtime = runtimeTarball(root);
+            await runWithServer((_request, responseValue) => {
+                responseValue.writeHead(200, { "content-type": "application/json" });
+                responseValue.write('{"version":"0.4.42"');
+            }, async (registry) => {
                 const result = await runPublishCli({ tarball: runtime, registry, allowPending: true, timeoutMs: 150 });
                 expectStubInvoked(result);
                 expect(result.status).not.toBe(0);
+                // The CLI has to report the product's deadline failure, so a
+                // harness kill can never pass this test unnoticed.
+                expect(`${result.stdout ?? ""}\n${result.stderr ?? ""}`).toMatch(/deadline|timed out/);
+                // Only the child process is bounded, and only generously:
+                // process launch and runner scheduling are not the
+                // verification deadline.
+                expect(result.elapsedMs).toBeLessThan(15_000);
             });
-            expect(Date.now() - started).toBeLessThan(2000);
         } finally { rmSync(root, { recursive: true, force: true }); }
-    });
+        // Last-resort kill for an unbounded implementation; the in-process
+        // bound above is what actually pins the product deadline.
+    }, 20_000);
+
+    it("does not charge a slow publish attempt against the resume verification deadline", async () => {
+        const root = join(tmpdir(), `dsh-acp-cli-${process.pid}-${Date.now()}`);
+        mkdirSync(root, { recursive: true });
+        try {
+            const runtime = runtimeTarball(root);
+            const bytes = readFileSync(runtime);
+            const sha1 = createHash("sha1").update(bytes).digest("hex");
+            const integrity = `sha512-${createHash("sha512").update(bytes).digest("base64")}`;
+            const publishDelayMs = 3000;
+            const verificationTimeoutMs = 2000;
+            await runWithServer((request, responseValue) => {
+                if (request.url.endsWith(".tgz")) { responseValue.statusCode = 200; responseValue.end(bytes); return; }
+                responseValue.statusCode = 200;
+                responseValue.end(JSON.stringify({ version: "0.4.42", dist: { tarball: "runtime.tgz", shasum: sha1, integrity } }));
+            }, async (registry) => {
+                const result = await runPublishCli({ tarball: runtime, registry, timeoutMs: verificationTimeoutMs, stubDelayMs: publishDelayMs });
+                expectStubInvoked(result);
+                // The publish attempt alone outlasts the verification timeout.
+                // The verification deadline still starts when the verification
+                // starts, so the digest check succeeds instead of being
+                // reported as a deadline failure.
+                expect(result.elapsedMs).toBeGreaterThanOrEqual(publishDelayMs);
+                expect(result.status).toBe(0);
+                expect(`${result.stdout ?? ""}\n${result.stderr ?? ""}`).not.toMatch(/deadline|timed out/);
+            });
+        } finally { rmSync(root, { recursive: true, force: true }); }
+    }, 20_000);
 
     it.each(["runtime", "shell"])("rejects an immutable %s retry when the registry digest differs", async (kind) => {
         const root = join(tmpdir(), `dsh-acp-publish-${process.pid}-${Date.now()}`);
