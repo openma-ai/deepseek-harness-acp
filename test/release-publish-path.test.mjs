@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { gzipSync } from "node:zlib";
-import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { delimiter, isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -45,16 +45,99 @@ function packageTarball(root, name, version = "0.4.42", filename = "runtime.tgz"
 function runtimeTarball(root, version = "0.4.42") { return packageTarball(root, "@openma/deepseek-harness-acp-runtime", version); }
 function shellTarball(root, version = "0.4.42") { return packageTarball(root, "@openma/deepseek-harness-acp", version, "shell.tgz"); }
 
-async function runPublishCli({ tarball, registry, allowPending = false, timeoutMs = 5000 }) {
+const NPM_EXECPATH_ENV = "npm_execpath";
+const PUBLISH_STUB_MARKER_ENV = "PUBLISH_STUB_MARKER";
+const NPM_REGISTRY_ENV = "npm_config_registry";
+// Environment keys the isolated publish harness owns. Windows treats
+// environment variables case-insensitively, so every spelling of these keys is
+// dropped from the inherited environment before the harness installs its own.
+const OWNED_ENV_KEYS = new Set([
+    NPM_EXECPATH_ENV.toLowerCase(),
+    PUBLISH_STUB_MARKER_ENV.toLowerCase(),
+    NPM_REGISTRY_ENV.toLowerCase(),
+]);
+
+const PUBLISH_STUB_SOURCE = "require('node:fs').writeFileSync(process.env.PUBLISH_STUB_MARKER, 'invoked\\n'); process.stderr.write('npm error 403 You cannot publish over the previously published versions: 0.4.42\\n'); process.exit(1);\n";
+
+function findEnvKey(env, key) {
+    const lower = key.toLowerCase();
+    return Object.keys(env).find((candidate) => candidate.toLowerCase() === lower);
+}
+
+/**
+ * Builds the environment for a publish CLI child that must never reach the
+ * real npm client.
+ *
+ * Node's `lib/child_process.js` sorts environment keys on Windows and drops
+ * case-insensitive duplicates, keeping the first one. Uppercase spellings sort
+ * before lowercase ones, so an inherited `NPM_EXECPATH` (the real client the
+ * parent npm process exports) used to beat the injected `npm_execpath` stub
+ * and the child published to the public registry. Every case variant of the
+ * keys this harness owns is therefore removed before the stub is installed.
+ */
+export function buildIsolatedPublishEnv({ baseEnv = process.env, npmExecPath, marker, registry, pathPrefix }) {
+    const env = {};
+    const pathKey = findEnvKey(baseEnv, "path") ?? "PATH";
+    const inheritedPath = baseEnv[pathKey];
+    for (const [key, value] of Object.entries(baseEnv)) {
+        if (value === undefined) continue;
+        const lower = key.toLowerCase();
+        if (OWNED_ENV_KEYS.has(lower) || lower === "path") continue;
+        env[key] = value;
+    }
+    env[NPM_EXECPATH_ENV] = npmExecPath;
+    env[PUBLISH_STUB_MARKER_ENV] = marker;
+    if (registry) env[NPM_REGISTRY_ENV] = registry;
+    const pathValue = [pathPrefix, inheritedPath].filter(Boolean).join(delimiter);
+    if (pathValue) env[pathKey] = pathValue;
+    return env;
+}
+
+/**
+ * Mirrors Node's Windows environment handling: keys are sorted and
+ * case-insensitive duplicates are dropped, keeping the first spelling.
+ */
+export function windowsEnvKeys(keys) {
+    const seen = new Set();
+    return [...keys].sort().filter((key) => {
+        const upper = key.toUpperCase();
+        if (seen.has(upper)) return false;
+        seen.add(upper);
+        return true;
+    });
+}
+
+function posixNpmShim(nodePath, stubPath) {
+    return `#!/bin/sh\nexec "${nodePath}" "${stubPath}" "$@"\n`;
+}
+
+function windowsNpmShim(nodePath, stubPath) {
+    return `@echo off\r\n"${nodePath}" "${stubPath}" %*\r\n`;
+}
+
+function windowsNpmPowerShellShim(nodePath, stubPath) {
+    return `& "${nodePath}" "${stubPath}" @args\nexit $LASTEXITCODE\n`;
+}
+
+async function runPublishCli({ tarball, registry, allowPending = false, timeoutMs = 5000, baseEnv = process.env }) {
     const root = resolve(tarball, "..");
     const npmExecPath = join(root, "npm-stub.cjs");
+    const stubBin = join(root, "npm-stub-bin");
     const marker = join(root, "npm-stub-invoked");
     if (existsSync(marker)) unlinkSync(marker);
-    writeFileSync(npmExecPath, "require('node:fs').writeFileSync(process.env.PUBLISH_STUB_MARKER, 'invoked\\n'); process.stderr.write('npm error 403 You cannot publish over the previously published versions: 0.4.42\\n'); process.exit(1);\n");
+    writeFileSync(npmExecPath, PUBLISH_STUB_SOURCE);
+    // A stub npm earlier on PATH keeps the "npm" fallback of the publish
+    // script away from the real client as well.
+    mkdirSync(stubBin, { recursive: true });
+    writeFileSync(join(stubBin, "npm"), posixNpmShim(process.execPath, npmExecPath));
+    chmodSync(join(stubBin, "npm"), 0o755);
+    writeFileSync(join(stubBin, "npm.cmd"), windowsNpmShim(process.execPath, npmExecPath));
+    writeFileSync(join(stubBin, "npm.ps1"), windowsNpmPowerShellShim(process.execPath, npmExecPath));
     const args = [resolve(import.meta.dirname, "../scripts/publish-release-artifact.mjs"), "--tarball", tarball, "--tag", "latest", "--registry", registry, "--verification-timeout-ms", String(timeoutMs)];
     if (allowPending) args.push("--allow-pending-visibility");
+    const env = buildIsolatedPublishEnv({ baseEnv, npmExecPath, marker, registry, pathPrefix: stubBin });
     try {
-        const result = await execFileAsync(process.execPath, args, { env: { ...process.env, npm_execpath: npmExecPath, PUBLISH_STUB_MARKER: marker }, encoding: "utf8" });
+        const result = await execFileAsync(process.execPath, args, { env, encoding: "utf8" });
         return { status: 0, invoked: existsSync(marker), stdout: result.stdout, stderr: result.stderr };
     } catch (error) { return { status: error.code, invoked: existsSync(marker), stdout: error.stdout, stderr: error.stderr }; }
 }
@@ -72,6 +155,10 @@ function response(status, body, bytes) {
 
 function expectStubInvoked(result) {
     expect(result.invoked, `publish stub was not invoked (status=${result.status}, stdout=${result.stdout ?? ""}, stderr=${result.stderr ?? ""})`).toBe(true);
+    // The stub is the only npm client the CLI boundary may reach: the real one
+    // reports the tarball and talks to the public registry.
+    const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+    expect(output, `the real npm client ran instead of the publish stub (status=${result.status})`).not.toMatch(/npm notice|ENEEDAUTH|registry\.npmjs\.org/);
 }
 
 describe("release publish artifact paths", () => {
@@ -265,6 +352,65 @@ describe("release publish artifact paths", () => {
                 fetchImpl: async () => response(404, {}),
             });
             expect(result).toEqual({ published: false, verifiedExisting: false, pendingVisibility: true });
+        } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+
+    it("keeps a single npm_execpath spelling so Windows cannot select the real npm client", () => {
+        const baseEnv = {
+            NPM_EXECPATH: "C:\\hostedtoolcache\\node\\npm\\bin\\npm-cli.js",
+            npm_execpath: "C:\\hostedtoolcache\\node\\npm\\bin\\npm-cli.js",
+            Path: "C:\\Windows\\system32",
+            // Mixed-case leftovers must be stripped too: OWNED_ENV_KEYS is
+            // compared case-insensitively, not against the install spelling.
+            publish_stub_marker: "C:\\stale-marker",
+            NPM_CONFIG_REGISTRY: "https://registry.npmjs.org",
+        };
+        const env = buildIsolatedPublishEnv({
+            baseEnv,
+            npmExecPath: "C:\\tmp\\npm-stub.cjs",
+            marker: "C:\\tmp\\npm-stub-invoked",
+            registry: "http://127.0.0.1:8080",
+            pathPrefix: "C:\\tmp\\npm-stub-bin",
+        });
+
+        expect(Object.keys(env).filter((key) => key.toLowerCase() === NPM_EXECPATH_ENV)).toEqual([NPM_EXECPATH_ENV]);
+        expect(Object.keys(env).filter((key) => key.toLowerCase() === PUBLISH_STUB_MARKER_ENV.toLowerCase())).toEqual([PUBLISH_STUB_MARKER_ENV]);
+        expect(Object.keys(env).filter((key) => key.toLowerCase() === NPM_REGISTRY_ENV)).toEqual([NPM_REGISTRY_ENV]);
+        expect(env[NPM_EXECPATH_ENV]).toBe("C:\\tmp\\npm-stub.cjs");
+        expect(env[PUBLISH_STUB_MARKER_ENV]).toBe("C:\\tmp\\npm-stub-invoked");
+        expect(env[NPM_REGISTRY_ENV]).toBe("http://127.0.0.1:8080");
+        expect(env.Path).toBe(`C:\\tmp\\npm-stub-bin${delimiter}C:\\Windows\\system32`);
+        // Node keeps the first spelling after sorting, so the stub has to be
+        // the only survivor of the Windows deduplication.
+        const surviving = windowsEnvKeys(Object.keys(env));
+        expect(surviving.filter((key) => key.toLowerCase() === NPM_EXECPATH_ENV)).toEqual([NPM_EXECPATH_ENV]);
+        expect(surviving.filter((key) => key.toLowerCase() === PUBLISH_STUB_MARKER_ENV.toLowerCase())).toEqual([PUBLISH_STUB_MARKER_ENV]);
+        expect(surviving.filter((key) => key.toLowerCase() === NPM_REGISTRY_ENV)).toEqual([NPM_REGISTRY_ENV]);
+    });
+
+    it("lets the inherited uppercase npm client win the Windows environment deduplication", () => {
+        // This is the hazard that leaked the real npm client into the publish
+        // CLI: Node sorts the environment keys and drops case-insensitive
+        // duplicates keeping the first, and uppercase sorts before lowercase.
+        const leaked = { NPM_EXECPATH: "C:\\npm\\bin\\npm-cli.js", npm_execpath: "C:\\tmp\\npm-stub.cjs" };
+        const survivors = windowsEnvKeys(Object.keys(leaked));
+
+        expect(survivors).toEqual(["NPM_EXECPATH"]);
+        expect(leaked[survivors[0]]).toBe("C:\\npm\\bin\\npm-cli.js");
+    });
+
+    it("invokes the publish stub even when the parent environment carries the real client under another spelling", async () => {
+        const root = join(tmpdir(), `dsh-acp-cli-${process.pid}-${Date.now()}`);
+        mkdirSync(root, { recursive: true });
+        try {
+            const runtime = runtimeTarball(root);
+            const realClient = process.env.npm_execpath || process.env.NPM_EXECPATH || "C:\\hostedtoolcache\\windows\\node\\22.23.5\\x64\\node_modules\\npm\\bin\\npm-cli.js";
+            const poisoned = { ...process.env, NPM_EXECPATH: realClient };
+            await runWithServer((_request, responseValue) => { responseValue.statusCode = 404; responseValue.end(); }, async (registry) => {
+                const result = await runPublishCli({ tarball: runtime, registry, allowPending: true, baseEnv: poisoned });
+                expectStubInvoked(result);
+                expect(result.status).toBe(0);
+            });
         } finally { rmSync(root, { recursive: true, force: true }); }
     });
 
