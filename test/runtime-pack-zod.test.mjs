@@ -1,6 +1,14 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+    existsSync,
+    mkdirSync,
+    mkdtempSync,
+    readFileSync,
+    rmSync,
+    symlinkSync,
+    writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
     applyDedupe,
@@ -38,6 +46,9 @@ const zodManifest = (version) => ({
     },
 });
 
+/** The kind of symlink the platform creates without extra privileges. */
+const linkType = process.platform === "win32" ? "junction" : "dir";
+
 /**
  * Build a small tree that looks like the runtime tree: a root slot copy of
  * zod, nested copies under the packages that pin it, and the lockfiles that
@@ -45,10 +56,12 @@ const zodManifest = (version) => ({
  *
  * @param {object} spec - the tree: the zod copies, the requirers, and the
  *   dependencies the tree root itself declares.
+ * @param {string} [directory] - the directory to build the tree in; a fresh
+ *   temporary directory is used when it is not given.
  * @returns {string} the tree root.
  */
-const makeTree = (spec) => {
-    const root = mkdtempSync(join(tmpdir(), "acp-runtime-zod-"));
+const makeTree = (spec, directory) => {
+    const root = directory ?? mkdtempSync(join(tmpdir(), "acp-runtime-zod-"));
     roots.push(root);
     const packages = {};
     const record = (dir, name, version) => {
@@ -176,6 +189,60 @@ describe("the compatible zod collapse", () => {
             expect(entry.version).toBe("4.6.6");
             expect(satisfiesRange(entry.version, entry.range)).toBe(true);
         }
+    });
+
+    it("reports the same path when the root is reached through a symlink", () => {
+        // The tree lives in a directory that is reached through a symlink, the
+        // way macOS reaches `/var/...` through `/private/var/...`: it is the
+        // same tree, and the evidence has to name the file the way the tree
+        // names it.
+        const real = mkdtempSync(join(tmpdir(), "acp-runtime-zod-real-"));
+        const link = join(tmpdir(), `acp-runtime-zod-link-${basename(real)}`);
+        symlinkSync(real, link, linkType);
+        // The links are removed before the directories they point at.
+        roots.unshift(link);
+        roots.push(real);
+        const root = makeTree({
+            copies: [
+                { path: "zod", version: "4.6.6" },
+                { path: "parent-a/node_modules/zod", version: "4.6.6" },
+            ],
+            parents: [{ name: "parent-a", range: "4.6.6" }],
+        }, join(real, "tree"));
+        applyDedupe(root, planDedupe(root));
+
+        // The root is reached through the symlinked parent directory.
+        const throughParent = verifyResolution(join(link, "tree"));
+        expect(throughParent).toHaveLength(1);
+        expect(throughParent[0].resolved).toBe("node_modules/zod/package.json");
+        expect(throughParent[0].version).toBe("4.6.6");
+        expect(satisfiesRange(throughParent[0].version, throughParent[0].range)).toBe(true);
+
+        // The root itself is the symlink.
+        const selfLink = join(dirname(root), `${basename(root)}-link`);
+        symlinkSync(root, selfLink, linkType);
+        roots.unshift(selfLink);
+        const throughSelf = verifyResolution(selfLink);
+        expect(throughSelf).toHaveLength(1);
+        expect(throughSelf[0].resolved).toBe("node_modules/zod/package.json");
+        expect(throughSelf[0].version).toBe("4.6.6");
+        expect(satisfiesRange(throughSelf[0].version, throughSelf[0].range)).toBe(true);
+    });
+
+    it("refuses to report a resolution that lies outside the tree", () => {
+        const root = makeTree({
+            copies: [{ path: "zod", version: "4.6.6" }],
+            parents: [{ name: "parent-a", range: "4.6.6" }],
+        });
+        // The copy the requirer resolves to lives outside the tree, so the
+        // evidence cannot name it relative to the root.
+        const outside = mkdtempSync(join(tmpdir(), "acp-runtime-zod-outside-"));
+        roots.push(outside);
+        write(outside, "zod/package.json", zodManifest("4.6.6"));
+        const slot = join(root, "node_modules/zod");
+        rmSync(slot, { recursive: true, force: true });
+        symlinkSync(join(outside, "zod"), slot, linkType);
+        expect(() => verifyResolution(root)).toThrow(/lies outside the runtime tree/);
     });
 
     it("refuses to pack a tree that still carries a redundant copy", () => {

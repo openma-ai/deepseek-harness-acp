@@ -23,8 +23,17 @@
  * never hoisted, and a tree whose copies genuinely differ keeps them.
  */
 
-import { cpSync, existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import {
+    cpSync,
+    existsSync,
+    readFileSync,
+    readdirSync,
+    realpathSync,
+    rmSync,
+    statSync,
+    writeFileSync,
+} from "node:fs";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createRequire } from "node:module";
 import semver from "semver";
 
@@ -319,6 +328,55 @@ export function withLockEntries(root, plan) {
 }
 
 /**
+ * The real path of a file or a directory.
+ *
+ * A path that cannot be resolved is returned unchanged: the tree is then
+ * examined as it is, and a tree that is broken is reported by the checks that
+ * follow rather than by a missing path.
+ *
+ * @param {string} path - the path.
+ * @returns {string} the real path.
+ */
+function realPath(path) {
+    try {
+        return realpathSync(path);
+    } catch {
+        return path;
+    }
+}
+
+/**
+ * The path of a resolved file inside the tree root, in POSIX form.
+ *
+ * Both sides are compared through their real path: a root that is reached
+ * through a symlink (`/var` vs `/private/var` on macOS) is the same tree, and
+ * a resolver that answers with platform separators (Windows) is the same file.
+ * The evidence therefore names the file the way the tree names it — a
+ * POSIX-relative path from the root — on every platform.
+ *
+ * A file that lies outside the root is a broken tree, and is reported as such
+ * instead of being described by a relative path that points nowhere.
+ *
+ * @param {string} base - the real path of the tree root.
+ * @param {string} resolved - the resolved file.
+ * @returns {string} the path relative to the root, in POSIX form.
+ */
+function relativeToRoot(base, resolved) {
+    const target = realPath(resolved);
+    const relativePath = relative(base, target);
+    const outside = relativePath === ""
+        || isAbsolute(relativePath)
+        || relativePath === ".."
+        || relativePath.startsWith(`..${sep}`);
+    if (outside) {
+        throw new Error(
+            `the resolution ${resolved} lies outside the runtime tree ${base}`,
+        );
+    }
+    return relativePath.split(sep).join("/");
+}
+
+/**
  * Check the resolution of the collapsed package with Node's own resolver.
  *
  * The evidence is a real module resolution: every requirer is asked where the
@@ -331,7 +389,9 @@ export function withLockEntries(root, plan) {
  */
 export function verifyResolution(root, name = DEDUPE_PACKAGE) {
     const requirers = findRequirers(root, name);
-    const base = resolve(root);
+    // The root is compared through its real path, so that a root that is
+    // reached through a symlink is still recognised as the tree it is.
+    const base = realPath(resolve(root));
     const evidence = [];
     for (const requirer of requirers) {
         const anchor = join(base, requirer.dir, "package.json");
@@ -346,7 +406,7 @@ export function verifyResolution(root, name = DEDUPE_PACKAGE) {
             package: requirer.package,
             range: requirer.range,
             kind: requirer.kind,
-            resolved: resolved.slice(base.length + 1),
+            resolved: relativeToRoot(base, resolved),
             version,
         });
     }
