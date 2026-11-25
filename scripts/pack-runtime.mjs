@@ -14,6 +14,8 @@ import { fileURLToPath } from "node:url";
 import * as tar from "tar";
 import { completePlatformPackages, pruneExternalPackages } from "./runtime-platforms.mjs";
 import { externalPackageRecords, packRuntimePackage, RUNTIME_PACKAGE_NAME } from "./runtime-package.mjs";
+import { pruneRuntimeTree } from "./runtime-pack-tree.mjs";
+import { applyDedupe, assertNoRedundantCopies, planDedupe, verifyResolution } from "./runtime-pack-zod.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
@@ -49,6 +51,31 @@ try {
     });
     await completePlatformPackages(staging);
     pruneExternalPackages(staging);
+    // The tree `npm ci` produced carries the packages' own build material and
+    // one copy of zod per package that pins it. Both are removed here, by
+    // reference analysis and by a compatible collapse, so every official pack
+    // ships the same slim tree.
+    const dedupe = applyDedupe(staging, planDedupe(staging));
+    if (dedupe.applied) {
+        console.log(
+            `collapsed ${dedupe.removed.length} redundant zod copies `
+            + `(kept ${dedupe.survivor.version}, freed ${dedupe.removedBytes} bytes)`,
+        );
+    }
+    const pruned = pruneRuntimeTree(staging);
+    console.log(
+        `pruned ${pruned.removedFiles} non-runtime files `
+        + `(freed ${pruned.removedBytes} bytes, kept ${pruned.protectedFiles} reachable files)`,
+    );
+    // The evidence is collected on the tree that is actually shipped: every
+    // package that declares zod resolves to the single surviving copy, and no
+    // redundant copy is left behind.
+    const resolution = verifyResolution(staging);
+    assertNoRedundantCopies(staging);
+    console.log(
+        `zod resolution verified for ${resolution.length} requirers `
+        + `(all resolve to ${resolution[0]?.version ?? "the kept copy"})`,
+    );
     const lock = JSON.parse(readFileSync(join(root, "runtime/package-lock.json"), "utf8"));
     const externalPackages = externalPackageRecords(lock);
     if (Object.keys(externalPackages).length === 0) {
